@@ -1,4 +1,4 @@
-"""主窗口：pit-wall 三段式 —— 顶栏 / 左图传右遥测 / 底状态条。
+"""主窗口：pit-wall 三段式 —— 顶栏 / 左图传右遥测 / 手柄条 / 底状态条。
 
 布局（ASCII）：
 +---------------------------------------------------------------+
@@ -9,14 +9,20 @@
 |                                      +------------------------+
 |                                      | LOGS · 日志            | 右下
 +--------------------------------------+------------------------+
+| GAMEPAD · 手柄  [●手柄]  按键灯 / 双摇杆 / 扳机 / 16字节协议   | 通栏手柄条
++---------------------------------------------------------------+
 | udp:8001 · K230→server · fps 12 · 帧 #1234                     | 底栏
 +---------------------------------------------------------------+
+手柄链路：XInput ~100Hz 轮询 -> 16 字节 HID -> POST /command，
+应用启动即自动连接手柄（无柄则后台重连等待，不卡 UI）。
 """
 from __future__ import annotations
 
 import tkinter as tk
 
 from desktop import theme
+from desktop.gamepad.pusher import GamepadPusher
+from desktop.modules.gamepad_panel import GamepadPanel
 from desktop.modules.latency_panel import LatencyPanel
 from desktop.modules.log_panel import LogPanel
 from desktop.modules.stream_panel import StreamPanel
@@ -31,11 +37,12 @@ class DesktopApp(tk.Tk):
         theme.apply_theme(self)
         self.configure(bg=theme.BG)
         self.title("TinDistance · Core-Bridge")
-        self.geometry("1280x760")
-        self.minsize(960, 560)
+        self.geometry("1280x880")
+        self.minsize(960, 680)
 
         self._server: ServerManager | None = None
         self._monitor: LatencyMonitor | None = None
+        self._gamepad: GamepadPusher | None = None
         self._start_screen: StartScreen | None = None
 
         self._show_start_screen()
@@ -58,6 +65,10 @@ class DesktopApp(tk.Tk):
 
         self._monitor = LatencyMonitor(get_base_url=lambda: base_url)
         self._monitor.start()
+
+        # 手柄：应用启动即尝试连接，后台 ~100Hz 轮询 + 实时 POST /command
+        self._gamepad = GamepadPusher(get_base_url=lambda: base_url)
+        self._gamepad.start()
 
         # ---- 顶栏 ----
         header = tk.Frame(self, bg=theme.PANEL, highlightthickness=1,
@@ -86,6 +97,7 @@ class DesktopApp(tk.Tk):
         main.columnconfigure(0, weight=3)
         main.columnconfigure(1, weight=1, minsize=300)
         main.rowconfigure(0, weight=1)
+        main.rowconfigure(1, weight=0)
 
         self.stream_panel = StreamPanel(main, default_server=base_url,
                                         monitor=self._monitor)
@@ -102,6 +114,11 @@ class DesktopApp(tk.Tk):
 
         self.log_panel = LogPanel(side, default_server=base_url)
         self.log_panel.grid(row=1, column=0, sticky="nsew")
+
+        # 手柄通栏条：xinput_gui 功能的 pit-wall 版（按键/摇杆/扳机/协议视图）
+        self.gamepad_panel = GamepadPanel(main, pusher=self._gamepad)
+        self.gamepad_panel.grid(row=1, column=0, columnspan=2,
+                                sticky="ew", pady=(10, 0))
 
         # ---- 底栏 ----
         foot = tk.Frame(self, bg=theme.PANEL, highlightthickness=1,
@@ -147,6 +164,8 @@ class DesktopApp(tk.Tk):
         try:
             if self._monitor is not None:
                 self._monitor.stop()
+            if self._gamepad is not None:
+                self._gamepad.stop()
         finally:
             if self._server is not None:
                 self._server.stop()

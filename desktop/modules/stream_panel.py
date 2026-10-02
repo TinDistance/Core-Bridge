@@ -6,7 +6,8 @@ from desktop.streaming.pusher import Pusher
 
 
 class StreamPanel(BasePanel):
-    def __init__(self, master, **kwargs) -> None:
+    def __init__(self, master, default_server: str = "http://127.0.0.1:8000", **kwargs) -> None:
+        self._default_server = default_server
         self._pusher: Pusher | None = None
         super().__init__(master, title="屏幕推流", **kwargs)
 
@@ -15,7 +16,7 @@ class StreamPanel(BasePanel):
         settings.pack(fill=tk.X, padx=6, pady=6)
 
         ttk.Label(settings, text="Server:").pack(side=tk.LEFT)
-        self._server_var = tk.StringVar(value="http://127.0.0.1:8000")
+        self._server_var = tk.StringVar(value=self._default_server)
         ttk.Entry(settings, textvariable=self._server_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
 
         controls = ttk.Frame(self)

@@ -7,7 +7,8 @@ from desktop.modules.base_panel import BasePanel
 
 
 class LogPanel(BasePanel):
-    def __init__(self, master, **kwargs) -> None:
+    def __init__(self, master, default_server: str = "ws://127.0.0.1:8000", **kwargs) -> None:
+        self._default_server = default_server
         self._client: LogClient | None = None
         self._queue: queue.Queue = queue.Queue()
         super().__init__(master, title="Server 日志", **kwargs)
@@ -17,7 +18,7 @@ class LogPanel(BasePanel):
         top.pack(fill=tk.X, padx=6, pady=6)
 
         ttk.Label(top, text="Server:").pack(side=tk.LEFT)
-        self._server_var = tk.StringVar(value="ws://127.0.0.1:8000")
+        self._server_var = tk.StringVar(value=self._default_server)
         ttk.Entry(top, textvariable=self._server_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
 
         self._toggle_btn = ttk.Button(top, text="连接", command=self._toggle)

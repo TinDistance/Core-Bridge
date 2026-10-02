@@ -53,6 +53,7 @@ class Pusher:
         self._stop_event = asyncio.Event()
         track = ScreenCaptureTrack(fps=self.fps)
         pc = RTCPeerConnection()
+        session: str | None = None
         try:
             self._set_status("capturing screen")
             pc.addTrack(track)
@@ -71,6 +72,7 @@ class Pusher:
                 )
                 resp.raise_for_status()
                 answer = resp.json()
+            session = answer.get("session")
             await pc.setRemoteDescription(RTCSessionDescription(sdp=answer["sdp"], type=answer["type"]))
 
             self._set_status("streaming")
@@ -81,3 +83,12 @@ class Pusher:
             self._set_status("stopped")
             await pc.close()
             track.stop()
+            if session is not None:
+                try:
+                    async with httpx.AsyncClient(timeout=5) as client:
+                        await client.post(
+                            f"{self.server_url}/webrtc/push/stop",
+                            json={"session": session},
+                        )
+                except Exception:
+                    pass

@@ -1,4 +1,6 @@
+import asyncio
 import time
+from fractions import Fraction
 
 import av
 import mss
@@ -27,14 +29,19 @@ class ScreenCaptureTrack(MediaStreamTrack):
         target_time = self._start + self._frame_count / self._fps
         delay = target_time - time.time()
         if delay > 0:
-            import asyncio
-
             await asyncio.sleep(delay)
 
         monitor = self._sct.monitors[1]
         img = self._sct.grab(monitor)
-        arr = np.frombuffer(img.BGRA, np.uint8).reshape((img.height, img.width, 4))
+        bgra = getattr(img, "bgra", None) or getattr(img, "BGRA", None)
+        arr = np.frombuffer(bgra, np.uint8).reshape((img.height, img.width, 4))
         frame = av.VideoFrame.from_ndarray(arr, format="bgra")
         frame.pts = self._frame_count
-        frame.time_base = 1 / self._fps
+        frame.time_base = Fraction(1, self._fps)
         return frame
+
+    def stop(self) -> None:
+        if self._sct is not None:
+            self._sct.close()
+            self._sct = None
+        super().stop()

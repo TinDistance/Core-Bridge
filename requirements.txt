@@ -6,3 +6,4 @@ mss
 numpy
 websockets
 httpx
+pillow

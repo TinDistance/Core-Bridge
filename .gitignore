@@ -216,3 +216,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# MSPM0 / TI CCS - SysConfig & gmake build artifacts (regenerated from .syscfg)
+ticlang/
+targetConfigs/
+Debug/
+ti_msp_dl_config.c
+ti_msp_dl_config.h
+device.cmd.genlibs
+device.opt
+device_linker.cmd
+Event.dot
+startup_mspm0g351x_ticlang.c
+*.out

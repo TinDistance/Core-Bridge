@@ -1,10 +1,11 @@
 from fastapi import FastAPI
 
-from server.routers import command
+from server.routers import command, webrtc
 
 app = FastAPI(title="Core-Bridge Server", version="0.1.0")
 
 app.include_router(command.router)
+app.include_router(webrtc.router)
 
 
 def main() -> None:

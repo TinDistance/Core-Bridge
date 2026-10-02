@@ -10,9 +10,11 @@ PROJECT_ROOT = __import__("pathlib").Path(__file__).resolve().parent.parent
 class ServerManager:
     """Starts, monitors and stops the Core-Bridge server as a subprocess."""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 8000) -> None:
+    def __init__(self, host: str = "127.0.0.1", port: int = 8000, bind_host: str = "0.0.0.0") -> None:
+        """`host` is the local URL used by the desktop app; `bind_host` is what uvicorn listens on."""
         self.host = host
         self.port = port
+        self.bind_host = bind_host
         self._proc: subprocess.Popen | None = None
 
     @property
@@ -26,7 +28,7 @@ class ServerManager:
         if self._proc is None:
             kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
             self._proc = subprocess.Popen(
-                [sys.executable, "-m", "uvicorn", "server.app:app", "--host", self.host, "--port", str(self.port)],
+                [sys.executable, "-m", "uvicorn", "server.app:app", "--host", self.bind_host, "--port", str(self.port)],
                 cwd=str(PROJECT_ROOT),
                 **kwargs,
             )

@@ -37,7 +37,12 @@ class LogPanel(BasePanel):
     def _toggle(self) -> None:
         if self._client is None:
             self._queue = queue.Queue()
-            self._client = LogClient(self._server_var.get().rstrip("/") + "/ws/logs", self._queue)
+            url = self._server_var.get().rstrip("/")
+            if url.startswith("http://"):
+                url = "ws://" + url[len("http://"):]
+            elif url.startswith("https://"):
+                url = "wss://" + url[len("https://"):]
+            self._client = LogClient(url + "/ws/logs", self._queue)
             self._client.start()
             self._toggle_btn.config(text="断开")
         else:

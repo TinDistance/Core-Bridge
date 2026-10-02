@@ -3,6 +3,18 @@ import logging
 from collections import deque
 
 
+# 桌面端高频轮询的接口：access 日志不向 WebSocket 广播，只留控制台。
+_NOISY_ACCESS_PATHS = (
+    "/video/status",
+    "/video/latest.jpg",
+    "/video/latency",
+    "/video/mjpeg",
+    "/ping",
+    "/test",
+    "/command",
+)
+
+
 class BroadcastHandler(logging.Handler):
     def __init__(self, hub: "LogHub") -> None:
         super().__init__()
@@ -10,6 +22,17 @@ class BroadcastHandler(logging.Handler):
         self.hub = hub
 
     def emit(self, record: logging.LogRecord) -> None:
+        # 高频轮询接口的 access 日志只留控制台，不向桌面广播，避免刷屏
+        # （桌面 LatencyMonitor 0.5s 轮询 /video/status，Viewer 12fps 轮询
+        # /video/latest.jpg，全广播会把 LOGS 面板淹没）。
+        if record.name == "uvicorn.access":
+            try:
+                msg = record.getMessage()
+            except Exception:
+                msg = ""
+            for noisy in _NOISY_ACCESS_PATHS:
+                if noisy in msg:
+                    return
         self.hub._publish(self.format(record))
 
 

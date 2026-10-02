@@ -1,11 +1,16 @@
 import asyncio
+import json
+import logging
 import uuid
 from typing import Awaitable, Callable, Optional
 
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 from aiortc.mediastreams import MediaStreamError, MediaStreamTrack
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import Response
 from pydantic import BaseModel
+
+logger = logging.getLogger("webrtc")
 
 router = APIRouter(prefix="/webrtc", tags=["webrtc"])
 
@@ -111,8 +116,50 @@ class StopRequest(BaseModel):
     session: str
 
 
+async def _read_offer(request: Request) -> tuple[str, str]:
+    """Accept either a JSON {sdp, type} body or a raw SDP body."""
+    raw = await request.body()
+    content_type = request.headers.get("content-type", "").lower()
+    if "json" in content_type:
+        try:
+            data = json.loads(raw)
+            return data["sdp"], data.get("type", "offer")
+        except (json.JSONDecodeError, KeyError) as e:
+            raise HTTPException(status_code=400, detail=f"invalid JSON offer: {e}")
+    sdp = raw.decode("utf-8", "replace").strip()
+    if not sdp:
+        raise HTTPException(status_code=400, detail="empty SDP offer")
+    return sdp, "offer"
+
+
+def _normalize_k230_offer(sdp: str) -> str:
+    """Fix K230 firmware SDP so aiortc accepts it.
+
+    K230 omits `packetization-mode` on its H264 fmtp line (defaults to 0),
+    but aiortc only ships H264 with `packetization-mode=1` and requires an
+    exact match, otherwise setRemoteDescription fails with "Failed to set
+    remote video description send parameters". The K230 sends fragmented
+    720p frames that only fit in FU-A (mode 1), so advertising mode 1 is
+    the correct description of the wire format.
+    """
+    lines = []
+    for line in sdp.splitlines():
+        if (
+            line.startswith("a=fmtp:")
+            and "profile-level-id" in line.lower()
+            and "packetization-mode" not in line.lower()
+        ):
+            line = line.rstrip() + ";packetization-mode=1"
+        lines.append(line)
+    return "\r\n".join(lines) + "\r\n"
+
+
 @router.post("/push")
-async def push(offer: SDPOffer) -> dict:
+async def push(request: Request):
+    sdp, offer_type = await _read_offer(request)
+    sdp = _normalize_k230_offer(sdp)
+    as_json = "json" in request.headers.get("content-type", "").lower()
+
     pc = RTCPeerConnection()
     pcs.add(pc)
     session = uuid.uuid4().hex
@@ -120,10 +167,12 @@ async def push(offer: SDPOffer) -> dict:
 
     @pc.on("track")
     def on_track(track: MediaStreamTrack) -> None:
+        logger.info("push %s: got remote %s track", session, track.kind)
         hub.start_feed(track, session)
 
     @pc.on("connectionstatechange")
     async def on_state() -> None:
+        logger.info("push %s: connectionState -> %s", session, pc.connectionState)
         if pc.connectionState in ("failed", "closed"):
             pcs.discard(pc)
             if push_sessions.get(session) is pc:
@@ -132,7 +181,7 @@ async def push(offer: SDPOffer) -> dict:
                 hub.stop_feed()
 
     try:
-        await pc.setRemoteDescription(RTCSessionDescription(sdp=offer.sdp, type=offer.type))
+        await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type=offer_type))
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
     except Exception as e:
@@ -141,7 +190,22 @@ async def push(offer: SDPOffer) -> dict:
         await pc.close()
         raise HTTPException(status_code=400, detail=f"invalid SDP offer: {e}")
 
-    return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type, "session": session}
+    answer_sdp = pc.localDescription.sdp
+    n_cands = sum(1 for ln in answer_sdp.splitlines() if ln.startswith("a=candidate"))
+    logger.info(
+        "push %s: offer %d bytes -> answer %d bytes, %d candidates",
+        session,
+        len(sdp),
+        len(answer_sdp),
+        n_cands,
+    )
+    for ln in answer_sdp.splitlines():
+        if ln.startswith("a=candidate") or ln.startswith("a=setup"):
+            logger.info("push %s: answer %s", session, ln)
+
+    if as_json:
+        return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type, "session": session}
+    return Response(content=pc.localDescription.sdp, media_type="application/sdp")
 
 
 @router.post("/push/stop")

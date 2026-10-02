@@ -74,8 +74,8 @@ class DesktopApp(tk.Tk):
             side=tk.RIGHT, padx=(0, 12), pady=8)
         self._hdr_pill_var = tk.StringVar(value="启动中")
         self._hdr_pill = tk.Label(header, textvariable=self._hdr_pill_var,
-                                  bg="#232E42", fg=theme.MUTE,
-                                  font=("Segoe UI Semibold", 8), padx=8, pady=2)
+                                   bg="#232E42", fg=theme.MUTE,
+                                   font=theme.FONT_EYEBROW, padx=8, pady=2)
         self._hdr_pill.pack(side=tk.RIGHT, padx=(0, 8), pady=8)
         tk.Label(header, text=base_url, bg=theme.PANEL, fg=theme.MUTE,
                  font=theme.FONT_MONO_SM).pack(side=tk.RIGHT, padx=(0, 8), pady=8)
@@ -154,6 +154,7 @@ class DesktopApp(tk.Tk):
 
 
 def main() -> None:
+    theme.enable_dpi_awareness()  # 必须在 Tk() 之前，否则高分屏下全窗口发虚
     app = DesktopApp()
     app.mainloop()
 

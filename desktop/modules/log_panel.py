@@ -121,7 +121,7 @@ class LogPanel(BasePanel):
                              bg="#0B0F16", fg="#C7D2E2", insertbackground=theme.INK,
                              relief=tk.FLAT, highlightthickness=1,
                              highlightbackground=theme.LINE,
-                             font=("Consolas", 9))
+                             font=theme.cjk_font(9))
         scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self._text.yview)
         self._text.configure(yscrollcommand=scrollbar.set)
         self._text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)

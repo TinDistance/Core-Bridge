@@ -38,8 +38,8 @@ class StreamPanel(BasePanel):
                  font=theme.FONT_EYEBROW).pack(side=tk.LEFT)
         self._pill_var = tk.StringVar(value="无信号")
         self._pill = tk.Label(head, textvariable=self._pill_var, bg="#232E42",
-                              fg=theme.MUTE, font=("Segoe UI Semibold", 8),
-                              padx=8, pady=2)
+                               fg=theme.MUTE, font=theme.FONT_EYEBROW,
+                               padx=8, pady=2)
         self._pill.pack(side=tk.RIGHT)
         self._meta_var = tk.StringVar(value="")
         tk.Label(head, textvariable=self._meta_var, bg=theme.PANEL,
@@ -164,9 +164,9 @@ class StreamPanel(BasePanel):
             return
         self._canvas.create_text(
             cw // 2, ch // 2 - 12, text=NO_STREAM_TEXT,
-            fill=theme.MUTE, font=("Segoe UI Semibold", 14),
+            fill=theme.INK, font=theme.cjk_font(14),
         )
         self._canvas.create_text(
             cw // 2, ch // 2 + 14, text=NO_STREAM_HINT,
-            fill=theme.FAINT, font=("Segoe UI", 9),
+            fill=theme.MUTE, font=theme.cjk_font(9),
         )

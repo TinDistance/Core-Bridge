@@ -137,8 +137,8 @@ class LatencyPanel(BasePanel):
         # 阈值线 500ms
         yt = y_of(WARN_MS)
         c.create_line(pad_l, yt, w - pad_r, yt, fill="#5A3A1A", dash=(4, 3))
-        c.create_text(w - pad_r - 2, yt - 7, text="500", fill="#8A6A3A",
-                      font=("Consolas", 7), anchor="e")
+        c.create_text(w - pad_r - 2, yt - 7, text="500", fill="#B08D4D",
+                      font=("Segoe UI", 8), anchor="e")
 
         if not samples:
             c.create_text(w // 2, h // 2, text="等待延迟采样…", fill=theme.FAINT,
@@ -160,6 +160,6 @@ class LatencyPanel(BasePanel):
                       fill=theme.BAD if samples[-1].e2e_ms >= WARN_MS else theme.AMBER,
                       outline="")
         c.create_text(pad_l + 2, h - 4, text="60s", fill=theme.FAINT,
-                      font=("Consolas", 7), anchor="sw")
+                      font=("Segoe UI", 8), anchor="sw")
         c.create_text(w - pad_r - 2, h - 4, text="now", fill=theme.FAINT,
-                      font=("Consolas", 7), anchor="se")
+                      font=("Segoe UI", 8), anchor="se")

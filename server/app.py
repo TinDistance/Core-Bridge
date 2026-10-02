@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from server.command_udp import start_command_udp, stop_command_udp
 from server.logs import hub as log_hub
 from server.routers import command, heartbeat, logs, video, webrtc
 from server.routers.video import start_udp_listener, stop_udp_listener
@@ -13,9 +14,11 @@ async def lifespan(app: FastAPI):
 
     log_hub.set_loop(asyncio.get_running_loop())
     await start_udp_listener()
+    start_command_udp()
     try:
         yield
     finally:
+        stop_command_udp()
         await stop_udp_listener()
 
 

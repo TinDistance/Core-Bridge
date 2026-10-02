@@ -73,6 +73,23 @@ async def status() -> JSONResponse:
     return JSONResponse(hub.status(UDP_PORT))
 
 
+@router.get("/latency")
+async def latency(n: int = Query(default=60, ge=5, le=120)) -> JSONResponse:
+    """延迟检测：返回最近帧间隔序列 + 当前抖动/fps，供桌面端画曲线或做二次分析。"""
+    st = hub.status(UDP_PORT)
+    return JSONResponse(
+        {
+            "live": st["live"],
+            "frame_id": st["frame_id"],
+            "age_ms": st["age_ms"],
+            "fps": st["fps"],
+            "jitter_ms": st["jitter_ms"],
+            "intervals_ms": hub.recent_intervals_ms(n),
+            "server_time": st["server_time"],
+        }
+    )
+
+
 @router.get("/latest.jpg")
 async def latest(since: int | None = Query(default=None)) -> Response:
     if hub.latest_jpeg is None:

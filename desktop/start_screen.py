@@ -1,41 +1,63 @@
+"""启动屏：只做一件事 —— 把 server 跑起来。
+
+品牌只有一行：TinDistance pit-wall，副标题讲清楚这是什么（小车核心控制端），
+不讲故事不放插画，操作手在赛场上没时间看。
+"""
+from __future__ import annotations
+
 import queue
+import threading
 import tkinter as tk
 from tkinter import ttk
 
+from desktop import theme
 from desktop.server_manager import ServerManager
 
 
-class StartScreen(ttk.Frame):
+class StartScreen(tk.Frame):
     """First screen: start the server, then hand over to the main interface."""
 
     def __init__(self, master, on_ready, **kwargs) -> None:
         self._on_ready = on_ready
         self._result: queue.Queue = queue.Queue()
-        self._manager: ServerManager | None = None
-        super().__init__(master, **kwargs)
+        super().__init__(master, bg=theme.BG, **kwargs)
         self.build()
 
     def build(self) -> None:
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
-        card = ttk.Frame(self)
-        card.grid(row=0, column=0, sticky="")
+        center = tk.Frame(self, bg=theme.BG)
+        center.grid(row=0, column=0, sticky="")
 
-        ttk.Label(card, text="Core-Bridge", font=("Segoe UI", 22, "bold")).grid(row=0, column=0, pady=(0, 20))
-        ttk.Label(card, text="Server 还未启动").grid(row=1, column=0, pady=(0, 10))
+        card = tk.Frame(center, bg=theme.PANEL, highlightthickness=1,
+                        highlightbackground=theme.LINE, padx=36, pady=32)
+        card.pack()
 
-        port_row = ttk.Frame(card)
-        port_row.grid(row=2, column=0, pady=(0, 16))
-        ttk.Label(port_row, text="端口:").pack(side=tk.LEFT)
+        tk.Label(card, text="TINDISTANCE · PIT-WALL", bg=theme.PANEL,
+                 fg=theme.FAINT, font=theme.FONT_EYEBROW).pack(anchor="w")
+        tk.Label(card, text="Core-Bridge", bg=theme.PANEL, fg=theme.INK,
+                 font=("Segoe UI Semibold", 26)).pack(anchor="w", pady=(4, 2))
+        tk.Label(card, text="小车核心控制端 · 图传 / 延迟 / 日志", bg=theme.PANEL,
+                 fg=theme.MUTE, font=theme.FONT_BODY).pack(anchor="w", pady=(0, 18))
+
+        # 琥珀信号线：全启动屏唯一的高饱和元素
+        tk.Frame(card, bg=theme.AMBER, height=2).pack(fill=tk.X, pady=(0, 18))
+
+        port_row = tk.Frame(card, bg=theme.PANEL)
+        port_row.pack(fill=tk.X, pady=(0, 16))
+        tk.Label(port_row, text="端口", bg=theme.PANEL, fg=theme.MUTE,
+                 font=theme.FONT_SMALL).pack(side=tk.LEFT)
         self._port_var = tk.StringVar(value="8000")
-        ttk.Entry(port_row, textvariable=self._port_var, width=8).pack(side=tk.LEFT, padx=6)
+        ttk.Entry(port_row, textvariable=self._port_var, width=8).pack(side=tk.LEFT, padx=(8, 0))
 
-        self._start_btn = ttk.Button(card, text="启动 Server", command=self._start)
-        self._start_btn.grid(row=3, column=0, pady=(0, 12))
+        self._start_btn = ttk.Button(card, text="启动 Server", style="Accent.TButton",
+                                      command=self._start)
+        self._start_btn.pack(fill=tk.X, pady=(0, 8))
 
-        self._status_var = tk.StringVar(value="")
-        ttk.Label(card, textvariable=self._status_var).grid(row=4, column=0, pady=(0, 12))
+        self._status_var = tk.StringVar(value="Server 还未启动")
+        tk.Label(card, textvariable=self._status_var, bg=theme.PANEL,
+                 fg=theme.MUTE, font=theme.FONT_SMALL).pack()
 
         self._poll_result()
 
@@ -43,7 +65,7 @@ class StartScreen(ttk.Frame):
         try:
             port = int(self._port_var.get())
         except ValueError:
-            self._status_var.set("端口无效")
+            self._status_var.set("端口无效，填 1024~65535 之间的数字")
             return
 
         self._start_btn.config(state=tk.DISABLED)
@@ -53,8 +75,6 @@ class StartScreen(ttk.Frame):
             manager = ServerManager(port=port)
             ok = manager.start()
             self._result.put((manager, ok))
-
-        import threading
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -69,7 +89,6 @@ class StartScreen(ttk.Frame):
             self._on_ready(manager)
         else:
             self._start_btn.config(state=tk.NORMAL)
-            self._status_var.set("启动失败，请检查端口后重试")
+            self._status_var.set("启动失败，换个端口再试一次")
             manager.stop()
-            self._manager = None
             self.after(200, self._poll_result)

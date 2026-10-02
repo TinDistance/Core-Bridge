@@ -55,6 +55,7 @@ class VideoHub:
         self.latest_at: float = 0.0  # monotonic
         self.latest_wall: float = 0.0
         self.sender: str = ""
+        self._boot: float = time.monotonic()
         # 统计
         self.chunks_rx = 0
         self.chunks_bad = 0
@@ -62,6 +63,7 @@ class VideoHub:
         self.frames_dropped = 0
         self.frames_bad_jpeg = 0
         self._frame_times: deque[float] = deque(maxlen=30)
+        self._intervals_ms: deque[float] = deque(maxlen=120)
         self._partials: dict[int, _Partial] = {}
 
     # ---------- 组包入口（UDP 协议回调调用） ----------
@@ -128,6 +130,8 @@ class VideoHub:
             self.latest_wall = time.time()
             self.sender = addr
             self.frames_ok += 1
+            if self._frame_times:
+                self._intervals_ms.append((now - self._frame_times[-1]) * 1000.0)
             self._frame_times.append(now)
 
     # ---------- 查询 ----------
@@ -146,6 +150,21 @@ class VideoHub:
             return 0.0
         return (len(self._frame_times) - 1) / dt
 
+    @property
+    def jitter_ms(self) -> float:
+        """最近帧间隔的抖动（总体标准差），样本不足时返回 0。"""
+        n = len(self._intervals_ms)
+        if n < 3:
+            return 0.0
+        tail = list(self._intervals_ms)[-30:]
+        mean = sum(tail) / len(tail)
+        var = sum((x - mean) ** 2 for x in tail) / len(tail)
+        return round(var**0.5, 1)
+
+    def recent_intervals_ms(self, n: int = 60) -> list[float]:
+        n = max(1, min(n, 120))
+        return [round(x, 1) for x in list(self._intervals_ms)[-n:]]
+
     def age_ms(self) -> int:
         if self.latest_jpeg is None:
             return -1
@@ -158,12 +177,16 @@ class VideoHub:
             "frame_id": self.latest_frame_id,
             "age_ms": self.age_ms(),
             "fps": round(self.fps, 2),
+            "jitter_ms": self.jitter_ms,
             "jpeg_bytes": len(self.latest_jpeg) if self.latest_jpeg else 0,
             "frames_ok": self.frames_ok,
             "frames_dropped": self.frames_dropped,
             "frames_bad_jpeg": self.frames_bad_jpeg,
             "chunks_rx": self.chunks_rx,
             "chunks_bad": self.chunks_bad,
+            "inflight": len(self._partials),
+            "uptime_s": round(time.monotonic() - self._boot, 1),
+            "server_time": round(time.time(), 3),
             "sender": self.sender,
             "protocol": "udp-jpeg-v1",
         }

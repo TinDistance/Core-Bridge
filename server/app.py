@@ -1,21 +1,32 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 
-from server.logs import hub
-from server.routers import command, heartbeat, logs, webrtc
+from server.logs import hub as log_hub
+from server.routers import command, heartbeat, logs, video, webrtc
+from server.routers.video import start_udp_listener, stop_udp_listener
 
-app = FastAPI(title="Core-Bridge Server", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    import asyncio
+
+    log_hub.set_loop(asyncio.get_running_loop())
+    await start_udp_listener()
+    try:
+        yield
+    finally:
+        await stop_udp_listener()
+
+
+app = FastAPI(title="Core-Bridge Server", version="0.2.0", lifespan=lifespan)
 
 app.include_router(command.router)
 app.include_router(heartbeat.router)
+app.include_router(video.router)
+# 旧 WebRTC 链路保留做回滚，但桌面默认走 /video（UDP+JPEG）
 app.include_router(webrtc.router)
 app.include_router(logs.router)
-
-
-@app.on_event("startup")
-async def on_startup() -> None:
-    import asyncio
-
-    hub.set_loop(asyncio.get_running_loop())
 
 
 def main() -> None:

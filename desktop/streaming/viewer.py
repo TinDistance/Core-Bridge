@@ -1,112 +1,110 @@
-import asyncio
+import io
 import threading
+import time
 from collections import deque
-from typing import Optional, Union
+from typing import Union
 
 import httpx
-from aiortc import RTCPeerConnection, RTCSessionDescription
-from aiortc.mediastreams import MediaStreamError, MediaStreamTrack
+from PIL import Image
 
-Event = tuple[str, Union[str, "object"]]
+Event = tuple[str, Union[str, "Image.Image"]]
 
 
 class Viewer:
-    """Pulls the currently pushed stream from the server and yields PIL frames.
+    """经 HTTP 拉取 server 重组好的 JPEG 帧并产出 PIL 帧。
 
-    Runs its own asyncio loop in a background thread; reconnects automatically.
+    链路：K230 UDP 分片 -> server:8001 重组 -> GET /video/latest.jpg。
+    只收完整帧（server 已做 SOI/EOI 校验），本端解码失败则丢帧不崩。
+
     Events: ("frame", PIL.Image) | ("status", "streaming"|"no_stream"|text)
+    接口与旧 WebRTC Viewer 一致，StreamPanel 无需改动。
     """
 
-    def __init__(self, server_url: str) -> None:
+    def __init__(self, server_url: str, fps: int = 12) -> None:
         self.server_url = server_url.rstrip("/")
-        self._events: deque[Event] = deque(maxlen=64)
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._stop_event: asyncio.Event | None = None
+        self.fps = max(1, min(fps, 20))
+        # 帧队列只留最新几帧，避免网络抖动时延迟堆积
+        self._events: deque[Event] = deque(maxlen=8)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._last_id: int | None = None
+        self._streaming = False
 
     def start(self) -> None:
         if self._thread is not None:
             return
-        self._thread = threading.Thread(target=self._thread_main, daemon=True, name="webrtc-viewer")
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._thread_main, daemon=True, name="jpeg-viewer")
         self._thread.start()
 
     def stop(self) -> None:
-        if self._stop_event is not None and self._loop is not None:
-            self._loop.call_soon_threadsafe(self._stop_event.set)
+        self._stop.set()
 
     def events(self) -> list[Event]:
-        out = list(self._events)
-        self._events.clear()
+        with self._lock:
+            out = list(self._events)
+            self._events.clear()
         return out
 
     def _emit(self, event: Event) -> None:
-        self._events.append(event)
+        with self._lock:
+            self._events.append(event)
+
+    def _set_streaming(self, on: bool) -> None:
+        if on == self._streaming:
+            return
+        self._streaming = on
+        self._emit(("status", "streaming" if on else "no_stream"))
 
     def _thread_main(self) -> None:
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
+        interval = 1.0 / self.fps
+        fail_streak = 0
         try:
-            self._loop.run_until_complete(self._run())
+            with httpx.Client(timeout=3.0, trust_env=False) as client:
+                while not self._stop.is_set():
+                    t0 = time.monotonic()
+                    try:
+                        url = f"{self.server_url}/video/latest.jpg"
+                        params = {"since": self._last_id} if self._last_id is not None else None
+                        resp = client.get(url, params=params)
+                        if resp.status_code == 304:
+                            pass  # 无新帧，等下一拍
+                        elif resp.status_code == 404:
+                            self._last_id = None
+                            self._set_streaming(False)
+                            fail_streak = 0
+                        elif resp.status_code == 200:
+                            fail_streak = 0
+                            fid = resp.headers.get("X-Frame-Id")
+                            try:
+                                img = Image.open(io.BytesIO(resp.content))
+                                img.load()  # 在网络线程内解码完，避免懒加载跨线程问题
+                            except Exception:
+                                pass  # 坏帧直接丢，不更新 last_id 等下一帧
+                            else:
+                                if fid is not None:
+                                    try:
+                                        self._last_id = int(fid)
+                                    except ValueError:
+                                        pass
+                                self._set_streaming(True)
+                                self._emit(("frame", img))
+                        else:
+                            fail_streak += 1
+                            if fail_streak == 1:
+                                self._emit(("status", f"视频流异常: HTTP {resp.status_code}"))
+                    except Exception as e:
+                        fail_streak += 1
+                        # 降频打日志：只在第一次失败/恢复时提示，避免刷屏
+                        if fail_streak == 1:
+                            self._emit(("status", f"连接失败: {e}"))
+                        self._set_streaming(False)
+                        time.sleep(1.5)
+                        continue
+                    dt = time.monotonic() - t0
+                    rest = interval - dt
+                    if rest > 0:
+                        self._stop.wait(rest)
         finally:
-            self._loop.close()
-            self._loop = None
             self._thread = None
-
-    async def _run(self) -> None:
-        self._stop_event = asyncio.Event()
-        while not self._stop_event.is_set():
-            try:
-                await self._watch_once()
-            except Exception as e:
-                self._emit(("status", f"连接失败: {e}"))
-            if not self._stop_event.is_set():
-                await asyncio.sleep(3)
-
-    async def _watch_once(self) -> None:
-        pc = RTCPeerConnection()
-        track_holder: dict[str, Optional[MediaStreamTrack]] = {"track": None}
-
-        @pc.on("track")
-        def on_track(track: MediaStreamTrack) -> None:
-            track_holder["track"] = track
-
-        pc.addTransceiver("video", direction="recvonly")
-
-        offer = await pc.createOffer()
-        await pc.setLocalDescription(offer)
-        async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
-            resp = await client.post(
-                f"{self.server_url}/webrtc/watch",
-                json={"sdp": pc.localDescription.sdp, "type": "offer"},
-            )
-            if resp.status_code == 404:
-                self._emit(("status", "no_stream"))
-                await self._wait_stop_or_timeout(3)
-                return
-            resp.raise_for_status()
-            answer = resp.json()
-        await pc.setRemoteDescription(RTCSessionDescription(sdp=answer["sdp"], type=answer["type"]))
-
-        track = track_holder["track"]
-        if track is None:
-            self._emit(("status", "未收到视频轨"))
-            await self._wait_stop_or_timeout(3)
-            return
-
-        self._emit(("status", "streaming"))
-        try:
-            while not self._stop_event.is_set():
-                frame = await track.recv()
-                self._emit(("frame", frame.to_image()))
-        except MediaStreamError:
-            self._emit(("status", "no_stream"))
-        finally:
-            self._emit(("status", "disconnected"))
-            await pc.close()
-
-    async def _wait_stop_or_timeout(self, timeout: float) -> None:
-        assert self._stop_event is not None
-        try:
-            await asyncio.wait_for(self._stop_event.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            pass

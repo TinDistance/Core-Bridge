@@ -2,3 +2,7 @@ fastapi
 uvicorn[standard]
 aiortc
 pydantic
+mss
+numpy
+websockets
+httpx

@@ -1,24 +1,4 @@
-# K230 (CanMV / MicroPython) UDP+JPEG 分片推送 -> Core-Bridge server.
-#
-# 链路：Sensor snapshot -> JPEG 压缩 -> UDP 分片（每片 <=1200B）-> server:8001/udp
-#       server 重组完整帧 -> desktop 经 HTTP /video/latest.jpg 轮询显示
-#
-# 为什么不用 WebRTC/H.264：
-#   * K230 固件 webrtc 栈 + aiortc 对接脆弱（SDP/连接状态难排错）
-#   * UDP+JPEG 无连接、无重传、丢包只丢一帧，WiFi 下更稳、延迟更低
-#
-# 稳定性关键（不要随意删）：
-#   1. 分辨率默认 640x480 + quality 65：单帧约 20~40KB（约 20~35 包），
-#      720p 下单帧 60~100KB+，WiFi 丢包率指数上升。如需清晰度再往上加。
-#   2. 片间 pacing 2ms：避免 UDP 突发把路由器/PC 接收缓冲打爆。
-#   3. 固定帧率 + 跳帧：capture+send 超时则直接下一帧，不堆积。
-#   4. socket 复用 + 发送失败重建；WiFi 断线自动重连。
-#   5. frame_id u16 循环，server 靠 (frame_id,total,idx) 重组，乱序/重复都安全。
-#
-# 服务端对应：server/video_hub.py + server/routers/video.py（协议 v1）
-#   头 12B 大端 ">HBBHHHH"：magic=0x4A50, ver=1, flags=0,
-#                          frame_id, total, idx, plen
-
+import gc
 import socket
 import struct
 import time
@@ -42,6 +22,7 @@ JPEG_QUALITY = 65           # 50~75 之间最稳
 FPS = 12                    # WiFi 下 10~15 最稳
 CHUNK_SIZE = 1100           # payload 上限（<=1200，留余量）
 CHUNK_GAP_MS = 2            # 片间 pacing，WiFi 稳定关键
+GC_COLLECT_EVERY = 100      # 每 N 帧强制一次 gc（100 帧 ≈ 8s @ 12fps）
 # ================================================
 
 _MAGIC = 0x4A50
@@ -50,13 +31,17 @@ _HEADER = ">HBBHHHH"
 _HEADER_SIZE = 12
 
 sensor = None
+_sta = None
+
+# 预分配发送缓冲：所有分片复用同一块内存，避免每片新分配 bytes 造成堆碎片
+_SEND_BUF = bytearray(_HEADER_SIZE + CHUNK_SIZE)
+_SEND_MV = memoryview(_SEND_BUF)
 
 
 def init_camera():
     global sensor
     sensor = Sensor(id=SENSOR_ID)
     sensor.reset()
-    # snapshot 用 RGB888（JPEG 压缩输入）；不要用 YUV420SP（那是给 VENC 的）
     try:
         sensor.set_framesize(width=WIDTH, height=HEIGHT, chn=CAM_CHN_ID_0)
     except TypeError:
@@ -71,10 +56,18 @@ def init_camera():
     print("[1/3] camera init done (%dx%d)" % (WIDTH, HEIGHT))
 
 
+def get_sta():
+    """WLAN 单例，避免多次 network.WLAN 造成重复分配。"""
+    global _sta
+    if _sta is None:
+        _sta = network.WLAN(network.STA_IF)
+    if not _sta.active():
+        _sta.active(True)
+    return _sta
+
+
 def connect_wifi(timeout_s=15):
-    sta = network.WLAN(network.STA_IF)
-    if not sta.active():
-        sta.active(True)
+    sta = get_sta()
     if sta.isconnected():
         ip, _nm, gw, _dns = sta.ifconfig()
         print("WiFi already up. IP: %s GW: %s" % (ip, gw))
@@ -110,9 +103,8 @@ def ensure_wifi(sta):
     return sta.isconnected()
 
 
-def capture_jpeg():
-    """返回 JPEG bytes；兼容不同固件的 compress/to_jpeg 命名。"""
-    img = sensor.snapshot()
+def _compress_image(img):
+    """在已抓取的 image 对象上尝试各种 JPEG 压缩 API。失败返回 None。"""
     for name in ("compress", "to_jpeg", "to_jpeg_bytes", "jpeg_encode"):
         fn = getattr(img, name, None)
         if fn is None:
@@ -123,62 +115,91 @@ def capture_jpeg():
             except TypeError:
                 data = fn(quality=JPEG_QUALITY)
             if data is not None and len(data) > 4:
-                return bytes(data)
+                # 已经是 bytes 就不再拷贝
+                return data if isinstance(data, bytes) else bytes(data)
         except Exception as e:
             print("capture via %s failed: %s" % (name, str(e)))
             continue
-    # 有些固件 snapshot(compress=True) 直接回 JPEG
+    return None
+
+
+def capture_jpeg():
+    """返回 JPEG bytes；兼容不同固件的 compress/to_jpeg 命名。"""
+    # 主路径：抓帧 + image.compress()
+    img = sensor.snapshot()
     try:
-        img2 = sensor.snapshot(compress=True, quality=JPEG_QUALITY)
-        if img2 is not None and len(img2) > 4:
-            return bytes(img2)
-    except Exception:
-        pass
-    raise RuntimeError("no JPEG API: image attrs=" + str([a for a in dir(img) if 'jpeg' in a.lower() or 'compress' in a.lower()]))
+        data = _compress_image(img)
+        if data is not None:
+            return data
+    finally:
+        # 显式断开帧缓冲引用，帮助 GC 尽早回收（K230 帧缓冲走 MMZ，回收越早越好）
+        del img
+
+    # 回退：有些固件 snapshot(compress=True) 直接返回 JPEG
+    try:
+        data = sensor.snapshot(compress=True, quality=JPEG_QUALITY)
+    except TypeError:
+        data = sensor.snapshot(compress=True)
+    if data is not None and len(data) > 4:
+        return data if isinstance(data, bytes) else bytes(data)
+    raise RuntimeError("no JPEG API")
 
 
 def make_sock():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    return s
+    return socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 
 def send_frame(s, server_ip, frame_id, jpeg):
+    """把一帧 JPEG 分片发出，返回分片数；异常由调用方处理。"""
     total = (len(jpeg) + CHUNK_SIZE - 1) // CHUNK_SIZE
     if total < 1:
         return 0
     if total > 256:
         print("frame too big (%dB/%d chunks), drop" % (len(jpeg), total))
         return 0
+
     mv = memoryview(jpeg)
+    addr = (server_ip, SERVER_UDP_PORT)
+    fid = frame_id & 0xFFFF
+    buf = _SEND_BUF
+    sbuf = _SEND_MV
+    last = total - 1
+
     for idx in range(total):
         st = idx * CHUNK_SIZE
         ed = st + CHUNK_SIZE
         if ed > len(jpeg):
             ed = len(jpeg)
-        piece = mv[st:ed]
-        hdr = struct.pack(_HEADER, _MAGIC, _VER, 0, frame_id & 0xFFFF, total, idx, (ed - st))
+        plen = ed - st
+        struct.pack_into(_HEADER, buf, 0,
+                         _MAGIC, _VER, 0, fid, total, idx, plen)
+        # 拷贝 payload 到复用缓冲
+        buf[_HEADER_SIZE:_HEADER_SIZE + plen] = mv[st:ed]
+        pkt = sbuf[:_HEADER_SIZE + plen]
         try:
-            s.sendto(hdr + piece, (server_ip, SERVER_UDP_PORT))
-        except Exception as e:
-            raise e
-        if CHUNK_GAP_MS and idx != total - 1:
+            s.sendto(pkt, addr)
+        except TypeError:
+            # 少数固件的 sendto 不接受 memoryview，退回 bytes
+            s.sendto(bytes(pkt), addr)
+        if CHUNK_GAP_MS and idx != last:
             time.sleep_ms(CHUNK_GAP_MS)
     return total
 
 
 def main():
-    global sensor
     init_camera()
     _ip, gateway = connect_wifi()
     server_ip = SERVER_IP or gateway
-    print("[3/3] pushing udp+jpeg to %s:%d q=%d fps=%d" % (server_ip, SERVER_UDP_PORT, JPEG_QUALITY, FPS))
+    print("[3/3] pushing udp+jpeg to %s:%d q=%d fps=%d"
+          % (server_ip, SERVER_UDP_PORT, JPEG_QUALITY, FPS))
 
-    sta = network.WLAN(network.STA_IF)
+    sta = get_sta()
     s = make_sock()
     frame_id = 0
     interval_ms = int(1000 / FPS)
     sent_frames = 0
     dropped = 0
+    last_len = 0
     t_stat = time.time()
 
     while True:
@@ -187,12 +208,14 @@ def main():
             os.exitpoint()
         except Exception:
             pass
+
         t0 = time.ticks_ms() if hasattr(time, "ticks_ms") else 0
 
         if not ensure_wifi(sta):
             time.sleep(2)
             continue
 
+        jpeg = None
         try:
             jpeg = capture_jpeg()
         except Exception as e:
@@ -205,32 +228,50 @@ def main():
         if len(jpeg) < 4 or jpeg[0] != 0xFF or jpeg[1] != 0xD8:
             print("bad jpeg head, drop len=%d" % len(jpeg))
             dropped += 1
+            del jpeg
             continue
 
+        last_len = len(jpeg)
         try:
             send_frame(s, server_ip, frame_id, jpeg)
             frame_id = (frame_id + 1) & 0xFFFF
             sent_frames += 1
         except Exception as e:
             print("udp send err: " + str(e) + ", rebuild socket")
+            # 先清引用，再重建，避免旧 socket 悬挂
             try:
                 s.close()
             except Exception:
                 pass
+            s = None
+            gc.collect()
             try:
                 s = make_sock()
             except Exception:
                 pass
             dropped += 1
+            del jpeg
             time.sleep_ms(100)
             continue
 
+        # 及时释放 JPEG 引用，让 GC 有机会在下一帧前回收
+        del jpeg
+
+        # 周期性强制回收：MicroPython 堆碎片在长时间运行下会拖慢分配
+        if sent_frames and (sent_frames % GC_COLLECT_EVERY) == 0:
+            gc.collect()
+
         now = time.time()
         if now - t_stat >= 10:
-            print("stat: sent=%d dropped=%d last=%dB" % (sent_frames, dropped, len(jpeg)))
+            try:
+                free = gc.mem_free()
+            except Exception:
+                free = -1
+            print("stat: sent=%d dropped=%d last=%dB free=%d"
+                  % (sent_frames, dropped, last_len, free))
             t_stat = now
 
-        # 帧率 pacing：capture+send 花掉的时间扣掉
+        # 帧率 pacing：扣掉 capture+send 花掉的时间
         if hasattr(time, "ticks_ms"):
             try:
                 spent = time.ticks_diff(time.ticks_ms(), t0)
@@ -259,3 +300,9 @@ finally:
             sensor.stop()
     except Exception:
         pass
+    try:
+        if _sta is not None:
+            _sta.active(False)
+    except Exception:
+        pass
+    gc.collect()

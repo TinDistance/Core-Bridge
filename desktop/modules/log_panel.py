@@ -1,6 +1,9 @@
 import queue
+import threading
 import tkinter as tk
 from tkinter import ttk
+
+import httpx
 
 from desktop.logs.log_client import LogClient
 from desktop.modules.base_panel import BasePanel
@@ -32,11 +35,24 @@ class LogPanel(BasePanel):
         self._text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
+        self.after(0, self._clear_remote_history)
         self.after(200, self._poll)
+
+    def _clear_remote_history(self) -> None:
+        """Drop the server's buffered log lines so the desktop starts clean."""
+        url = self._default_server.rstrip("/")
+        threading.Thread(target=self._clear_worker, args=(url,), daemon=True).start()
+
+    def _clear_worker(self, url: str) -> None:
+        try:
+            httpx.delete(f"{url}/logs", timeout=2)
+        except Exception:
+            pass
 
     def _toggle(self) -> None:
         if self._client is None:
             self._queue = queue.Queue()
+            self._reset_text()
             url = self._server_var.get().rstrip("/")
             if url.startswith("http://"):
                 url = "ws://" + url[len("http://"):]
@@ -49,6 +65,11 @@ class LogPanel(BasePanel):
             self._client.stop()
             self._client = None
             self._toggle_btn.config(text="连接")
+
+    def _reset_text(self) -> None:
+        self._text.config(state=tk.NORMAL)
+        self._text.delete("1.0", tk.END)
+        self._text.config(state=tk.DISABLED)
 
     def _poll(self) -> None:
         self._text.config(state=tk.NORMAL)

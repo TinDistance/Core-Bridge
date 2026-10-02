@@ -5,6 +5,12 @@ from server.logs import hub
 router = APIRouter(tags=["logs"])
 
 
+@router.delete("/logs")
+async def clear_logs() -> dict:
+    hub.history.clear()
+    return {"ok": True}
+
+
 @router.websocket("/ws/logs")
 async def ws_logs(websocket: WebSocket) -> None:
     await websocket.accept()

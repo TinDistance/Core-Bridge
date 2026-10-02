@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 import httpx
 
+from desktop.gamepad import commands as cmd_builder
 from desktop.gamepad import xinput as xi
 
 
@@ -132,8 +133,11 @@ class GamepadPusher:
             return False, ""
         try:
             parsed = xi.parse_protocol(st.proto)
+            cmds = cmd_builder.build_commands(
+                parsed["lx"], parsed["ly"], parsed["rx"], parsed["ry"])
             resp = client.post(f"{base}/command", json={
                 "raw_hex": parsed["raw_hex"],
+                "cmds": cmds,
                 "slot": st.slot,
                 "packet": st.packet,
                 "client_ts": round(now, 3),

@@ -1,11 +1,12 @@
 from fastapi import FastAPI
 
 from server.logs import hub
-from server.routers import command, logs, webrtc
+from server.routers import command, heartbeat, logs, webrtc
 
 app = FastAPI(title="Core-Bridge Server", version="0.1.0")
 
 app.include_router(command.router)
+app.include_router(heartbeat.router)
 app.include_router(webrtc.router)
 app.include_router(logs.router)
 

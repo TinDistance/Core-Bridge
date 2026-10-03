@@ -1,37 +1,3 @@
-# K230 (CanMV) H264 裸 RTP 推流 + UART 命令桥（方案 A 发送端）。
-#
-# 与 udp_jpeg_push.py / webrtc_push.py 的关系：
-#   * 采集/编码管线与 webrtc_push.py 相同：Sensor(chn0 YUV420SP) -> VENC(H264)
-#     -> GetStream 出 NALU；但不走 webrtc.PeerConnection/aiortc 握手，
-#     改为按 RFC 6184 自行 RTP 打包（单 NAL / FU-A）直发 server:8002。
-#   * 服务器只做纯转发（server/rtp_relay.py），桌面端 PyAV 解码。
-#   * UART 命令桥与 udp_jpeg_push.py 相同：server 从视频包学习本机地址后，
-#     经 8001 socket 反推 v2 UART 帧；本脚本同一收发 socket 排空缓存，
-#     AA55 帧转发 UART3，CBR\x01 控制包触发 RequestIDR。
-#
-# 低延迟要点：
-#   * profile=BASELINE（禁 B 帧）；bit_rate CBR；gopLen=15（0.5s 自愈窗口，
-#     GOP 直接等于桌面端最坏黑屏时长，见下面 GOP_LEN 处注释）
-#   * GetStream timeout=20ms；时间戳用帧计数 * 3000（90kHz/30fps），
-#     不依赖 stream.pts 单位
-#   * sendto 失败只丢当帧：不重建 socket、不 sleep（对比 JPEG 版老问题）
-#
-# 拥塞控制（丢包策略，见下面"带宽预算"）：
-#   帧间编码和帧内编码的丢包代价完全不同：
-#     * JPEG 丢一包 = 丢一帧，下一帧立刻可用。
-#     * H264 丢一个 P 帧 = 参考链断裂，直到下一个 IDR 才能解码。桌面端
-#       因此在检测到 seq 跳变后会 wait_idr 拒收所有 P 帧。
-#   => I 帧是唯一的画面恢复手段，必须无条件发送，绝不能被限速/丢弃。
-#   => P 帧按 airtime 守卫丢：估这帧占满 5Mbps 需要多久，超过帧间隔的
-#      MAX_PFRAME_DUTY 就整帧丢弃。链路跟不上时继续往 AP 队列灌包只会
-#      让缓冲溢出、延迟累积，反而更糟。
-#   => 不做重传：25ms 后才到的帧对 5Mbps@30fps 毫无价值，且重传会挤占
-#      本来就不够的带宽。恢复靠"立刻请求新 IDR"。
-#
-# 验证实验（实施前置，见 k230/rtp_diag.py）：
-#   E1 UDP goodput（test/udp_flood_rx.py + diag_udp_flood）
-#   E2 GetStream NALU 形态（Annex-B/SPS/PPS/pts）
-#   E3 MediaManager 是否需要显式 init
 import gc
 import os
 import socket
@@ -44,94 +10,54 @@ from media.sensor import *
 from media.media import *
 from media.vencoder import *
 
-# ==================== 配置区 ====================
 WIFI_SSID = "TF-Laptop"
 WIFI_PASSWORD = "TF@HTR.Hello"
-SERVER_IP = None            # None = 用网关地址（连热点时网关就是电脑）
+# 注意：SSID/密码提交仅为校内赛默认；优先使用 wifi.cfg / 环境变量覆盖，避免改代码。
+try:
+    _cfg_ssid = os.environ.get("WIFI_SSID") if hasattr(os, "environ") else None
+    _cfg_pass = os.environ.get("WIFI_PASSWORD") if hasattr(os, "environ") else None
+    if _cfg_ssid:
+        WIFI_SSID = _cfg_ssid
+    if _cfg_pass:
+        WIFI_PASSWORD = _cfg_pass
+except Exception:
+    pass
+SERVER_IP = None
+try:
+    _cfg_ip = os.environ.get("SERVER_IP") if hasattr(os, "environ") else None
+    if _cfg_ip:
+        SERVER_IP = _cfg_ip
+except Exception:
+    pass
 RTP_PORT = 8002
 SENSOR_ID = 2
-WIDTH = 1280                # 编码宽度（自动 16 对齐）
+WIDTH = 1280
 HEIGHT = 720
-BIT_RATE = 3072             # Kbit/s CBR（2.4G 下 3M 安全，必要时调低）
-GOP_LEN = 15              # IDR 间隔 0.5s。桌面端一旦判丢包就拒收所有 P 帧，
-                          # 等下一个 IDR 才恢复画面，所以 GOP 直接等于最坏
-                          # 黑屏时长。30 帧(1s)对遥控太长了；15 帧配合
-                          # CBR 不涨码率（IDR 变小即可），只轻微掉画质。
+BIT_RATE = 16000
+GOP_LEN = 60
 FPS = 30
-MAX_PAYLOAD = 1200          # 单 RTP 包 payload 上限（<1472 不触发 IP 分片）
+MAX_PAYLOAD = 1200
 CMD_STALE_MS = 200
 UART3_BAUD = 115200
 GC_COLLECT_EVERY = 100
-# ================================================
 
-# ==================== 带宽预算 ====================
-# 5Mbps 链路 @30fps 的每帧预算是 5e6/30/8 ≈ 20.8KB（已扣 RTP+UDP+IP 头
-# 约 2.9%，可用 ~20.2KB）。JPEG 帧内编码达不到这个质量档（720p q65 实测
-# 60~100KB，超预算 3~5 倍），所以必须走帧间编码 —— 这就是本脚本存在的原因。
-#
-# 换算成 RTP 包数：
-_PKTS_AVG = BIT_RATE * 1000 // FPS // 8 // MAX_PAYLOAD + 1   # 平均帧包数
-# I 帧峰值按平均的 IFRAME_PEAK_RATIO 倍留量。实测 720p30@3Mbps 时 I 帧是
-# 平均的 5~8 倍，16 倍是保守上界。
-IFRAME_PEAK_RATIO = 16
-IFRAME_PKTS_MAX = _PKTS_AVG * IFRAME_PEAK_RATIO + 8
-
-# 链路余量守卫：5Mbps 是实测值，估一帧在空中要占多久，超了就整帧丢弃。
-# 只对 P 帧生效 —— I 帧是恢复手段，宁可超发也不能丢。
-# 链路跟不上时继续往 AP 队列里灌包，只会让缓冲溢出、延迟累积，反而更糟。
-LINK_KBPS = 5000           # 实测 K230<->PC 可用带宽
-WIRE_OVERHEAD_PER_PKT = 12 + 8 + 20               # RTP头+UDP头+IP头
+LINK_KBPS = 20000
 FRAME_INTERVAL_MS = 1000 // FPS
-FRAME_PERIOD_MS = 1000 // FPS     # 软件帧率闸门周期
-MAX_PFRAME_DUTY = 0.8      # P 帧 airtime 占帧间隔的上限
+FRAME_PERIOD_MS = FRAME_INTERVAL_MS
+MAX_PFRAME_DUTY = 0.8
 
-# ---- airtime 节流器（pacer）------------------------------------------
-# 背景（数字全部可复算，见文件末尾注释）：
-#   旧实现是"按包数"的令牌桶：PACER_PPS = IFRAME_PKTS_MAX * FPS // 2
-#   = 184*30//2 = 2760 pps，桶容量 PACER_BURST = 184 个 token。
-#   **它从来没有限过速。** 推导：
-#     * 令牌补充速率 2760 pps，而需求 = 平均帧包数 / 帧间隔
-#       ≈ 13 / 0.0333 = 390 pps。补充 >> 消耗，桶被容量 184 顶死在满格。
-#     * 仿真（13 包 P 帧 / GOP15 / 98 包 I 帧，300 帧）实测 5600 个包里
-#       等待次数 = 0，令牌最低只跌到 87/184。
-#     * I 帧路径连 pacer.has() 预检都跳过，take(1) 又因为桶是满的而不睡
-#       => 整帧在几微秒内灌进 AP 队列。
-#   所以旧的 PACER_PPS=2760 只是一个"永远不会被触碰的数字"，注释里
-#   "≈60 次/秒"的说法与代码也不符（2760 是 pps，不是每 2760 包等一次）。
-#   真正限制平均码率的是 VENC 的 CBR + 下面的软件帧率闸门，不是 pacer。
-#
-# 新实现：按**字节**的 airtime 令牌桶，所有包（含关键帧）都必须 take()。
-#   * 目标线速 = LINK_KBPS * PACER_DUTY，留 15% 给 WiFi 重传/ACK 开销。
-#   * 每包消耗 = payload + 每包 40B 线速开销，即它真实占用链路的时间。
-#   * => 相邻包最小间隔 = 1240*8 / 4.25e6 = 2.33ms，即节流上限 428pps。
-#     内容侧只有 3.07Mbps/1240B = 309pps，所以稳态由内容限速（309pps），
-#     pacer 只在 I 帧突发期间介入（瞬时不超过 428pps）。
-#   * 桶容量 = 2 个帧间隔的目标线速字节数（~35KB）：启动时能快速灌满管道，
-#     又不至于一次性放出整个 I 帧。
-PACER_DUTY = 0.85
-PACER_WIRE_KBPS = int(LINK_KBPS * PACER_DUTY)              # 4250 Kbps 上限
-_PACER_BYTES_PER_S = PACER_WIRE_KBPS * 1000 / 8.0          # 531250 B/s
+PACER_DUTY = 0.90
+PACER_WIRE_KBPS = int(LINK_KBPS * PACER_DUTY)
+_PACER_BYTES_PER_S = PACER_WIRE_KBPS * 1000 / 8.0
 PACER_BURST_BYTES = int(_PACER_BYTES_PER_S * 2 * FRAME_INTERVAL_MS / 1000.0)
 
-# 单帧节流时长上限。I 帧实测可达 ~100KB（≈81 包 * 2.33ms = 189ms 的 airtime），
-# 上限必须 >= 这个值，否则最该被摊平的 I 帧反而残留突发。
-# 取 200ms = 6 个帧间隔：编���器 outbuf 能在主循环阻塞期间接住新帧；
-# 超预算时不再等待（受控突发）并把 token 打成负数，让紧随其后的 P 帧被
-# can_send() 预检丢掉 —— 用"丢 P 帧"换"不打爆队列"。I 帧之后 P 帧本来
-# 就因参考链语义而失效，且下一个 IDR 最多 500ms 后到。
-PACER_SPAN_MAX_MS = 200
+PACER_SPAN_MAX_MS = 300
 
-# IDR 请求合并/限频（详见 IdrGate 的注释）
-IDR_REQ_MIN_INTERVAL_MS = 800      # 两次"生效的"强制 IDR 请求的最小间隔
-IDR_REQ_SETTLE_MS = 500            # 最近真的发过 IDR 后的静默窗口
+IDR_REQ_MIN_INTERVAL_MS = 400
+IDR_REQ_SETTLE_MS = 500
 
-# VENC 输出缓冲深度推导：节流器最长阻塞 PACER_SPAN_MAX_MS，期间编码器
-# 会产出 ceil(200/33)=7 帧；再加 2 帧余量 => 9，取整到 10。
-# **不要再往上加**：outbuf 越大，积压的过期 P 帧越多、延迟越高，
-# 而节流器修好后突发已被摊平，够用即可。要改必须先看真机 pacer cap / txerr。
 OUT_BUFS = max(8, -(-PACER_SPAN_MAX_MS // FRAME_INTERVAL_MS) + 3)
 
-# ================================================
 
 sensor = None
 encoder = None
@@ -153,7 +79,6 @@ def init_camera():
     sensor = Sensor(id=SENSOR_ID)
     sensor.reset()
     width = ALIGN_UP(WIDTH, 16)
-    # chn0 提供给 VENC 编码，必须是 YUV420SP
     sensor.set_framesize(width=width, height=HEIGHT, alignment=12, chn=CAM_CHN_ID_0)
     sensor.set_pixformat(Sensor.YUV420SP, chn=CAM_CHN_ID_0)
     print("[1/4] camera init done (%dx%d)" % (width, HEIGHT))
@@ -206,7 +131,6 @@ def ensure_wifi(sta):
 
 
 def pick_profile(enc):
-    # Baseline 优先（禁 B 帧，低延迟），旧固件没有则退回 MAIN
     for name in ("H264_PROFILE_BASELINE", "H264_PROFILE_MAIN"):
         val = getattr(enc, name, None)
         if val is not None:
@@ -241,7 +165,6 @@ def init_encoder():
         encoder.chn, width, HEIGHT, profile_name, BIT_RATE))
 
 
-# ==================== RTP 打包 ====================
 def split_nalus(data):
     """Annex-B（00 00 00 01 / 00 00 01）-> NALU payload 列表（memoryview）。"""
     mv = memoryview(data)
@@ -292,12 +215,8 @@ def packetize_nalu(nalu, ts, seq, ssrc, out_packets):
     return seq
 
 
-# >>> PURE-PACER-CORE v1 >>>
-# 本段不引用任何 K230 专有 API：时钟/睡眠由外部注入，link_kbps 全部传参。
-# test/test_k230_pacer.py 抽取这两个标记之间的源码 exec 到带假时钟的命名
-# 空间里做纯逻辑仿真；改这里请同步看那个文件。
-PacerWireOverhead = 12 + 8 + 20          # RTP 12 + UDP 8 + IP 20
-TICKS_MS_PERIOD = 1 << 30               # MicroPython ticks_ms 回绕周期
+PacerWireOverhead = 12 + 8 + 20
+TICKS_MS_PERIOD = 1 << 30
 
 
 def ms_diff(now, then):
@@ -339,21 +258,7 @@ class SysClock:
 
 
 class Pacer:
-    """字节级 airtime 令牌桶。**每一个**发出的包（含关键帧）都必须 take()。
-
-    rate_kbps : 目标线速（wire Kbps）。相邻包最小间隔由它决定：
-                (payload + 40B) * 8 / rate_kbps。
-    burst     : 桶容量（wire 字节）= 允许的瞬时突发上限。
-    span_max_ms: 单帧节流时长上限，防止一个大 I 帧把主循环阻塞几百 ms。
-
-    取用逻辑（take）：
-      * 桶里够 -> 立刻放行，零等待。
-      * 不够   -> 分片 sleep 直到够，或直到本帧 span 预算耗尽。
-      * span 耗尽 -> 仍然放行（I 帧不能丢），但把 token 打成负数，
-        于是紧随其后的 P 帧在 can_send() 预检里被丢掉。
-        这就是"I 帧优先但不无节制突发"：优先靠 FIFO + 预检实现，
-        限突发靠"负 token 连带压制后续 P 帧"实现。
-    """
+    """字节级 airtime 令牌桶。**每一个**发出的包（含关键帧）都必须 take()。"""
 
     def __init__(self, rate_kbps, burst_bytes, clock, span_max_ms):
         self.clock = clock
@@ -362,17 +267,14 @@ class Pacer:
         self.tokens = float(burst_bytes)
         self.last = clock.now_us()
         self.span_max_us = int(span_max_ms * 1000)
-        # 初始就等于满预算：忘调 begin_frame() 时最坏只是"没有单帧上限"，
-        # 而不是"完全不节流"。fail-safe 方向必须是这个。
         self.span_left = self.span_max_us
-        # ---- 诊断计数（只读，不影响行为）----
         self.packets = 0
         self.wire_bytes = 0
-        self.wait_us = 0        # 累计节流等待时长
-        self.sleeps = 0         # sleep 次数
-        self.max_wait_us = 0    # 单包最长等待
-        self.cap_events = 0     # span 上限触发次数（>0 说明节流被截断）
-        self.min_gap_us = None  # 相邻包最小间隔
+        self.wait_us = 0
+        self.sleeps = 0
+        self.max_wait_us = 0
+        self.cap_events = 0
+        self.min_gap_us = None
 
     def wire_bytes_for(self, nbytes):
         return nbytes + PacerWireOverhead
@@ -412,7 +314,6 @@ class Pacer:
             deficit = need - self.tokens
             wait_us = int(deficit / (self.rate_bps / 8.0) * 1000000.0) + 50
             if self.span_left <= 0:
-                # 单帧预算耗尽：受控突发放行，并把 token 打成负数压制后续 P 帧。
                 self.tokens = max(self.tokens - need, -self.burst)
                 self.cap_events += 1
                 return waited
@@ -430,30 +331,13 @@ class Pacer:
 
 
 class IdrGate:
-    """IDR 请求合并/限频。
-
-    为什么必须限：编码器健康时 GOP=15@30fps 自然每 500ms 就出一个 IDR，
-    此时接收端的任何 IDR 请求都是多余的。而每强制一次 RequestIDR() 就多
-    一个 ~100KB 的 I 帧：旧实现限频 100ms => 最多 10 次/秒 => 1MB/s
-    = 8.4Mbps 的额外需求，单这一项就能灌爆 5Mbps 链路，并把队列撑到
-    秒级 —— 这正是"一落后就疯狂请求、越请求越延迟"的正反馈。
-
-    两道独立的闸门（都是纯合并，不丢"最后一次"的状态）：
-      * settle_ms : 最近真的发过 IDR 就合并掉。健康编码器下这条几乎总是
-        命中 => 强制 IDR 归零。
-      * interval_ms: 距上一次生效的强制请求不足就合并掉。这是硬上限，
-        保证强制 IDR 速率 <= 1000/interval_ms 次/秒。
-
-    被合并不等于丢恢复能力：编码器停了 IDR 的场景下，settle 闸门自然不再
-    命中，第一个请求就能生效，不会死锁。
-    """
+    """IDR 请求合并/限频。"""
 
     def __init__(self, interval_ms, settle_ms):
         self.interval_ms = interval_ms
         self.settle_ms = settle_ms
         self._last_idr_sent = None
         self._last_grant = None
-        # ---- 诊断计数（只读）----
         self.rx = 0
         self.granted = 0
         self.merged_idr = 0
@@ -489,19 +373,14 @@ class SendAborted(Exception):
     """send_paced 的 sink 抛这个来中止本帧（发送队列溢出时用）。"""
 
 
-# frame_admission 的返回值
 FRAME_SEND = 0
-FRAME_DROP_DUTY = 1      # P 帧 airtime 超过帧间隔预算
-FRAME_DROP_STARVE = 2    # P 帧拿不到节流令牌（前面有 I 帧突发留下的债务）
+FRAME_DROP_DUTY = 1
+FRAME_DROP_STARVE = 2
 
 
 def frame_admission(frame_bytes, npkts, is_idr, link_kbps,
                     frame_interval_ms, max_pframe_duty, pacer):
-    """整帧准入判定（纯函数，无副作用）。返回 (action, airtime_ms)。
-
-    **关键帧永远返回 FRAME_SEND**：它绝不因为 airtime 或令牌不足被丢，
-    只在 send_paced 里被节流。丢 I 帧 = 桌面端永远 wait_idr。
-    """
+    """整帧准入判定（纯函数，无副作用）。返回 (action, airtime_ms)。"""
     air = airtime_ms(frame_bytes, npkts, link_kbps)
     if is_idr:
         return FRAME_SEND, air
@@ -513,13 +392,7 @@ def frame_admission(frame_bytes, npkts, is_idr, link_kbps,
 
 
 def send_paced(pacer, packets, sink):
-    """逐包节流发送，返回实际发出的包数。
-
-    节流逻辑必须留在这个函数里、且**每个包都要走** —— 历史上正是"关键帧
-    绕过守卫"造成了 4~10s 延迟。把它收在这里，test/test_k230_pacer.py
-    就能直接对同一份代码断言最小包间隔，而不是靠源码阅读保证。
-    sink 抛 SendAborted 即中止本帧（已发出的包不回滚）。
-    """
+    """逐包节流发送，返回实际发出的包数。"""
     sent = 0
     pacer.begin_frame()
     for pkt in packets:
@@ -607,14 +480,7 @@ def get_clock():
         SYS_CLOCK = SysClock()
     return SYS_CLOCK
 
-# <<< PURE-PACER-CORE v1 <<<
 
-
-def _airtime_ms(frame_bytes, npkts):
-    return airtime_ms(frame_bytes, npkts, LINK_KBPS)
-
-
-# ==================== UART 命令桥（与 udp_jpeg_push 一致） ====================
 def crc8(payload):
     c = 0
     for b in payload:
@@ -685,11 +551,7 @@ class CommandLink:
                 data = sock.recv(64)
                 if not data:
                     break
-                if len(data) >= 4 and bytes(data[:3]) == b"CBR\x01":
-                    # 桌面丢包/新接入 -> 请求新 IDR。
-                    # 这里**不做任何合并**：CommandLink.pump 在一个 tick 里会
-                    # 把 socket 缓冲排空，一次 pump 可能收到几十个 CBR\x01，
-                    # 限频必须放在 IdrGate（合并语义 + 统计都在那里）。
+                if len(data) >= 4 and bytes(data[:3]) == b"CBR" and data[3] == 0x01:
                     if self._on_ctrl:
                         self._on_ctrl(b"IDR")
                     self.ctrl_rx += 1
@@ -701,8 +563,10 @@ class CommandLink:
         if latest is not None:
             try:
                 result = self.uart.write(latest)
-                if result is False:
-                    print("[CMD] UART write returned False")
+                # MicroPython UART.write 可返回实际写入字节数；必须等于帧长才算成功
+                wrote = len(latest) if result is None else int(result)
+                if wrote is False or wrote != len(latest):
+                    print("[CMD] UART short write %s/%d" % (result, len(latest)))
                     self.ok = False
                     return
             except Exception as e:
@@ -723,7 +587,6 @@ class CommandLink:
         return "[CMD] rx=%d ok=%s" % (self.rx, self.ok)
 
 
-# ==================== 主流程 ====================
 def stream_loop(sock, server_ip, sta):
     stream = StreamData()
     parameter_sets = None
@@ -731,19 +594,17 @@ def stream_loop(sock, server_ip, sta):
     gate = IdrGate(IDR_REQ_MIN_INTERVAL_MS, IDR_REQ_SETTLE_MS)
     st = TxStats()
     addr = (server_ip, RTP_PORT)
-    ssrc = 0x54494E44  # "TIND"
+    ssrc = 0x54494E44
     seq = 0
     ts_step = 90000 // FPS
     frame_count = 0
     last_sent_ms = _ticks_ms() - FRAME_PERIOD_MS
     t_stat = time.time()
-    pending_idr = [True]  # 首次出流 + 桌面请求时出新 IDR
+    pending_idr = [True]
 
     def _on_ctrl(_data):
         pending_idr[0] = True
 
-    # UART3 只初始化一次：init_uart3() 会重设 FPIOA 引脚并重建 UART 对象，
-    # 调两次会泄漏第一个句柄并可能复位外设。
     cmdline = CommandLink(init_uart3(), on_ctrl=_on_ctrl)
 
     while True:
@@ -757,26 +618,14 @@ def stream_loop(sock, server_ip, sta):
 
         if pending_idr[0]:
             pending_idr[0] = False
-            # IdrGate 合并/限频：健康的编码器每 500ms 自然出一个 IDR，
-            # 此时请求是多余的（每个多余的请求 = 多一个 ~100KB 的 I 帧）。
             if gate.request(_ticks_ms()):
-                # 出新 IDR：接收端无需等 GOP 到点即可解码
                 encoder.RequestIDR()
                 st.forced_idr += 1
                 print("RTP: requested IDR")
-            # 被合并时保持静默：合并次数由 gate.rx/granted 统计上报，
-            # 这里 print 会在风暴（每秒几十次）时把串口刷爆。
 
         if encoder.GetStream(stream, timeout=20) != 0:
             continue
 
-        # ---- 软件帧率闸门（必须放在 ReleaseStream 之前）----
-        # K230 VENC 的 dst_frame_rate 实测无效：配置 30fps 实际出流 ~49fps。
-        # 而码率控制的分母用的是"配置帧率"，所以每帧仍是 bit_rate/30 ≈
-        # 12800B，实际总码率 = 12800 x 49 = 5.0Mbps，直接灌满 5Mbps 链路
-        # （占用 101%，零余量）-> 持续丢包 -> 桌面端永远收不齐 IDR -> 黑屏。
-        # 这里按真实时间戳硬限到 FPS，12800B x 30 = 3.07Mbps（占用 61%）。
-        # 不依赖固件行为，比赌 dst_frame_rate 生效可靠。
         now_ms = _ticks_ms()
         if _ticks_diff(now_ms, last_sent_ms) < FRAME_PERIOD_MS:
             st.overfps += 1
@@ -788,9 +637,6 @@ def stream_loop(sock, server_ip, sta):
             packets = []
             frame_bytes = 0
             is_idr = False
-            # 关键：seq 先写进局部变量，只有这一帧真的发出去了才提交。
-            # 若在丢弃分支就 advance，丢帧会在 RTP 序号空间里留下永久空洞，
-            # 接收端每次都判丢包 -> wait_idr -> 黑屏，实测直接"没信号"。
             seq_next = seq
             for i in range(stream.pack_cnt):
                 data = uctypes.bytearray_at(stream.data[i], stream.data_size[i])
@@ -809,20 +655,10 @@ def stream_loop(sock, server_ip, sta):
                     seq_next = packetize_nalu(nalu, frame_count * ts_step, seq_next, ssrc, packets)
             if not packets:
                 continue
-            # marker 打在 access unit 最后一个包上
             packets[-1] = bytearray(packets[-1])
             packets[-1][1] |= 0x80
 
             air_ms = None
-            # airtime 守卫（判定逻辑在 frame_admission 里，可被仿真测试覆盖）：
-            #   * P 帧：airtime 超帧间隔的 MAX_PFRAME_DUTY 就整帧丢；
-            #     令牌不足（前面有 I 帧突发）也整帧丢。恢复靠下一个 IDR。
-            #   * I 帧：**不再绕过守卫**。旧实现让 I 帧完全跳过预检且不
-            #     等待，结果是 ~100KB 在几微秒内灌进 AP/WiFi 队列。2.4G
-            #     上队列排空只有 625KB/s，单次 I 帧就顶到 100ms+ 深度；
-            #     叠加 IDR 请求风暴（最多 10 次/秒 = 1MB/s）能撑到秒级。
-            #     现在 I 帧与 P 帧走同一个 send_paced 逐包节流，但保留
-            #     "绝不丢 I 帧"。
             action, air_ms = frame_admission(
                 frame_bytes, len(packets), is_idr, LINK_KBPS,
                 FRAME_INTERVAL_MS, MAX_PFRAME_DUTY, pacer)
@@ -835,12 +671,8 @@ def stream_loop(sock, server_ip, sta):
                 st.starved += 1
                 continue
             if is_idr:
-                st.idr_frames += 1
                 gate.note_idr_sent(_ticks_ms())
 
-            # 逐包节流：每包按 (payload + 40B) 的真实线速占用取令牌。
-            # 优先级靠 FIFO + can_send 预检实现（I 帧先占桶，随后的 P 帧
-            # 被判不足而丢）；限突发靠 PACER_SPAN_MAX_MS + 负 token 连带压制。
             send_err = [None]
 
             def _sink(pkt, _sock=sock, _addr=addr, _err=send_err,
@@ -850,8 +682,6 @@ def stream_loop(sock, server_ip, sta):
                 except TypeError:
                     _sock.sendto(bytes(pkt), _addr)
                 except OSError as e:
-                    # ENOBUFS/EAGAIN 说明本机发送队列溢出，
-                    # 这是"帧在建网前就丢了"，不改代码永远看不见。
                     _err[0] = str(e)
                     raise SendAborted()
                 _st.bytes_tx += len(pkt)
@@ -861,12 +691,10 @@ def stream_loop(sock, server_ip, sta):
             except SendAborted:
                 st.pkt_err += 1
                 print("sendto err: %s" % send_err[0])
-            # 只有真正发出去才提交序号/时间戳：见上面 seq_next 的注释
             seq = seq_next
             frame_count = (frame_count + 1) & 0xFFFFFFFF
             st.note_frame(frame_bytes, len(packets), is_idr, air_ms)
         except Exception as e:
-            # 失败只丢当帧：不重建 socket、不 sleep（老 JPEG 版的坑）
             print("send drop: " + str(e))
             st.dropped += 1
         finally:
@@ -905,8 +733,6 @@ def stream_loop(sock, server_ip, sta):
                           gate.rx, gate.granted, gate.rx - gate.granted,
                           st.idr_bytes * 8 / span / 1000.0))
             t_stat = now
-            # 节流器的累计量是全程的（要看整场趋势），只清帧级计数。
-            # pacer.min_gap_us / max_wait_us 也不清，方便看全程极值。
             st.reset_rolling()
             gate.reset_rolling()
             pacer.wait_us = 0
@@ -938,7 +764,6 @@ def cleanup():
 
 def make_sock():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    # rt-smart MicroPython 没有 SO_RCVBUF；有则加大接收缓冲
     rcvbuf = getattr(socket, "SO_RCVBUF", None)
     if rcvbuf is not None:
         try:
@@ -948,7 +773,7 @@ def make_sock():
     try:
         sock.bind(("0.0.0.0", 0))
     except Exception:
-        pass  # MicroPython 可不 bind，由首次 sendto 隐式绑定
+        pass
     return sock
 
 

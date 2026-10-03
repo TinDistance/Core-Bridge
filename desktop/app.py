@@ -2,10 +2,10 @@
 
 布局（ASCII）：
 +---------------------------------------------------------------+
-| TINDISTANCE·PIT-WALL   server:http://..  [●LIVE] [132ms]       | 顶栏
-+--------------------------------------+------------------------+
-|                                      | LATENCY · 延迟         | 右上：曲线
-|        VIDEO · 图传 (weight 3)       | ~amber curve~ 132ms    |
+| TINDISTANCE·PIT-WALL   server:http://..  [●LIVE] [real_age ms]  | 顶栏
++---------------------------------------------------------------+
+|                                      | LATENCY · 真实滞后        | 右上：曲线
+|        VIDEO · 图传 (weight 3)       | ~amber curve~ render_age |
 |                                      +------------------------+
 |                                      | LOGS · 日志            | 右下
 +--------------------------------------+------------------------+
@@ -28,7 +28,7 @@ from desktop.modules.log_panel import LogPanel
 from desktop.modules.stream_panel import StreamPanel
 from desktop.server_manager import ServerManager
 from desktop.start_screen import StartScreen
-from desktop.telemetry.latency_monitor import LatencyMonitor
+from desktop.telemetry.latency_monitor import WARN_MS, LatencyMonitor
 
 
 class DesktopApp(tk.Tk):
@@ -137,30 +137,50 @@ class DesktopApp(tk.Tk):
         try:
             if self._monitor is not None:
                 st = self._monitor.stats()
+                # 顶栏与延迟面板同一口径：真实滞后（render_age_ms）。
+                # 没有真实值就显示 "—" 并把药丸置灰 —— 绝不用
+                # staleness_ms 或本机 rtt+fetch 顶替，旧实现那样做过，
+                # 结果本机 8ms 出头的往返顶着"延迟"标签显示 132ms，
+                # 现场真实 4~10s 反而看不见。
                 cur = st["current_ms"]
                 live = st["live"]
-                if not live or cur < 0:
+                has_latency = st["latency_available"]
+                if not live:
                     self._hdr_lat_var.set("— ms")
                     self._hdr_pill_var.set("无信号")
                     self._hdr_pill.config(fg=theme.MUTE, bg="#232E42")
+                    self._foot_var.set(
+                        f"{st.get('source') or 'udp:8001'} · 等待 K230 推流…")
+                elif not has_latency or cur < 0:
                     self._hdr_lat_var.set("— ms")
-                    src = getattr(st, "get", lambda k, d=None: None)("source") or "udp:8001"
-                    self._foot_var.set(f"{src} · 等待 K230 推流…")
+                    self._hdr_pill_var.set("无 render_age")
+                    self._hdr_pill.config(fg=theme.MUTE, bg="#232E42")
+                    self._foot_var.set(
+                        f"{st.get('source') or 'udp:8001'} · fps {st['fps']:.1f}"
+                        f" · 帧 #{st['frame_id']} · viewer 未上报 render_age")
                 else:
                     self._hdr_lat_var.set(f"{int(cur)} ms")
-                    if cur >= 500:
-                        self._hdr_pill_var.set("延迟高")
+                    if cur >= WARN_MS:
+                        self._hdr_pill_var.set("滞后高")
                         self._hdr_pill.config(fg=theme.BAD, bg="#3A1E1E")
                     else:
                         self._hdr_pill_var.set("● LIVE")
                         self._hdr_pill.config(fg=theme.OK, bg="#14352B")
+                    # 底栏带上积压证据：画面卡住时先看 drops/backlog，
+                    # 不要再去猜空中段。
+                    queue = st["queue_ms"]
+                    drops = st["drops"]
+                    extra = ""
+                    if queue >= 0:
+                        extra += f" · 队列 {queue:.0f}ms"
+                    if drops >= 0:
+                        extra += f" · 丢 {int(drops)}"
                     src = st.get("source") or "udp:8001"
-                    self._foot_var.set(
-                        f"{src} · K230→server · fps {st['fps']:.1f} "
-                        f"· 帧 #{st['frame_id']} · p95 {int(st['p95_ms'])}ms"
-                        if st["p95_ms"] >= 0 else
-                        f"{src} · K230→server · fps {st['fps']:.1f} · 帧 #{st['frame_id']}"
-                    )
+                    base = (f"{src} · K230→server · fps {st['fps']:.1f}"
+                            f" · 帧 #{st['frame_id']}")
+                    if st["p95_ms"] >= 0:
+                        base += f" · p95 {int(st['p95_ms'])}ms"
+                    self._foot_var.set(base + extra)
         finally:
             self.after(500, self._tick_chrome)
 

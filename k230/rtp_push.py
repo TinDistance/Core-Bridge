@@ -425,6 +425,51 @@ class Pacer:
         return waited
 
 
+
+class SendAborted(Exception):
+    """send_paced 的 sink 抛这个来中止本帧（发送队列溢出时用）。"""
+
+
+# frame_admission 的返回值
+FRAME_SEND = 0
+FRAME_DROP_DUTY = 1      # P 帧 airtime 超过帧间隔预算
+FRAME_DROP_STARVE = 2    # P 帧拿不到节流令牌（前面有 I 帧突发留下的债务）
+
+
+def frame_admission(frame_bytes, npkts, is_idr, link_kbps,
+                    frame_interval_ms, max_pframe_duty, pacer):
+    """整帧准入判定（纯函数，无副作用）。返回 (action, airtime_ms)。
+
+    **关键帧永远返回 FRAME_SEND**：它绝不因为 airtime 或令牌不足被丢，
+    只在 send_paced 里被节流。丢 I 帧 = 桌面端永远 wait_idr。
+    """
+    air = airtime_ms(frame_bytes, npkts, link_kbps)
+    if is_idr:
+        return FRAME_SEND, air
+    if air > frame_interval_ms * max_pframe_duty:
+        return FRAME_DROP_DUTY, air
+    if not pacer.can_send(frame_bytes, npkts):
+        return FRAME_DROP_STARVE, air
+    return FRAME_SEND, air
+
+
+def send_paced(pacer, packets, sink):
+    """逐包节流发送，返回实际发出的包数。
+
+    节流逻辑必须留在这个函数里、且**每个包都要走** —— 历史上正是"关键帧
+    绕过守卫"造成了 4~10s 延迟。把它收在这里，test/test_k230_pacer.py
+    就能直接对同一份代码断言最小包间隔，而不是靠源码阅读保证。
+    sink 抛 SendAborted 即中止本帧（已发出的包不回滚）。
+    """
+    sent = 0
+    pacer.begin_frame()
+    for pkt in packets:
+        pacer.take(len(pkt))
+        sink(pkt)
+        sent += 1
+    return sent
+
+
 SYS_CLOCK = None
 
 
@@ -644,44 +689,59 @@ def stream_loop(sock, server_ip, sta):
             packets[-1] = bytearray(packets[-1])
             packets[-1][1] |= 0x80
 
-            air_ms = _airtime_ms(frame_bytes, len(packets))
             last_len = frame_bytes
             if frame_bytes > max_frame_bytes:
                 max_frame_bytes = frame_bytes
 
+            # airtime 守卫（判定逻辑在 frame_admission 里，可被仿真测试覆盖）：
+            #   * P 帧：airtime 超帧间隔的 MAX_PFRAME_DUTY 就整帧丢；
+            #     令牌不足（前面有 I 帧突发留下债务）也整帧丢。恢复靠下一个 IDR。
+            #   * I 帧：**不再绕过守卫**。旧实现让 I 帧完全跳过预检且不等待，
+            #     结果是 ~100KB 在几微秒内灌进 AP/WiFi 队列。2.4G 上队列排空
+            #     只有 625KB/s，单次 I 帧就顶到 100ms+ 深度；叠加 IDR 请求
+            #     风暴（最多 10 次/秒 = 1MB/s）能撑到秒级 —— 这是 4~10s
+            #     延迟的直接来源。现在 I 帧与 P 帧走同一个 send_paced 逐包
+            #     节流，但保留"绝不丢 I 帧"。
+            action, air_ms = frame_admission(
+                frame_bytes, len(packets), is_idr, LINK_KBPS,
+                FRAME_INTERVAL_MS, MAX_PFRAME_DUTY, pacer)
+            if action == FRAME_DROP_DUTY:
+                dropped += 1
+                over_duty += 1
+                continue
+            if action == FRAME_DROP_STARVE:
+                dropped += 1
+                starved += 1
+                continue
             if is_idr:
+                idr_count += 1
                 last_iframe_pkts = len(packets)
                 last_iframe_ms = air_ms
-                idr_count += 1
             else:
                 last_pframe_ms = air_ms
-                if air_ms > FRAME_INTERVAL_MS * MAX_PFRAME_DUTY:
-                    dropped += 1
-                    over_duty += 1
-                    continue
-                if not pacer.can_send(frame_bytes, len(packets)):
-                    dropped += 1
-                    starved += 1
-                    continue
 
-            # 逐包节流：每包按 (payload + 40B) 的真实线速占用取令牌。
-            # begin_frame 重置本帧的节流时长预算，防止一个超大帧把主循环
-            # 阻塞到 outbuf 溢出。
-            pacer.begin_frame()
-            for pkt in packets:
-                pacer.take(len(pkt))
+            # 优先级靠 FIFO + can_send 预检实现（I 帧先占桶，随后的 P 帧被判
+            # 不足而丢）；限突发靠 PACER_SPAN_MAX_MS + 负 token 连带压制。
+            send_err = [None]
+
+            def _sink(pkt, _sock=sock, _addr=addr, _err=send_err):
                 try:
-                    sock.sendto(pkt, addr)
+                    _sock.sendto(pkt, _addr)
                 except TypeError:
-                    sock.sendto(bytes(pkt), addr)
+                    _sock.sendto(bytes(pkt), _addr)
                 except OSError as e:
-                    # sendto 失败必须计数：ENOBUFS/EAGAIN 说明本机发送队列
-                    # 溢出，这是"帧在建网前就丢了"，不改代码永远看不见。
-                    pkt_err += 1
-                    print("sendto err: %s" % str(e))
-                    break
+                    # ENOBUFS/EAGAIN 说明本机发送队列溢出，
+                    # 这是"帧在建网前就丢了"，不改代码永远看不见。
+                    _err[0] = str(e)
+                    raise SendAborted()
                 pkts_tx += 1
                 bytes_tx += len(pkt)
+
+            try:
+                send_paced(pacer, packets, _sink)
+            except SendAborted:
+                pkt_err += 1
+                print("sendto err: %s" % send_err[0])
             # 只有真正发出去才提交序号/时间戳：见上面 seq_next 的注释
             seq = seq_next
             frame_count = (frame_count + 1) & 0xFFFFFFFF

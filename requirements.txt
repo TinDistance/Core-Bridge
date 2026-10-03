@@ -7,3 +7,7 @@ numpy
 websockets
 httpx
 pillow
+# H264 裸 RTP 链路（desktop/streaming/h264_viewer.py）解码用。
+# aiortc 依赖 PyAV 会把它带进 venv，但必须显式声明：比赛现场重装环境时
+# 缺 av 会让 H264 链路静默降级回 JPEG，而不是报错。
+av

@@ -429,8 +429,6 @@ class Pacer:
         return waited
 
 
-
-
 class IdrGate:
     """IDR 请求合并/限频。
 
@@ -465,10 +463,7 @@ class IdrGate:
         self._last_idr_sent = now_ms
 
     def reset_rolling(self):
-        """只清本窗口计数；合并状态（_last_idr_sent/_last_grant）必须保留。
-
-        这两个状态一旦被清掉，限频闸门就会每 10s 重新放行一次风暴。
-        """
+        """只清本窗口计数；合并状态（_last_idr_sent/_last_grant）必须保留。"""
         self.rx = 0
         self.granted = 0
         self.merged_idr = 0
@@ -532,6 +527,75 @@ def send_paced(pacer, packets, sink):
         sink(pkt)
         sent += 1
     return sent
+
+
+class TxStats:
+    """发送侧诊断统计（只读，不影响任何行为）。"""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.reset_rolling()
+        self.last_len = 0
+        self.last_iframe_pkts = 0
+        self.last_iframe_ms = 0.0
+        self.last_pframe_ms = 0.0
+
+    def note_frame(self, frame_bytes, npkts, is_idr, air_ms):
+        self.sent_frames += 1
+        self.last_len = frame_bytes
+        if frame_bytes > self.max_frame_bytes:
+            self.max_frame_bytes = frame_bytes
+        if is_idr:
+            self.idr_frames += 1
+            self.idr_bytes += frame_bytes
+            self.last_iframe_pkts = npkts
+            self.last_iframe_ms = air_ms
+        else:
+            self.last_pframe_ms = air_ms
+
+    def idr_share(self):
+        """I 帧字节占本窗口已发字节的比例（诊断 I 帧开销有多重）。"""
+        return 100.0 * self.idr_bytes / self.bytes_tx if self.bytes_tx else 0.0
+
+    def reset_rolling(self):
+        """只清本窗口的累计量；last_* 单帧观测值保留。"""
+        self.sent_frames = 0
+        self.dropped = 0
+        self.over_duty = 0
+        self.starved = 0
+        self.overfps = 0
+        self.idr_frames = 0
+        self.idr_bytes = 0
+        self.bytes_tx = 0
+        self.pkt_err = 0
+        self.forced_idr = 0
+        self.max_frame_bytes = 0
+
+    def line(self, span, pacer, gate, free):
+        kbps = self.bytes_tx * 8 / span / 1000.0
+        fps = self.sent_frames / span
+        return (
+            "stat: sent=%d drop=%d(duty=%d starve=%d) overfps=%d idr=%d "
+            "(forced=%d) last=%dB max=%dB kbps=%.0f fps=%.1f pps=%.0f "
+            "txerr=%d idrshare=%.0f%% free=%d" % (
+                self.sent_frames, self.dropped, self.over_duty, self.starved,
+                self.overfps, self.idr_frames, self.forced_idr, self.last_len,
+                self.max_frame_bytes, kbps, fps, pacer.packets / span,
+                self.pkt_err, self.idr_share(), free))
+
+    def detail(self, pacer, gate):
+        return (
+            "      pacer: wait=%.0fms sleep=%d cap=%d maxwait=%.1fms "
+            "minkgap=%s | I帧 %d包 %.0fms | IDR请求 rx=%d 生效=%d "
+            "(合并:近期IDR=%d 限频=%d)" % (
+                pacer.wait_us / 1000.0, pacer.sleeps, pacer.cap_events,
+                pacer.max_wait_us / 1000.0,
+                "n/a" if pacer.min_gap_us is None else "%.2fms" % (
+                    pacer.min_gap_us / 1000.0),
+                self.last_iframe_pkts, self.last_iframe_ms,
+                gate.rx, gate.granted, gate.merged_idr, gate.merged_rate))
 
 
 SYS_CLOCK = None
@@ -608,8 +672,8 @@ class CommandLink:
         self.uart = uart
         self.ok = False
         self.rx = 0
-        self._last_rx = 0
         self.ctrl_rx = 0
+        self._last_rx = 0
         self._on_ctrl = on_ctrl
 
     def pump(self, sock):
@@ -623,10 +687,9 @@ class CommandLink:
                     break
                 if len(data) >= 4 and bytes(data[:3]) == b"CBR\x01":
                     # 桌面丢包/新接入 -> 请求新 IDR。
-                    # 这里**不做任何合并**：CommandLink.pump 在一个 tick 里
-                    # 会把 socket 缓冲排空，一次 pump 可能收到几十个
-                    # CBR\x01，限频必须放在 IdrGate（合并语义 + 统计都在
-                    # 那里）。
+                    # 这里**不做任何合并**：CommandLink.pump 在一个 tick 里会
+                    # 把 socket 缓冲排空，一次 pump 可能收到几十个 CBR\x01，
+                    # 限频必须放在 IdrGate（合并语义 + 统计都在那里）。
                     if self._on_ctrl:
                         self._on_ctrl(b"IDR")
                     self.ctrl_rx += 1
@@ -666,25 +729,12 @@ def stream_loop(sock, server_ip, sta):
     parameter_sets = None
     pacer = Pacer(PACER_WIRE_KBPS, PACER_BURST_BYTES, get_clock(), PACER_SPAN_MAX_MS)
     gate = IdrGate(IDR_REQ_MIN_INTERVAL_MS, IDR_REQ_SETTLE_MS)
+    st = TxStats()
     addr = (server_ip, RTP_PORT)
     ssrc = 0x54494E44  # "TIND"
     seq = 0
     ts_step = 90000 // FPS
     frame_count = 0
-    sent_frames = 0
-    dropped = 0
-    last_len = 0
-    idr_count = 0
-    over_duty = 0
-    starved = 0
-    last_iframe_pkts = 0
-    last_iframe_ms = 0.0
-    last_pframe_ms = 0.0
-    pkts_tx = 0
-    bytes_tx = 0
-    pkt_err = 0
-    max_frame_bytes = 0
-    overfps = 0
     last_sent_ms = _ticks_ms() - FRAME_PERIOD_MS
     t_stat = time.time()
     pending_idr = [True]  # 首次出流 + 桌面请求时出新 IDR
@@ -707,14 +757,15 @@ def stream_loop(sock, server_ip, sta):
 
         if pending_idr[0]:
             pending_idr[0] = False
-            # IdrGate 合并/限频：健康的编码器每 500ms 自然出一个 IDR，此时
-            # 请求是多余的（每个多余的请求 = 多一个 ~100KB 的 I 帧）。
+            # IdrGate 合并/限频：健康的编码器每 500ms 自然出一个 IDR，
+            # 此时请求是多余的（每个多余的请求 = 多一个 ~100KB 的 I 帧）。
             if gate.request(_ticks_ms()):
                 # 出新 IDR：接收端无需等 GOP 到点即可解码
                 encoder.RequestIDR()
+                st.forced_idr += 1
                 print("RTP: requested IDR")
-            # 被合并时保持静默：合并次数由 gate.rx/granted 统计上报，这里
-            # print 会在风暴（每秒几十次）时把串口刷爆。
+            # 被合并时保持静默：合并次数由 gate.rx/granted 统计上报，
+            # 这里 print 会在风暴（每秒几十次）时把串口刷爆。
 
         if encoder.GetStream(stream, timeout=20) != 0:
             continue
@@ -728,7 +779,7 @@ def stream_loop(sock, server_ip, sta):
         # 不依赖固件行为，比赌 dst_frame_rate 生效可靠。
         now_ms = _ticks_ms()
         if _ticks_diff(now_ms, last_sent_ms) < FRAME_PERIOD_MS:
-            overfps += 1
+            st.overfps += 1
             encoder.ReleaseStream(stream)
             continue
         last_sent_ms = now_ms
@@ -762,43 +813,38 @@ def stream_loop(sock, server_ip, sta):
             packets[-1] = bytearray(packets[-1])
             packets[-1][1] |= 0x80
 
-            last_len = frame_bytes
-            if frame_bytes > max_frame_bytes:
-                max_frame_bytes = frame_bytes
-
+            air_ms = None
             # airtime 守卫（判定逻辑在 frame_admission 里，可被仿真测试覆盖）：
             #   * P 帧：airtime 超帧间隔的 MAX_PFRAME_DUTY 就整帧丢；
-            #     令牌不足（前面有 I 帧突发留下债务）也整帧丢。恢复靠下一个 IDR。
-            #   * I 帧：**不再绕过守卫**。旧实现让 I 帧完全跳过预检且不等待，
-            #     结果是 ~100KB 在几微秒内灌进 AP/WiFi 队列。2.4G 上队列排空
-            #     只有 625KB/s，单次 I 帧就顶到 100ms+ 深度；叠加 IDR 请求
-            #     风暴（最多 10 次/秒 = 1MB/s）能撑到秒级 —— 这是 4~10s
-            #     延迟的直接来源。现在 I 帧与 P 帧走同一个 send_paced 逐包
-            #     节流，但保留"绝不丢 I 帧"。
+            #     令牌不足（前面有 I 帧突发）也整帧丢。恢复靠下一个 IDR。
+            #   * I 帧：**不再绕过守卫**。旧实现让 I 帧完全跳过预检且不
+            #     等待，结果是 ~100KB 在几微秒内灌进 AP/WiFi 队列。2.4G
+            #     上队列排空只有 625KB/s，单次 I 帧就顶到 100ms+ 深度；
+            #     叠加 IDR 请求风暴（最多 10 次/秒 = 1MB/s）能撑到秒级。
+            #     现在 I 帧与 P 帧走同一个 send_paced 逐包节流，但保留
+            #     "绝不丢 I 帧"。
             action, air_ms = frame_admission(
                 frame_bytes, len(packets), is_idr, LINK_KBPS,
                 FRAME_INTERVAL_MS, MAX_PFRAME_DUTY, pacer)
             if action == FRAME_DROP_DUTY:
-                dropped += 1
-                over_duty += 1
+                st.dropped += 1
+                st.over_duty += 1
                 continue
             if action == FRAME_DROP_STARVE:
-                dropped += 1
-                starved += 1
+                st.dropped += 1
+                st.starved += 1
                 continue
             if is_idr:
-                idr_count += 1
+                st.idr_frames += 1
                 gate.note_idr_sent(_ticks_ms())
-                last_iframe_pkts = len(packets)
-                last_iframe_ms = air_ms
-            else:
-                last_pframe_ms = air_ms
 
-            # 优先级靠 FIFO + can_send 预检实现（I 帧先占桶，随后的 P 帧被判
-            # 不足而丢）；限突发靠 PACER_SPAN_MAX_MS + 负 token 连带压制。
+            # 逐包节流：每包按 (payload + 40B) 的真实线速占用取令牌。
+            # 优先级靠 FIFO + can_send 预检实现（I 帧先占桶，随后的 P 帧
+            # 被判不足而丢）；限突发靠 PACER_SPAN_MAX_MS + 负 token 连带压制。
             send_err = [None]
 
-            def _sink(pkt, _sock=sock, _addr=addr, _err=send_err):
+            def _sink(pkt, _sock=sock, _addr=addr, _err=send_err,
+                      _st=st):
                 try:
                     _sock.sendto(pkt, _addr)
                 except TypeError:
@@ -808,26 +854,25 @@ def stream_loop(sock, server_ip, sta):
                     # 这是"帧在建网前就丢了"，不改代码永远看不见。
                     _err[0] = str(e)
                     raise SendAborted()
-                pkts_tx += 1
-                bytes_tx += len(pkt)
+                _st.bytes_tx += len(pkt)
 
             try:
                 send_paced(pacer, packets, _sink)
             except SendAborted:
-                pkt_err += 1
+                st.pkt_err += 1
                 print("sendto err: %s" % send_err[0])
             # 只有真正发出去才提交序号/时间戳：见上面 seq_next 的注释
             seq = seq_next
             frame_count = (frame_count + 1) & 0xFFFFFFFF
-            sent_frames += 1
+            st.note_frame(frame_bytes, len(packets), is_idr, air_ms)
         except Exception as e:
             # 失败只丢当帧：不重建 socket、不 sleep（老 JPEG 版的坑）
             print("send drop: " + str(e))
-            dropped += 1
+            st.dropped += 1
         finally:
             encoder.ReleaseStream(stream)
 
-        if sent_frames and (sent_frames % GC_COLLECT_EVERY) == 0:
+        if st.sent_frames and (st.sent_frames % GC_COLLECT_EVERY) == 0:
             gc.collect()
 
         now = time.time()
@@ -837,39 +882,36 @@ def stream_loop(sock, server_ip, sta):
             except Exception:
                 free = -1
             span = max(1e-6, now - t_stat)
-            kbps = bytes_tx * 8 / span / 1000.0
-            fps = sent_frames / span
-            print("stat: sent=%d drop=%d(duty=%d starve=%d) overfps=%d idr=%d "
-                  "last=%dB max=%dB kbps=%.0f fps=%.1f pps=%.0f txerr=%d "
-                  "free=%d (%s)" % (
-                      sent_frames, dropped, over_duty, starved, overfps,
-                      idr_count, last_len, max_frame_bytes, kbps, fps,
-                      pkts_tx / span, pkt_err, free, cmdline.stats_line()))
+            kbps = st.bytes_tx * 8 / span / 1000.0
+            fps = st.sent_frames / span
+            print(st.line(span, pacer, gate, free) + " (%s)" % cmdline.stats_line())
             util = kbps / LINK_KBPS
-            print("      P帧airtime %.1fms / 预算 %.1fms | I帧 %d包 %.0fms | "
+            print(st.detail(pacer, gate))
+            print("      P帧airtime %.1fms / 预算 %.1fms | 节流上限 %dKbps | "
                   "链路占用 %.0f%%%s" % (
-                      last_pframe_ms, FRAME_INTERVAL_MS * MAX_PFRAME_DUTY,
-                      last_iframe_pkts, last_iframe_ms, util * 100.0,
+                      st.last_pframe_ms, FRAME_INTERVAL_MS * MAX_PFRAME_DUTY,
+                      PACER_WIRE_KBPS, util * 100.0,
                       "  << 超 5Mbps，必然丢包!" if util > 0.9 else ""))
             if fps > FPS * 1.15:
                 print("      !! 实际 %.1f fps 超过配置 %d，码率分母错，"
                       "软件闸门失效" % (fps, FPS))
-            sent_frames = 0
-            dropped = 0
-            over_duty = 0
-            starved = 0
-            overfps = 0
-            idr_count = 0
-            pkts_tx = 0
-            bytes_tx = 0
-            pkt_err = 0
-            max_frame_bytes = 0
+            if pacer.cap_events:
+                print("      !! 节流被 span 上限截断 %d 次：I 帧超过 %dms 的"
+                      "节流预算，突发未被完全摊平（需真机确认 I 帧大小）" % (
+                          pacer.cap_events, PACER_SPAN_MAX_MS))
             if cmdline.ctrl_rx:
-                print("      IDR 请求 %d 次 -> 生效 %d 次（合并 %d：近期IDR=%d 限频=%d）" % (
-                    gate.rx, gate.granted, gate.rx - gate.granted,
-                    gate.merged_idr, gate.merged_rate))
+                print("      IDR 请求 %d 次 -> 生效 %d 次（合并 %d），"
+                      "强制 I 帧 %.0fKB/s" % (
+                          gate.rx, gate.granted, gate.rx - gate.granted,
+                          st.idr_bytes * 8 / span / 1000.0))
             t_stat = now
+            # 节流器的累计量是全程的（要看整场趋势），只清帧级计数。
+            # pacer.min_gap_us / max_wait_us 也不清，方便看全程极值。
+            st.reset_rolling()
             gate.reset_rolling()
+            pacer.wait_us = 0
+            pacer.sleeps = 0
+            pacer.packets = 0
 
 
 def cleanup():

@@ -252,8 +252,11 @@ class RtpRelay:
             # 秒。把它暴露出来，延迟异常时才能一眼区分"空中段慢"还是
             # "包到了但在 socket 缓冲里排队"。
             "rcvbuf_bytes": SO_RCVBUF_BYTES,
+            # 量纲：bytes*8 -> bit；kbps 的单位是 kbit/s = 1000 bit/s，
+            # 所以 bit/(kbit/s) 已经就是毫秒，不再除 1000。
+            # （此前误多除了一次 1000，349kbps 下把 6007ms 报成 6.0ms。）
             "rcvbuf_max_queue_ms": (
-                round(SO_RCVBUF_BYTES * 8 / kbps / 1000.0, 1)
+                round(SO_RCVBUF_BYTES * 8 / kbps, 1)
                 if kbps > 0 else -1.0),
             "server_time": round(time.time(), 3),
         }

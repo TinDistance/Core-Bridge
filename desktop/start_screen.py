@@ -1,8 +1,4 @@
-"""启动屏：只做一件事 —— 把 server 跑起来。
-
-品牌只有一行：TinDistance pit-wall，副标题讲清楚这是什么（小车核心控制端），
-不讲故事不放插画，操作手在赛场上没时间看。
-"""
+"""启动屏：只做一件事 —— 把 server 跑起来。"""
 from __future__ import annotations
 
 import queue
@@ -41,7 +37,6 @@ class StartScreen(tk.Frame):
         tk.Label(card, text="小车核心控制端 · 图传 / 延迟 / 日志", bg=theme.PANEL,
                  fg=theme.MUTE, font=theme.FONT_BODY).pack(anchor="w", pady=(0, 18))
 
-        # 琥珀信号线：全启动屏唯一的高饱和元素
         tk.Frame(card, bg=theme.AMBER, height=2).pack(fill=tk.X, pady=(0, 18))
 
         port_row = tk.Frame(card, bg=theme.PANEL)
@@ -67,20 +62,29 @@ class StartScreen(tk.Frame):
         except ValueError:
             self._status_var.set("端口无效，填 1024~65535 之间的数字")
             return
+        if not 1024 <= port <= 65535:
+            self._status_var.set("端口无效，填 1024~65535 之间的数字")
+            return
 
         self._start_btn.config(state=tk.DISABLED)
         self._status_var.set("正在启动 Server…")
 
         def work() -> None:
-            manager = ServerManager(port=port)
-            ok = manager.start()
-            self._result.put((manager, ok))
+            try:
+                manager = ServerManager(port=port)
+                ok: bool = manager.start()
+                self._result.put((manager, ok, ""))
+            except Exception as e:
+                try:
+                    self._result.put((None, False, str(e)[:200]))
+                except Exception:
+                    pass
 
         threading.Thread(target=work, daemon=True).start()
 
     def _poll_result(self) -> None:
         try:
-            manager, ok = self._result.get_nowait()
+            manager, ok, err = self._result.get_nowait()
         except queue.Empty:
             self.after(200, self._poll_result)
             return
@@ -89,6 +93,10 @@ class StartScreen(tk.Frame):
             self._on_ready(manager)
         else:
             self._start_btn.config(state=tk.NORMAL)
-            self._status_var.set("启动失败，换个端口再试一次")
-            manager.stop()
-            self.after(200, self._poll_result)
+            msg = f"启动失败：{err}，换个端口再试一次" if err else "启动失败，换个端口再试一次"
+            self._status_var.set(msg)
+            if manager is not None:
+                # 丢后台停服，避免 UI 线程卡 5s
+                threading.Thread(target=manager.stop, daemon=True).start()
+            # 失败后不再空轮询，等待用户下次点击
+

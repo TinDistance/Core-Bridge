@@ -1,12 +1,14 @@
 import os
+import re
 import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import httpx
 
-PROJECT_ROOT = __import__("pathlib").Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 class ServerManager:
@@ -24,23 +26,30 @@ class ServerManager:
         return f"http://{self.host}:{self.port}"
 
     def start(self, timeout: float = 20.0, reuse_existing: bool = False) -> bool:
-        """Start the server; wait until ready.
-
-        By default stale processes on the port are killed first, because an
-        old uvicorn (e.g. pre-raw-SDP `/webrtc/push`) keeps serving 422 while
-        looking healthy on `GET /command`. Pass `reuse_existing=True` to keep
-        the old reuse behaviour.
-        """
+        """Start the server; wait until ready."""
         if reuse_existing and self._healthy():
             return True
-        self.free_port()
+        # 仅杀自己上次残留的子进程；不再 taskkill 任意占用进程（防误杀）
+        self.stop()
         if self._proc is None:
             kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
-            self._proc = subprocess.Popen(
-                [sys.executable, "-m", "uvicorn", "server.app:app", "--host", self.bind_host, "--port", str(self.port)],
-                cwd=str(PROJECT_ROOT),
-                **kwargs,
-            )
+            log_path = PROJECT_ROOT / "logs" / "server.out"
+            try:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_file = open(log_path, "ab")
+            except Exception:
+                log_file = None  # type: ignore[assignment]
+            try:
+                self._proc = subprocess.Popen(
+                    [sys.executable, "-m", "uvicorn", "server.app:app", "--host", self.bind_host, "--port", str(self.port)],
+                    cwd=str(PROJECT_ROOT),
+                    stdout=log_file or subprocess.DEVNULL,
+                    stderr=subprocess.STDOUT if log_file else subprocess.DEVNULL,
+                    **kwargs,
+                )
+            finally:
+                # 子进程已继承 fd，父进程侧可关（Windows 上保持打开也无妨）
+                pass
         return self.wait_ready(timeout)
 
     def wait_ready(self, timeout: float = 20.0) -> bool:
@@ -71,53 +80,70 @@ class ServerManager:
             return False
 
     def free_port(self, wait: float = 5.0) -> None:
-        """Kill stale processes listening on our port (not just our child)."""
-        for pid in self._listening_pids():
-            if pid == os.getpid():
-                continue
-            try:
-                if sys.platform == "win32":
-                    subprocess.run(
-                        ["taskkill", "/F", "/PID", str(pid)],
-                        capture_output=True,
-                        check=False,
-                    )
-                else:
-                    os.kill(pid, 9)
-            except Exception:
-                continue
+        """兼容旧接口：不再杀任意进程，仅等待端口释放（由调用方确认）。
+
+        如确需清理陈旧进程，请手动处理或传入 force=True 的新接口。
+        """
         deadline = time.time() + wait
         while time.time() < deadline:
-            if not self._listening_pids():
+            if not self._port_in_use():
                 return
             time.sleep(0.2)
 
-    def _listening_pids(self) -> set[int]:
-        pids: set[int] = set()
-        try:
-            proc = subprocess.run(
-                ["netstat", "-ano", "-p", "TCP"],
-                capture_output=True,
-                check=False,
-            )
-            out = proc.stdout.decode("gbk", errors="ignore").splitlines()
-        except Exception:
-            return pids
-        for line in out:
-            if "LISTENING" not in line or f":{self.port}" not in line:
-                continue
-            parts = line.split()
-            if not parts:
-                continue
+    def _port_in_use(self) -> bool:
+        with socket.socket() as s:
             try:
-                pids.add(int(parts[-1]))
-            except ValueError:
-                continue
-        # Fallback: port is free if we can bind it.
-        if not pids:
-            with socket.socket() as s:
-                try:
-                    s.bind((self.bind_host, self.port))
-                except OSError:
-                    pass
+                s.bind((self.bind_host, self.port))
+                return False
+            except OSError:
+                return True
+
+    def _listening_pids(self) -> set[int]:
+        """精确匹配本地监听端口的 PID（尾缀匹配，避免 :8000 命中 :80001）。
+
+        Windows 用 netstat（gbk/utf8 兼容解码），POSIX 用 /proc 或 lsof 回退。
+        """
+        pids: set[int] = set()
+        port_re = re.compile(rf"[.:]{self.port}\s")
+        try:
+            if sys.platform == "win32":
+                proc = subprocess.run(
+                    ["netstat", "-ano", "-p", "TCP"],
+                    capture_output=True,
+                    check=False,
+                )
+                raw = proc.stdout
+                out = ""
+                for enc in ("gbk", "utf-8", "cp936"):
+                    try:
+                        out = raw.decode(enc)
+                        break
+                    except Exception:
+                        continue
+                for line in out.splitlines():
+                    if "LISTENING" not in line:
+                        continue
+                    parts = line.split()
+                    if len(parts) < 5:
+                        continue
+                    local = parts[1]
+                    # 精确尾缀：**:8000 结尾
+                    if not (local.endswith(f":{self.port}")):
+                        continue
+                    try:
+                        pids.add(int(parts[-1]))
+                    except ValueError:
+                        continue
+            else:
+                proc = subprocess.run(
+                    ["lsof", "-ti", f"TCP:{self.port}", "-sTCP:LISTEN"],
+                    capture_output=True, check=False, text=True,
+                )
+                for line in proc.stdout.splitlines():
+                    line = line.strip()
+                    if line.isdigit():
+                        pids.add(int(line))
+        except Exception:
+            pass
+        _ = port_re  # 保留正则以备扩展
         return pids

@@ -1,21 +1,4 @@
-"""主窗口：pit-wall 三段式 —— 顶栏 / 左图传右遥测 / 手柄条 / 底状态条。
-
-布局（ASCII）：
-+---------------------------------------------------------------+
-| TINDISTANCE·PIT-WALL   server:http://..  [●LIVE] [real_age ms]  | 顶栏
-+---------------------------------------------------------------+
-|                                      | LATENCY · 真实滞后        | 右上：曲线
-|        VIDEO · 图传 (weight 3)       | ~amber curve~ render_age |
-|                                      +------------------------+
-|                                      | LOGS · 日志            | 右下
-+--------------------------------------+------------------------+
-| GAMEPAD · 手柄  [●手柄]  按键灯 / 双摇杆 / 扳机 / 16字节协议   | 通栏手柄条
-+---------------------------------------------------------------+
-| udp:8001 · K230→server · fps 30 · 帧 #1234                     | 底栏
-+---------------------------------------------------------------+
-手柄链路：XInput ~100Hz 轮询 -> 16 字节 HID -> POST /command，
-应用启动即自动连接手柄（无柄则后台重连等待，不卡 UI）。
-"""
+"""主窗口：pit-wall 三段式 —— 顶栏 / 左图传右遥测 / 手柄条 / 底状态条。"""
 from __future__ import annotations
 
 import tkinter as tk
@@ -39,6 +22,7 @@ class DesktopApp(tk.Tk):
         self.title("TinDistance · Core-Bridge")
         self.geometry("1280x880")
         self.minsize(960, 680)
+        self._closed = False
 
         self._server: ServerManager | None = None
         self._monitor: LatencyMonitor | None = None
@@ -66,13 +50,9 @@ class DesktopApp(tk.Tk):
         self._monitor = LatencyMonitor(get_base_url=lambda: base_url)
         self._monitor.start()
 
-        # 手柄：应用启动即尝试连接，后台 ~100Hz 轮询 + 实时 POST /command。
-        # 命令下发链路：POST /command -> server 从视频 socket 反向推 v2 UART 帧
-        # 给 K230（server/command_udp.py），K230 收到后原样写 UART3。
         self._gamepad = GamepadPusher(get_base_url=lambda: base_url)
         self._gamepad.start()
 
-        # ---- 顶栏 ----
         header = tk.Frame(self, bg=theme.PANEL, highlightthickness=1,
                           highlightbackground=theme.LINE)
         header.pack(fill=tk.X)
@@ -93,7 +73,6 @@ class DesktopApp(tk.Tk):
         tk.Label(header, text=base_url, bg=theme.PANEL, fg=theme.MUTE,
                  font=theme.FONT_MONO_SM).pack(side=tk.RIGHT, padx=(0, 8), pady=8)
 
-        # ---- 主区 ----
         main = tk.Frame(self, bg=theme.BG)
         main.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         main.columnconfigure(0, weight=3)
@@ -117,12 +96,10 @@ class DesktopApp(tk.Tk):
         self.log_panel = LogPanel(side, default_server=base_url)
         self.log_panel.grid(row=1, column=0, sticky="nsew")
 
-        # 手柄通栏条：xinput_gui 功能的 pit-wall 版（按键/摇杆/扳机/协议视图）
         self.gamepad_panel = GamepadPanel(main, pusher=self._gamepad)
         self.gamepad_panel.grid(row=1, column=0, columnspan=2,
                                 sticky="ew", pady=(10, 0))
 
-        # ---- 底栏 ----
         foot = tk.Frame(self, bg=theme.PANEL, highlightthickness=1,
                         highlightbackground=theme.LINE)
         foot.pack(fill=tk.X)
@@ -134,14 +111,11 @@ class DesktopApp(tk.Tk):
         self.after(500, self._tick_chrome)
 
     def _tick_chrome(self) -> None:
+        if self._closed:
+            return
         try:
             if self._monitor is not None:
                 st = self._monitor.stats()
-                # 顶栏与延迟面板同一口径：真实滞后（render_age_ms）。
-                # 没有真实值就显示 "—" 并把药丸置灰 —— 绝不用
-                # staleness_ms 或本机 rtt+fetch 顶替，旧实现那样做过，
-                # 结果本机 8ms 出头的往返顶着"延迟"标签显示 132ms，
-                # 现场真实 4~10s 反而看不见。
                 cur = st["current_ms"]
                 live = st["live"]
                 has_latency = st["latency_available"]
@@ -166,8 +140,6 @@ class DesktopApp(tk.Tk):
                     else:
                         self._hdr_pill_var.set("● LIVE")
                         self._hdr_pill.config(fg=theme.OK, bg="#14352B")
-                    # 底栏带上积压证据：画面卡住时先看 drops/backlog，
-                    # 不要再去猜空中段。
                     queue = st["queue_ms"]
                     drops = st["drops"]
                     extra = ""
@@ -181,23 +153,44 @@ class DesktopApp(tk.Tk):
                     if st["p95_ms"] >= 0:
                         base += f" · p95 {int(st['p95_ms'])}ms"
                     self._foot_var.set(base + extra)
+        except tk.TclError:
+            return
         finally:
-            self.after(500, self._tick_chrome)
+            if not self._closed:
+                try:
+                    self.after(500, self._tick_chrome)
+                except tk.TclError:
+                    pass
 
     def _on_close(self) -> None:
+        self._closed = True
         try:
             if self._monitor is not None:
                 self._monitor.stop()
             if self._gamepad is not None:
                 self._gamepad.stop()
+            for panel in (getattr(self, "stream_panel", None),
+                          getattr(self, "log_panel", None),
+                          getattr(self, "latency_panel", None),
+                          getattr(self, "gamepad_panel", None)):
+                try:
+                    if panel is not None:
+                        if hasattr(panel, "stop"):
+                            panel.stop()
+                        panel.destroy()
+                except Exception:
+                    pass
         finally:
             if self._server is not None:
                 self._server.stop()
-            self.destroy()
+            try:
+                self.destroy()
+            except tk.TclError:
+                pass
 
 
 def main() -> None:
-    theme.enable_dpi_awareness()  # 必须在 Tk() 之前，否则高分屏下全窗口发虚
+    theme.enable_dpi_awareness()
     app = DesktopApp()
     app.mainloop()
 

@@ -11,19 +11,11 @@ Event = tuple[str, Union[str, "Image.Image"]]
 
 
 class Viewer:
-    """经 HTTP 拉取 server 重组好的 JPEG 帧并产出 PIL 帧。
-
-    链路：K230 UDP 分片 -> server:8001 重组 -> GET /video/latest.jpg。
-    只收完整帧（server 已做 SOI/EOI 校验），本端解码失败则丢帧不崩。
-
-    Events: ("frame", PIL.Image) | ("status", "streaming"|"no_stream"|text)
-    接口与旧 WebRTC Viewer 一致，StreamPanel 无需改动。
-    """
+    """经 HTTP 拉取 server 重组好的 JPEG 帧并产出 PIL 帧。"""
 
     def __init__(self, server_url: str, fps: int = 30) -> None:
         self.server_url = server_url.rstrip("/")
         self.fps = max(1, min(fps, 30))
-        # 帧队列只留最新几帧，避免网络抖动时延迟堆积
         self._events: deque[Event] = deque(maxlen=8)
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -32,14 +24,17 @@ class Viewer:
         self._streaming = False
 
     def start(self) -> None:
-        if self._thread is not None:
+        if self._thread is not None and self._thread.is_alive():
             return
         self._stop.clear()
         self._thread = threading.Thread(target=self._thread_main, daemon=True, name="jpeg-viewer")
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 2.0) -> None:
         self._stop.set()
+        t, self._thread = self._thread, None
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=timeout)
 
     def events(self) -> list[Event]:
         with self._lock:
@@ -69,7 +64,7 @@ class Viewer:
                         params = {"since": self._last_id} if self._last_id is not None else None
                         resp = client.get(url, params=params)
                         if resp.status_code == 304:
-                            pass  # 无新帧，等下一拍
+                            pass
                         elif resp.status_code == 404:
                             self._last_id = None
                             self._set_streaming(False)
@@ -79,9 +74,9 @@ class Viewer:
                             fid = resp.headers.get("X-Frame-Id")
                             try:
                                 img = Image.open(io.BytesIO(resp.content))
-                                img.load()  # 在网络线程内解码完，避免懒加载跨线程问题
+                                img.load()
                             except Exception:
-                                pass  # 坏帧直接丢，不更新 last_id 等下一帧
+                                pass
                             else:
                                 if fid is not None:
                                     try:
@@ -94,9 +89,13 @@ class Viewer:
                             fail_streak += 1
                             if fail_streak == 1:
                                 self._emit(("status", f"视频流异常: HTTP {resp.status_code}"))
+                            elif fail_streak % 10 == 1:
+                                self._emit(("status", f"视频流异常: HTTP {resp.status_code} x{fail_streak}"))
+                            # 5xx/未知状态退避，避免 30rps hammer server
+                            self._stop.wait(1.0)
+                            continue
                     except Exception as e:
                         fail_streak += 1
-                        # 降频打日志：只在第一次失败/恢复时提示，避免刷屏
                         if fail_streak == 1:
                             self._emit(("status", f"连接失败: {e}"))
                         self._set_streaming(False)

@@ -1,10 +1,4 @@
-"""手柄面板：xinput_gui.py 的 pit-wall 版 —— 操作手的另一只眼睛。
-
-布局（一眼四段，横条，放在主区底部通栏）：
-  状态（含 slot/帧率/推送） | 按键灯 | 双摇杆+双扳机 | 16 字节协议视图
-颜色纪律：连接绿 / 断开红 / 无 XInput 灰；按键灯亮红与验证程序一致。
-数据流：只读 GamepadPusher.snapshot()（20Hz 刷 UI），轮询与 POST 全在后台线程。
-"""
+"""手柄面板：xinput_gui.py 的 pit-wall 版 —— 操作手的另一只眼睛。"""
 from __future__ import annotations
 
 import tkinter as tk
@@ -14,13 +8,13 @@ from desktop.gamepad import xinput as xi
 from desktop.modules.base_panel import BasePanel
 
 _HAT = xi.HAT_NAMES
-_BTN13 = [("A", 0x01), ("B", 0x02), ("X", 0x08), ("Y", 0x10),
-          ("LB", 0x40), ("RB", 0x80)]
+# 按键灯统一复用 xi.LAMPS_13，避免双定义漂移
 
 
 class GamepadPanel(BasePanel):
     def __init__(self, master, pusher=None, **kwargs) -> None:
         self._pusher = pusher
+        self._closed = False
         super().__init__(master, title="GAMEPAD · 手柄", **kwargs)
 
     def build(self) -> None:
@@ -43,7 +37,6 @@ class GamepadPanel(BasePanel):
         for i, w in enumerate((1, 1, 0, 0)):
             body.columnconfigure(i, weight=w)
 
-        # ---- 按键灯 ----
         btnf = tk.Frame(body, bg=theme.PANEL)
         btnf.grid(row=0, column=0, sticky="nw", padx=(0, 10))
         self._lamps: dict[str, tk.Label] = {}
@@ -59,7 +52,6 @@ class GamepadPanel(BasePanel):
                  fg=theme.MUTE, font=theme.FONT_MONO_SM).grid(
             row=3, column=0, columnspan=6, sticky="w", pady=(4, 0))
 
-        # ---- 摇杆 ----
         self._sticks: dict[str, tuple] = {}
         for j, name in enumerate(("左摇杆", "右摇杆")):
             f = tk.Frame(body, bg=theme.PANEL)
@@ -74,7 +66,6 @@ class GamepadPanel(BasePanel):
             dot = cv.create_oval(0, 0, 0, 0, fill="#FF5D5D", outline="")
             self._sticks[name] = (cv, dot)
 
-        # ---- 扳机 ----
         trigf = tk.Frame(body, bg=theme.PANEL)
         trigf.grid(row=0, column=3, sticky="n", padx=(10, 0))
         tk.Label(trigf, text="扳机 0~255", bg=theme.PANEL, fg=theme.FAINT,
@@ -93,7 +84,6 @@ class GamepadPanel(BasePanel):
                                  font=("Consolas", 8))
             self._trigs[name] = (cv, bar, txt)
 
-        # ---- 协议视图 ----
         prof = tk.Frame(self, bg="#0B0F16", highlightthickness=1,
                         highlightbackground=theme.LINE)
         prof.pack(fill=tk.X, padx=theme.PAD, pady=(2, theme.PAD))
@@ -113,13 +103,23 @@ class GamepadPanel(BasePanel):
 
         self.after(50, self._tick)
 
-    # ---------- 刷新（20Hz，只读 snapshot，不做网络 IO） ----------
     def _tick(self) -> None:
+        if getattr(self, "_closed", False):
+            return
         try:
             if self._pusher is not None:
                 self._render(self._pusher.snapshot())
+        except tk.TclError:
+            return
         finally:
-            self.after(50, self._tick)
+            try:
+                self.after(50, self._tick)
+            except tk.TclError:
+                pass
+
+    def destroy(self) -> None:  # type: ignore[override]
+        self._closed = True
+        super().destroy()
 
     def _set_lamp(self, name: str, on: bool) -> None:
         lbl = self._lamps.get(name)
@@ -142,7 +142,6 @@ class GamepadPanel(BasePanel):
             if w & m:
                 self._set_lamp(n, True)
 
-        # 摇杆（Y 取反，与验证程序一致：上为正）
         for name, x, y in (("左摇杆", snap.lx, -snap.ly),
                            ("右摇杆", snap.rx, -snap.ry)):
             cv, dot = self._sticks[name]
@@ -163,17 +162,24 @@ class GamepadPanel(BasePanel):
         self._dp_var.set(
             f"十字键帽子值: {hat} {_HAT.get(hat, '?')}    L3={l3} R3={r3}")
 
-        parsed = xi.parse_protocol(snap.proto)
+        try:
+            parsed = xi.parse_protocol(snap.proto)
+        except Exception:
+            self._hex_var.set("-- 协议帧异常 --")
+            return
         self._hex_var.set(" ".join(
             parsed["raw_hex"][i:i + 2] for i in range(0, 32, 2)))
-        b13_names = "".join(n for n, m in _BTN13 if parsed["btn"] & m) or "--"
-        self._detail_var.set(
+        b13_names = "".join(n for n, m in xi.LAMPS_13 if parsed["btn"] & m) or "--"
+        prof = (
             f"LX={parsed['lx']:5d} LY={parsed['ly']:5d} "
             f"RX={parsed['rx']:5d} RY={parsed['ry']:5d}  "
             f"LT={parsed['lt']:4d} RT={parsed['rt']:4d}  "
             f"hat={parsed['hat']} btn=0x{parsed['btn']:02X}({b13_names}) "
             f"sys=0x{parsed['sys']:02X} share=0x{parsed['share']:02X}  "
             f"{'已推送→/command' if snap.posted else '未推送'}")
+        if getattr(snap, "last_error", ""):
+            prof += f" · {snap.last_error}"
+        self._detail_var.set(prof)
 
         if snap.connected:
             self._conn_var.set(

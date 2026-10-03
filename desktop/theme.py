@@ -1,31 +1,23 @@
-"""TinDistance pit-wall 主题 token：整个桌面 UI 的唯一颜色/字体来源。
-
-设计立场（只为这台赛车控制台选的，不是通用模板）：
-- 背景是赛道沥青蓝，而不是纯黑或米白纸面：长时间盯图传不刺眼，
-  又和维修区夜间灯光的氛围一致。
-- 主信号色是维修区信号灯琥珀 #FFB020，只用在延迟数字 + 曲线 + 关键操作上，
-  其他地方全部压暗，让操作手的眼睛永远先落在延迟上。
-- 辅助用遥测青 #4CC9FF，只画链接/次要曲线，不抢主信号。
-"""
+"""TinDistance pit-wall 主题 token：整个桌面 UI 的唯一颜色/字体来源。"""
 from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk
 
-BG = "#0E131A"  # asphalt，应用底
-PANEL = "#161E29"  # 卡片底
-PANEL_2 = "#1C2534"  # 悬浮/输入底
-LINE = "#263144"  # 分隔线
-INK = "#EAF0F6"  # 主文字
-MUTE = "#8A96AC"  # 次要文字
-FAINT = "#7E8CA3"  # 极弱文字/网格（PANEL 上对比度约 4.9:1，眉题小字可读）
-AMBER = "#FFB020"  # 主信号：延迟/录制/关键按钮
-CYAN = "#4CC9FF"  # 辅助：链接/RTT
+BG = "#0E131A"
+PANEL = "#161E29"
+PANEL_2 = "#1C2534"
+LINE = "#263144"
+INK = "#EAF0F6"
+MUTE = "#8A96AC"
+FAINT = "#7E8CA3"
+AMBER = "#FFB020"
+CYAN = "#4CC9FF"
 OK = "#34D399"
 BAD = "#FF5D5D"
 WARN = "#FFB020"
 
-FONT_DISPLAY = ("Segoe UI Semibold", 32)  # 右上大延迟数字，tabular 感靠 Consolas 数字行
+FONT_DISPLAY = ("Segoe UI Semibold", 32)
 FONT_TITLE = ("Segoe UI Semibold", 11)
 FONT_BODY = ("Segoe UI", 9)
 FONT_SMALL = ("Segoe UI", 9)
@@ -33,10 +25,6 @@ FONT_EYEBROW = ("Segoe UI Semibold", 9)
 FONT_MONO = ("Consolas", 9)
 FONT_MONO_BIG = ("Consolas", 26, "bold")
 FONT_MONO_SM = ("Consolas", 9)
-# 中英混排正文（日志/空状态提示）：Consolas 缺中文会回退宋体小字发虚。
-# 注意 Tk 按字体名精确匹配，而雅黑在不同语言系统下注册名不同
-#（简中机多为“微软雅黑”/Microsoft YaHei，繁体机可能是 Microsoft JhengHei），
-# 所以运行时探测、可运行时调用 cjk_font() 拿 tuple。
 _CJK_CANDIDATES = (
     "微软雅黑", "Microsoft YaHei", "Microsoft YaHei UI",
     "微軟正黑體", "Microsoft JhengHei UI",
@@ -69,9 +57,7 @@ RADIUS_NOTE = "卡片统一用 1px LINE 描边 + 无圆角系统主题，靠间�
 
 
 def enable_dpi_awareness() -> None:
-    """Windows 高分屏必调：声明 DPI 感知，否则系统会位图拉伸整个窗口，
-    所有文字发虚。必须在第一个 Tk() 创建之前调用；非 Windows 下无操作。
-    """
+    """Windows 高分屏必调：声明 DPI 感知，否则系统会位图拉伸整个窗口，"""
     try:
         import ctypes
     except Exception:
@@ -80,17 +66,17 @@ def enable_dpi_awareness() -> None:
         windll = getattr(ctypes, "windll", None)
         if windll is None:
             return
-        try:  # Win10 1703+：逐屏 V2，最清晰
+        try:
             windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
             return
         except Exception:
             pass
-        try:  # Win8.1+：逐屏感知
+        try:
             windll.shcore.SetProcessDpiAwareness(2)
             return
         except Exception:
             pass
-        try:  # 兜底：系统级感知
+        try:
             windll.user32.SetProcessDPIAware()
         except Exception:
             pass

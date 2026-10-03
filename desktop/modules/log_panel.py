@@ -1,8 +1,4 @@
-"""Server 日志：只回答“刚才发生了什么”，默认自动跟随，报错行标红。
-
-高频轮询（/video/status、/video/latest.jpg 等）与连续重复行默认批量
-折叠省略，避免把面板刷屏；工具条可随时关掉折叠查看原文。
-"""
+"""Server 日志：只回答“刚才发生了什么”，默认自动跟随，报错行标红。"""
 from __future__ import annotations
 
 import queue
@@ -19,33 +15,28 @@ from desktop.logs.log_client import LogClient
 from desktop.modules.base_panel import BasePanel
 
 
-# 时间戳前缀（server 格式 "%Y-%m-%d %H:%M:%S,ms"）每次都不同，归一化时去掉，
-# 否则同一条 access 日志永远判不成“重复”。
 _TIME_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[,.]\d+)?\s*")
-# 数字（帧号/延迟ms/端口/包大小…）折成 #，让“同类不同参”也算同一组重复。
 _NUM = re.compile(r"\d+")
 
-# 桌面自己发出的高频轮询：LatencyMonitor 0.5s 一次 /video/status，
-# Viewer 30fps 轮询 /video/latest.jpg，健康检查 /command 等。
 _POLLING_PATHS = (
     "/video/status",
     "/video/latest.jpg",
-    "/video/latency",
+    "/video/timing",
     "/video/mjpeg",
     "/ping",
     "/test",
     "/command",
 )
 
-# 同一组重复超过这么久还没断，插一条小结落数，避免计数永远不落地。
-# （比如 30fps 的图传拉帧日志停不下来时，每 2s 只多一行小结。）
 _SUMMARY_INTERVAL = 2.0
 
 
 def _normalize_key(line: str) -> str:
-    """去掉时间戳、把数字折叠，得到“重复分组”键。"""
+    """去掉时间戳、折叠纯数字长串，得到“重复分组”键；保留 fps/帧号等关键数值差异。"""
     s = _TIME_PREFIX.sub("", line).strip()
-    s = _NUM.sub("#", s)
+    # 只折叠时间戳/长数字（≥4位）与内存地址，避免不同帧号/fps 被误折叠
+    s = re.sub(r"\b\d{4,}\b", "#", s)
+    s = re.sub(r"0x[0-9a-fA-F]+", "0x#", s)
     return s
 
 
@@ -62,7 +53,7 @@ def _classify_tag(line: str) -> str | None:
         return "err"
     if "warn" in low:
         return "warn"
-    if "ok" in low or "done" in low or "connected" in low:
+    if re.search(r"\bok\b", low) or "done" in low or "connected" in low:
         return "ok"
     return None
 
@@ -73,14 +64,14 @@ class LogPanel(BasePanel):
         self._client: LogClient | None = None
         self._queue: queue.Queue = queue.Queue()
         self._follow = True
-        # 批量省略状态：连续重复只展示首条，其余计数+定时落小结；
-        # 轮询类（30fps 拉帧、0.5s 探针…）默认整类隐藏
         self._dedup = True
         self._hide_polling = True
+        self._closed = False
         self._pending_key: str | None = None
         self._pending_hidden: int = 0
         self._pending_since: float = 0.0
-        self._collapsed_total: int = 0
+        self._dedup_hidden: int = 0
+        self._polling_hidden: int = 0
         super().__init__(master, title="LOGS · 日志", **kwargs)
 
     def build(self) -> None:
@@ -90,11 +81,11 @@ class LogPanel(BasePanel):
                  font=theme.FONT_EYEBROW).pack(side=tk.LEFT)
         self._toggle_btn = ttk.Button(head, text="连接", command=self._toggle)
         self._toggle_btn.pack(side=tk.RIGHT)
+        ttk.Button(head, text="清空远端", command=self._clear_history).pack(side=tk.RIGHT, padx=(0, 6))
         self._follow_var = tk.StringVar(value="跟随开")
         ttk.Button(head, textvariable=self._follow_var,
                    command=self._flip_follow).pack(side=tk.RIGHT, padx=(0, 6))
 
-        # 第二排：批量省略开关 + 已省略计数
         opts = tk.Frame(self, bg=theme.PANEL)
         opts.pack(fill=tk.X, padx=theme.PAD, pady=(0, 6))
         self._dedup_var = tk.BooleanVar(value=self._dedup)
@@ -131,12 +122,23 @@ class LogPanel(BasePanel):
         self._text.tag_config("ok", foreground=theme.OK)
         self._text.tag_config("fold", foreground=theme.FAINT)
 
-        self.after(0, self._clear_remote_history)
         self.after(200, self._poll)
+        # 默认自动连接（与 Monitor/Pusher 一致），失败仅打行日志不断裂
+        try:
+            self.after(500, self._auto_connect)
+        except Exception:
+            pass
 
-    # ---------- 连接 ----------
-    def _clear_remote_history(self) -> None:
-        url = self._default_server.rstrip("/")
+    def _auto_connect(self) -> None:
+        if self._client is None:
+            try:
+                self._toggle()
+            except Exception:
+                pass
+
+    def _clear_history(self) -> None:
+        """显式清服务端历史（按钮触发，不再初始化自动清）。"""
+        url = self._server_var.get().rstrip("/")
         threading.Thread(target=self._clear_worker, args=(url,), daemon=True).start()
 
     def _clear_worker(self, url: str) -> None:
@@ -168,7 +170,6 @@ class LogPanel(BasePanel):
 
     def _flip_dedup(self) -> None:
         self._dedup = bool(self._dedup_var.get())
-        # 关掉折叠后丢弃未结算的组（计数已计入总数，不再补小结行）
         self._pending_key = None
         self._pending_hidden = 0
 
@@ -176,8 +177,13 @@ class LogPanel(BasePanel):
         self._hide_polling = bool(self._hide_poll_var.get())
 
     def _refresh_fold_label(self) -> None:
-        if self._collapsed_total > 0:
-            self._fold_var.set(f"已省略 {self._collapsed_total} 条重复")
+        parts = []
+        if self._dedup_hidden > 0:
+            parts.append(f"重复 {self._dedup_hidden}")
+        if self._polling_hidden > 0:
+            parts.append(f"轮询 {self._polling_hidden}")
+        if parts:
+            self._fold_var.set("已省略 " + " · ".join(parts))
         else:
             self._fold_var.set("")
 
@@ -188,10 +194,10 @@ class LogPanel(BasePanel):
         self._pending_key = None
         self._pending_hidden = 0
         self._pending_since = 0.0
-        self._collapsed_total = 0
+        self._dedup_hidden = 0
+        self._polling_hidden = 0
         self._refresh_fold_label()
 
-    # ---------- 输出（只追加不改写，避免 Tk 文本索引跨版本算错行） ----------
     def _append_line(self, line: str, tag: str | None) -> None:
         if tag:
             self._text.insert(tk.END, line + "\n", tag)
@@ -199,8 +205,16 @@ class LogPanel(BasePanel):
             self._text.insert(tk.END, line + "\n")
 
     def _trim(self) -> None:
-        if float(self._text.index(tk.END).split(".")[0]) > 2000:
-            self._text.delete("1.0", "500.0")
+        try:
+            end_idx = self._text.index(tk.END)
+            rows = int(end_idx.split(".")[0])
+        except Exception:
+            return
+        if rows > 2000:
+            try:
+                self._text.delete("1.0", "500.0")
+            except tk.TclError:
+                pass
 
     def _flush_pending(self) -> None:
         """结算当前重复组：藏起来的条数落一行灰色小结。调用时 Text 须可写。"""
@@ -215,40 +229,65 @@ class LogPanel(BasePanel):
         self._pending_hidden = 0
 
     def _poll(self) -> None:
-        self._text.config(state=tk.NORMAL)
+        if self._closed:
+            return
+        try:
+            self._text.config(state=tk.NORMAL)
+        except tk.TclError:
+            return
         try:
             while True:
                 try:
                     line = self._queue.get_nowait()
                 except queue.Empty:
                     break
-                # 轮询类（30fps 图传拉帧、0.5s 状态探针…）默认整类隐藏
                 if self._hide_polling and _is_polling(line):
-                    self._collapsed_total += 1
+                    self._polling_hidden += 1
                     continue
                 tag = _classify_tag(line)
                 key = _normalize_key(line) if self._dedup else None
                 if self._dedup and key is not None and key == self._pending_key:
-                    # 连续重复：只计数不展示；超 2s 不断则先落一条小结
                     self._pending_hidden += 1
-                    self._collapsed_total += 1
+                    self._dedup_hidden += 1
                     if time.monotonic() - self._pending_since >= _SUMMARY_INTERVAL:
                         self._flush_pending()
                     continue
-                # 新的一组：先结算上一组，再展示首条
                 self._flush_pending()
                 self._append_line(line, tag)
                 self._trim()
                 self._pending_key = key
                 self._pending_hidden = 0
                 self._pending_since = time.monotonic()
-            # 队列见底时，超时未断的组也落地，避免小结迟迟不出现
             if (self._dedup and self._pending_hidden > 0
                     and time.monotonic() - self._pending_since >= _SUMMARY_INTERVAL):
                 self._flush_pending()
             self._refresh_fold_label()
         finally:
-            if self._follow:
-                self._text.see(tk.END)
-            self._text.config(state=tk.DISABLED)
-            self.after(200, self._poll)
+            try:
+                if self._follow:
+                    self._text.see(tk.END)
+                self._text.config(state=tk.DISABLED)
+            except tk.TclError:
+                pass
+            if not self._closed:
+                try:
+                    self.after(200, self._poll)
+                except tk.TclError:
+                    pass
+
+    def destroy(self) -> None:  # type: ignore[override]
+        self._closed = True
+        try:
+            if self._client is not None:
+                self._client.stop()
+                self._client = None
+        except Exception:
+            pass
+        super().destroy()
+
+    def stop(self) -> None:
+        try:
+            if self._client is not None:
+                self._client.stop()
+        except Exception:
+            pass

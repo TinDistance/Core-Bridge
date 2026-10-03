@@ -1,9 +1,7 @@
-fastapi
-uvicorn[standard]
-aiortc
-pydantic
-mss
-numpy
-websockets
-httpx
-pillow
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+websockets>=12.0
+httpx>=0.27
+pillow>=10.2
+av>=11.0

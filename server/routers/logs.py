@@ -16,12 +16,20 @@ async def ws_logs(websocket: WebSocket) -> None:
     await websocket.accept()
     queue = hub.subscribe()
     try:
-        for line in list(hub.history):
-            await websocket.send_text(line)
+        # 历史分块发送，避免 500 行一次性阻塞 loop
+        history = list(hub.history)
+        for i in range(0, len(history), 50):
+            for line in history[i:i + 50]:
+                await websocket.send_text(line)
         while True:
             line = await queue.get()
             await websocket.send_text(line)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
         pass
+    except Exception:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
     finally:
         hub.unsubscribe(queue)

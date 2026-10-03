@@ -1,24 +1,4 @@
-"""UDP + JPEG 分片视频通道：重组器 + 最新帧缓存 + 统计。
-
-协议 v1（发往 UDP_PORT，默认 8001）：
-  每个 UDP 包 = 12 字节头 + JPEG 切片
-  头结构（大端）: >H B B H H H H
-    magic      u16 = 0x4A50 ('JP')
-    version    u8  = 1
-    flags      u8  = 0（保留）
-    frame_id   u16 （循环 0..65535）
-    total      u16 （该帧总片数，1..512）
-    idx        u16 （本片序号，0..total-1）
-    plen       u16 （本片 payload 实际长度，需 == len(package)-12）
-
-稳定性设计（接收端只收完整帧，丢包即丢整帧，保证实时性）：
-  * 单片 payload <= 1200B（MTU 安全，WiFi 下避免 IP 分片）
-  * 发送端片间 pacing 1~2ms，避免突发丢包
-  * 未收齐的帧超时 0.6s 丢弃；同时只保留最近 3 个未完成帧
-  * 单帧上限 1MB、total 上限 512，超限直接丢（防攻击/错包卡死）
-  * 组装后校验 JPEG SOI(FFD8)/EOI(FFD9)，坏帧丢弃不发布
-  * 只保留最新完整帧，desktop 通过 HTTP 轮询拉取（无长连接不断线）
-"""
+"""UDP + JPEG 分片视频通道：重组器 + 最新帧缓存 + 统计。"""
 from __future__ import annotations
 
 import struct
@@ -29,7 +9,7 @@ from dataclasses import dataclass, field
 MAGIC = 0x4A50
 VERSION = 1
 HEADER_FMT = ">HBBHHHH"
-HEADER_SIZE = struct.calcsize(HEADER_FMT)  # 12
+HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
 CHUNK_PAYLOAD_MAX = 1200
 MAX_CHUNKS = 512
@@ -52,11 +32,10 @@ class VideoHub:
     def __init__(self) -> None:
         self.latest_jpeg: bytes | None = None
         self.latest_frame_id: int = -1
-        self.latest_at: float = 0.0  # monotonic
+        self.latest_at: float = 0.0
         self.latest_wall: float = 0.0
         self.sender: str = ""
         self._boot: float = time.monotonic()
-        # 统计
         self.chunks_rx = 0
         self.chunks_bad = 0
         self.frames_ok = 0
@@ -66,7 +45,6 @@ class VideoHub:
         self._intervals_ms: deque[float] = deque(maxlen=120)
         self._partials: dict[int, _Partial] = {}
 
-    # ---------- 组包入口（UDP 协议回调调用） ----------
     def feed_datagram(self, data: bytes, addr: str) -> bool:
         """校验头部并组包；头部合法返回 True（命令推送学习地址用）。"""
         if len(data) < HEADER_SIZE:
@@ -92,7 +70,6 @@ class VideoHub:
         if plen != len(payload) or len(payload) > CHUNK_PAYLOAD_MAX or len(payload) == 0:
             self.chunks_bad += 1
             return False
-        # 头部合法：来源地址可作为命令反向推送目标
         self.sender = addr
 
         now = time.monotonic()
@@ -102,21 +79,20 @@ class VideoHub:
         part = self._partials.get(frame_id)
         if part is None:
             if len(self._partials) >= MAX_INFLIGHT:
-                # 挤掉最旧的未完成帧，保证内存/实时性
                 oldest = min(self._partials, key=lambda k: self._partials[k].first_seen)
                 del self._partials[oldest]
                 self.frames_dropped += 1
             part = self._partials[frame_id] = _Partial(total=total, first_seen=now)
         elif part.total != total:
-            # 同一 frame_id 复用但 total 不一致：旧回绕残留，直接丢弃旧项重建
             self.frames_dropped += 1
             part = self._partials[frame_id] = _Partial(total=total, first_seen=now)
 
         if idx in part.chunks:
-            return True  # 重复片，忽略
+            return True
         part.chunks[idx] = payload
         part.size += len(payload)
-        if part.size > MAX_FRAME_BYTES:
+        # 双限额：单帧理论上限 total*1200 + 绝对上限 1MiB（防 total 虚标撑内存）
+        if part.size > part.total * CHUNK_PAYLOAD_MAX or part.size > MAX_FRAME_BYTES:
             del self._partials[frame_id]
             self.frames_dropped += 1
             return True
@@ -137,7 +113,6 @@ class VideoHub:
             self._frame_times.append(now)
         return True
 
-    # ---------- 查询 ----------
     @property
     def live(self) -> bool:
         if self.latest_jpeg is None:
@@ -168,7 +143,8 @@ class VideoHub:
         n = max(1, min(n, 120))
         return [round(x, 1) for x in list(self._intervals_ms)[-n:]]
 
-    def age_ms(self) -> int:
+    def staleness_ms(self) -> int:
+        """最新帧落 server 距今的毫秒数（无帧 -1）。"""
         if self.latest_jpeg is None:
             return -1
         return int((time.monotonic() - self.latest_at) * 1000)
@@ -178,7 +154,7 @@ class VideoHub:
             "live": self.live,
             "udp_port": udp_port,
             "frame_id": self.latest_frame_id,
-            "age_ms": self.age_ms(),
+            "staleness_ms": self.staleness_ms(),
             "fps": round(self.fps, 2),
             "jitter_ms": self.jitter_ms,
             "jpeg_bytes": len(self.latest_jpeg) if self.latest_jpeg else 0,

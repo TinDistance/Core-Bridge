@@ -17,7 +17,9 @@ from desktop.streaming.h264_viewer import H264Viewer, available as h264_availabl
 from desktop.streaming.viewer import Viewer
 
 NO_STREAM_TEXT = "没有设备在推流"
-NO_STREAM_HINT = "检查 K230 是否已上电，确认推流地址指向本机 UDP 8001"
+NO_STREAM_HINT = "检查 K230 是否已上电，确认推流地址指向本机 UDP 8002"
+H264_SILENT_S = 5.0     # H264 连续多久没出帧就去探 JPEG 链路
+SIGNAL_LOSS_GRACE_S = 5.0   # 断流宽限：之内保留最后一帧不闪"没有设备在推流"
 
 
 class StreamPanel(BasePanel):
@@ -25,7 +27,13 @@ class StreamPanel(BasePanel):
                  monitor=None, **kwargs) -> None:
         self._default_server = default_server
         self._monitor = monitor  # LatencyMonitor，可选：上报拉帧耗时
-        self._viewer: Viewer | None = None
+        # 两条链路并存、按谁有帧用谁；旧实现是单向锁死（JPEG 不可逆），
+        # 结果跑 rtp_push.py 时 JPEG 无流 -> 永久"没信号"。
+        self._h264: H264Viewer | None = None
+        self._jpeg: Viewer | None = None
+        self._h264_last = 0.0
+        self._last_frame_ts = 0.0   # 最后一次真正出帧的时刻，用于断流宽限
+        self._paused = False
         self._photo: ImageTk.PhotoImage | None = None
         self._streaming = False
         self._frames = 0
@@ -72,75 +80,109 @@ class StreamPanel(BasePanel):
         tk.Label(foot, textvariable=self._size_var, bg=theme.PANEL,
                  fg=theme.FAINT, font=theme.FONT_MONO_SM).pack(side=tk.RIGHT)
 
-        self.after(500, self._ensure_viewer)
-        self.after(100, self._poll)
+        self.after(33, self._poll)
 
     # ---------- 控制 ----------
     def _toggle(self) -> None:
-        if self._viewer is None:
-            self._ensure_viewer()
-            self._toggle_btn.config(text="暂停")
-        else:
-            self._viewer.stop()
-            self._viewer = None
+        self._paused = not self._paused
+        if self._paused:
+            if self._h264 is not None:
+                self._h264.stop()
+                self._h264 = None
+            self._stop_jpeg()
             self._streaming = False
             self._toggle_btn.config(text="继续看")
             self._set_pill("已暂停", theme.MUTE, "#232E42")
             self._redraw()
-
-    def _ensure_viewer(self) -> None:
-        if self._viewer is not None:
-            return
-        url = self._server_var.get()
-        # 默认走 H264 裸 RTP（低延迟主链路）；PyAV 缺失时自动用 JPEG
-        if h264_available():
-            self._viewer = H264Viewer(url)
         else:
-            self._viewer = Viewer(url)
-        self._viewer.start()
+            self._h264_last = 0.0
+            self._toggle_btn.config(text="暂停")
+
+    def _ensure_h264(self) -> None:
+        """H264 裸 RTP 是主链路，常驻。PyAV 缺失才退回 JPEG。"""
+        if self._h264 is not None or not h264_available():
+            return
+        self._h264 = H264Viewer(self._server_var.get())
+        self._h264.start()
+
+    def _ensure_jpeg(self) -> None:
+        """JPEG 链路只在 H264 沉默时按需拉起；H264 一恢复立刻停掉。"""
+        if self._jpeg is None:
+            self._jpeg = Viewer(self._server_var.get())
+            self._jpeg.start()
+
+    def _stop_jpeg(self) -> None:
+        if self._jpeg is not None:
+            self._jpeg.stop()
+            self._jpeg = None
 
     def _set_pill(self, text: str, fg: str, bg: str) -> None:
         self._pill_var.set(text)
         self._pill.config(fg=fg, bg=bg)
 
-    def _switch_to_jpeg(self) -> None:
-        if self._viewer is not None:
-            self._viewer.stop()
-        self._viewer = Viewer(self._server_var.get())
-        self._viewer.start()
-        self._foot_var.set("H264 不可用，已降级 JPEG/UDP")
-
     # ---------- 帧循环 ----------
     def _poll(self) -> None:
-        if self._viewer is not None:
-            last_frame: Image.Image | None = None
-            for kind, payload in self._viewer.events():
+        now = time.monotonic()
+        if self._paused:
+            self.after(33, self._poll)
+            return
+        self._ensure_h264()
+
+        h264_img = None
+        h264_status = None
+        if self._h264 is not None:
+            for kind, payload in self._h264.events():
                 if kind == "frame":
-                    last_frame = payload  # 只画最新一帧，积压的旧帧直接丢
+                    h264_img = payload
                 elif kind == "status":
-                    if payload == "streaming":
-                        self._streaming = True
-                        self._set_pill("● LIVE", theme.OK, "#14352B")
-                    elif payload == "no_stream":
-                        self._streaming = False
-                        self._set_pill("无信号", theme.MUTE, "#232E42")
-                        self._redraw()
-                    elif payload == "fallback":
-                        self._switch_to_jpeg()
-                    else:
-                        self._set_pill("连接中", theme.WARN, "#3A2E14")
-                        self._foot_var.set(str(payload))
-            if last_frame is not None:
-                t0 = time.monotonic()
-                self._streaming = True
-                self._draw_frame(last_frame)
-                self._fetch_ms = (time.monotonic() - t0) * 1000.0
-                if self._monitor is not None:
-                    try:
-                        self._monitor.report_fetch(self._fetch_ms)
-                    except Exception:
-                        pass
-                self._set_pill("● LIVE", theme.OK, "#14352B")
+                    h264_status = payload
+
+        # H264 出帧 -> 立刻收回 JPEG 链路（双向切换，不再单向锁死）
+        if h264_img is not None:
+            self._h264_last = now
+            self._stop_jpeg()
+        elif self._h264_last and now - self._h264_last < H264_SILENT_S:
+            pass                        # 还在 H264 的短暂抖动窗口内
+        elif h264_available():
+            self._ensure_jpeg()          # H264 沉默 -> 探 JPEG
+
+        img = h264_img
+        if img is None and self._jpeg is not None:
+            for kind, payload in self._jpeg.events():
+                if kind == "frame":
+                    img = payload
+                elif kind == "status":
+                    h264_status = payload
+
+        if img is not None:
+            self._last_frame_ts = now
+            self._streaming = True
+            t0 = time.monotonic()
+            self._draw_frame(img)
+            self._fetch_ms = (time.monotonic() - t0) * 1000.0
+            if self._monitor is not None:
+                try:
+                    self._monitor.report_fetch(self._fetch_ms)
+                except Exception:
+                    pass
+            self._set_pill("● LIVE", theme.OK, "#14352B")
+            if img is not h264_img:
+                self._foot_var.set(f"JPEG 回退 · {self._size_var.get()}")
+        elif self._last_frame_ts and (now - self._last_frame_ts) < SIGNAL_LOSS_GRACE_S:
+            # 短暂断流：保留最后一帧，不闪"没有设备在推流"。
+            # 遥控/观测时一次几百毫秒的卡顿很常见，把画面清空反而更难判断
+            # 是机器人停了还是链路抖了。保持 _streaming=True 也让窗口 resize
+            # 时的 _redraw() 继续贴住这一帧而不是画占位符。
+            self._streaming = True
+            gap = now - self._last_frame_ts
+            self._set_pill(f"重连中 {gap:.1f}s", theme.WARN, "#3A2E14")
+        else:
+            # 连续断流超过 SIGNAL_LOSS_GRACE_S（或从未收到过帧）才报无信号
+            self._streaming = False
+            self._photo = None
+            self._size_var.set("")
+            self._set_pill("无信号", theme.MUTE, "#232E42")
+            self._redraw()
         self.after(33, self._poll)
 
     def _current_image_size(self) -> tuple[int, int]:

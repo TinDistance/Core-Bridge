@@ -163,11 +163,11 @@ def ensure_wifi(sta):
 
 
 def pick_profile(enc):
-    for name in ("H265_PROFILE_MAIN", "H265_PROFILE_MAIN10"):
+    for name in ("H264_PROFILE_BASELINE", "H264_PROFILE_MAIN"):
         val = getattr(enc, name, None)
         if val is not None:
             return val, name
-    raise RuntimeError("no H265 profile constant")
+    raise RuntimeError("no H264 profile constant")
 
 
 def init_encoder():
@@ -177,7 +177,7 @@ def init_encoder():
     encoder.SetOutBufs(OUT_BUFS, width, HEIGHT)
     profile, profile_name = pick_profile(encoder)
     chnAttr = ChnAttrStr(
-        encoder.PAYLOAD_TYPE_H265,
+        encoder.PAYLOAD_TYPE_H264,
         profile,
         width,
         HEIGHT,
@@ -216,27 +216,20 @@ def split_nalus(data):
     return out
 
 
-def rtp_header(seq, ts, marker, ssrc, pt=96):
+def rtp_header(seq, ts, marker, ssrc):
     return struct.pack(
-        ">BBHII", 0x80, pt | (0x80 if marker else 0), seq & 0xFFFF, ts & 0xFFFFFFFF, ssrc)
+        ">BBHII", 0x80, 0x60 | (0x80 if marker else 0), seq & 0xFFFF, ts & 0xFFFFFFFF, ssrc)
 
 
 def packetize_nalu(nalu, ts, seq, ssrc, out_packets):
-    """H.265（RFC 7798）单 NAL / FU 打包，返回更新后的 seq。
-
-    HEVC NAL 头 2 字节：高 9 位含 nal_unit_type/bit 层，低 6 位为
-    nuh_layer_id，末 3 位 tid。FU 包结构：Indicator(2B, F=0, type=49)
-    + FU header(1B: S/E/ Frequency) + 载荷，双方均保留原 2 字节头
-    中的 layer-id/tid，满足 RFC 7798 §4.3 的 MUST 约束。
-    """
+    """单 NAL / FU-A 打包，返回更新后的 seq。"""
     ln = len(nalu)
     if ln <= MAX_PAYLOAD:
         out_packets.append(rtp_header(seq, ts, False, ssrc) + bytes(nalu))
         return (seq + 1) & 0xFFFF
-    hdr0, hdr1 = nalu[0], nalu[1]
-    nal_type = (hdr0 >> 1) & 0x3F
-    indicator = (hdr0 & 0x81) | (49 << 1)
-    off = 2
+    indicator = (nalu[0] & 0xE0) | 28
+    nal_type = nalu[0] & 0x1F
+    off = 1
     first = True
     while off < ln:
         chunk = nalu[off:off + MAX_PAYLOAD]
@@ -249,8 +242,7 @@ def packetize_nalu(nalu, ts, seq, ssrc, out_packets):
         if last:
             fu |= 0x40
         out_packets.append(
-            rtp_header(seq, ts, False, ssrc)
-            + bytes([indicator, hdr1, fu]) + bytes(chunk))
+            rtp_header(seq, ts, False, ssrc) + bytes([indicator, fu]) + bytes(chunk))
         seq = (seq + 1) & 0xFFFF
     return seq
 
@@ -864,7 +856,7 @@ def main():
     server_ip = SERVER_IP or gateway
     init_encoder()
     sock = make_sock()
-    print("[4/4] pushing RTP h265 to %s ports=%s (%dKBps enc, %dKBps link, "
+    print("[4/4] pushing RTP h264 to %s ports=%s (%dKBps enc, %dKBps link, "
           "copies=%d, gop=%d)" % (
               server_ip, "/".join(str(p) for p in RTP_PORTS),
               BIT_RATE * 1000 // 8, WIFI_LINK_KBPS, LINK_COPIES, GOP_LEN))

@@ -65,7 +65,7 @@ class LatencySample:
     jitter_ms: float = 0.0
     frame_id: int = -1
     live: bool = False
-    source: str = "rtp:8002 (h265)"
+    source: str = "rtp:8002"
 
     @property
     def local_ms(self) -> float:
@@ -111,22 +111,10 @@ class LatencyMonitor:
         if t is not None and t is not threading.current_thread():
             t.join(timeout=timeout)
 
-    def report_fetch(self, fetch_ms: float) -> None:
-        """StreamPanel 的 Viewer 每次拉到帧后调用（本机取帧耗时）。"""
-        with self._lock:
-            self._fetch_ms = fetch_ms
-
     def report_draw(self, draw_ms: float) -> None:
         """绘制耗时（原 report_fetch 的真实语义）；暂与 fetch 共用字段，避免混入 local_ms 需另算。"""
         with self._lock:
             self._fetch_ms = draw_ms
-
-    def report_stream_stats(self, stats: dict | None) -> None:
-        """喂 H265Viewer.stats()。字段缺失/None 一律存 None，后续按 -1 显示。"""
-        with self._stream_lock:
-            if stats is None:
-                return
-            self._stream_stats = dict(stats)
 
     def set_stream_stats_provider(self, fn: Callable[[], dict] | None) -> None:
         """注册一个返回 viewer.stats() 的 callable，采样时主动拉。"""
@@ -173,7 +161,7 @@ class LatencyMonitor:
             self.last_error = str(e)
             self._append(LatencySample(t=time.time()))
             return
-        src = "rtp:8002 (h265)"
+        src = "rtp:8002"
         jpeg_live = bool(data.get("live"))
         if not jpeg_live:
             try:

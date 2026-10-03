@@ -1,4 +1,4 @@
-"""H265 裸 RTP 多链中转（方案 A 的 server 段）。
+"""H264 裸 RTP 多链中转（方案 A 的 server 段）。
 
 K230 同帧同 seq 同 SSRC 多拷贝发往多入口端口（8002/8003/8004），
 每条入口独立 socket/独立内核缓冲，互为备份；本中转不按内容去重
@@ -35,7 +35,6 @@ def _parse_ports(raw: str) -> list[int]:
 RTP_PORTS = _parse_ports(
     os.environ.get("CORE_BRIDGE_RTP_PORTS")
     or os.environ.get("CORE_BRIDGE_RTP_UDP_PORT", "8002,8003,8004"))
-RTP_PORT = RTP_PORTS[0]
 
 CONTROL_MAGIC = b"CBR"
 CTRL_PING = 0x00
@@ -47,7 +46,6 @@ UPSTREAM_STALE_S = 5.0
 DOWNSTREAM_STALE_S = 10.0
 
 SO_RCVBUF_BYTES = 256 << 10
-RATE_ASSUMED_BPS = 3_000_000
 
 
 class RtpRelay:
@@ -62,7 +60,6 @@ class RtpRelay:
         self._upstreams: dict[int, tuple[str, int]] = {}
         self._upstream_at: dict[int, float] = {}
         self._downstreams: dict[tuple[str, int], float] = {}
-        self._downstream_at = 0.0
 
         self._pkts_rx = 0
         self._pkts_tx = 0
@@ -219,7 +216,6 @@ class RtpRelay:
     def _on_control(self, data: bytes, addr: tuple[str, int]) -> None:
         kind = data[3] if len(data) > 3 else CTRL_PING
         now = time.monotonic()
-        sock: socket.socket | None = None
         upstreams: dict[tuple[str, int], float] = {}
         with self._lock:
             self._downstreams[addr] = now
@@ -228,7 +224,6 @@ class RtpRelay:
                       if now - t > DOWNSTREAM_STALE_S]:
                 if a != addr:
                     del self._downstreams[a]
-            self._downstream_at = now
             for port, up in self._upstreams.items():
                 age = now - self._upstream_at.get(port, 0.0)
                 if age <= UPSTREAM_STALE_S:
@@ -296,7 +291,7 @@ class RtpRelay:
             and last_frame_at and now - last_frame_at <= UPSTREAM_STALE_S
         )
         return {
-            "mode": "h265",
+            "mode": "h264",
             "live": live,
             "fps": round(fps, 2),
             "pps": round(pps, 1),
@@ -343,5 +338,5 @@ def stop_relay() -> None:
 
 def relay_status() -> dict:
     if _relay is None:
-        return {"mode": "h265", "live": False, "started": False}
+        return {"mode": "h264", "live": False, "started": False}
     return _relay.status()

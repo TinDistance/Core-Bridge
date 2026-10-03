@@ -1,24 +1,10 @@
-"""XInput 读取 + 16 字节 BLE HID 协议映射。
-
-协议（与 ESP32_to_Xbox / xinput_gui.py 完全一致）：
-  [0:2]  joyLHori uint16 LE 中值0x8000   [2:4] joyLVert
-  [4:6]  joyRHori                        [6:8] joyRVert
-  [8:10] trigLT 10位(0~1023)             [10:12] trigRT
-  [12]   十字键帽子值 0中 1上 2右上 3右 4右下 5下 6左下 7左 8左上
-  [13]   A=0x01 B=0x02 X=0x08 Y=0x10 LB=0x40 RB=0x80
-  [14]   View=0x04 Menu=0x08 Xbox=0x10 LS=0x20 RS=0x40
-  [15]   Share=0x01（XInput 无 Share，恒 0）
-
-本模块 import 安全：非 Windows / 无 XInput DLL 时 load 失败，
-reader 返回未连接状态，不抛异常，UI 照常显示“未连接手柄”。
-"""
+"""XInput 读取 + 16 字节 BLE HID 协议映射。"""
 from __future__ import annotations
 
 import ctypes
 import sys
 from dataclasses import dataclass
 
-# ---------------- XInput 按键位 ----------------
 XINPUT_GAMEPAD_DPAD_UP = 0x0001
 XINPUT_GAMEPAD_DPAD_DOWN = 0x0002
 XINPUT_GAMEPAD_DPAD_LEFT = 0x0004
@@ -40,7 +26,6 @@ HAT_NAMES = {
     5: "下", 6: "左下", 7: "左", 8: "左上",
 }
 
-# UI 按键灯：(显示名, XInput 位)
 LAMPS_13 = [
     ("A", XINPUT_GAMEPAD_A), ("B", XINPUT_GAMEPAD_B),
     ("X", XINPUT_GAMEPAD_X), ("Y", XINPUT_GAMEPAD_Y),
@@ -86,7 +71,7 @@ def _load_xinput():
 _XINPUT, _DLL_FOUND = _load_xinput()
 if _XINPUT is not None:
     try:
-        _GET_STATE = _XINPUT[100]  # XInputGetStateEx，支持 Guide 键
+        _GET_STATE = _XINPUT[100]
         _GUIDE_OK = True
     except (AttributeError, OSError):
         _GET_STATE = _XINPUT.XInputGetState
@@ -131,7 +116,7 @@ class PadState:
     buttons: int = 0
     lt8: int = 0
     rt8: int = 0
-    lx: int = 0  # int16 原始值
+    lx: int = 0
     ly: int = 0
     rx: int = 0
     ry: int = 0
@@ -163,13 +148,16 @@ def hat_from_buttons(w: int) -> int:
 
 
 def xinput_to_protocol(g: XINPUT_GAMEPAD) -> bytes:
-    """XInput 状态 -> 项目 16 字节 BLE HID 报文（与 xinput_gui.py 逐字节一致）。"""
-    lx = int(g.sThumbLX) & 0xFFFF
-    ly = int(g.sThumbLY) & 0xFFFF
-    rx = int(g.sThumbRX) & 0xFFFF
-    ry = int(g.sThumbRY) & 0xFFFF
-    lt = min(1023, int(g.bLeftTrigger) * 4)
-    rt = min(1023, int(g.bRightTrigger) * 4)
+    """XInput 状态 -> 项目 16 字节 BLE HID 报文（与 xinput_gui.py 逐字节一致）。
+
+    XInput 摇杆为有符号 SHORT，中位 0；协议为 u16 偏置码，中位 0x8000。
+    """
+    lx = (int(g.sThumbLX) + 32768) & 0xFFFF
+    ly = (int(g.sThumbLY) + 32768) & 0xFFFF
+    rx = (int(g.sThumbRX) + 32768) & 0xFFFF
+    ry = (int(g.sThumbRY) + 32768) & 0xFFFF
+    lt = min(1023, (int(g.bLeftTrigger) * 1023 + 127) // 255)
+    rt = min(1023, (int(g.bRightTrigger) * 1023 + 127) // 255)
     w = int(g.wButtons)
     hat = hat_from_buttons(w)
     b13 = 0
@@ -216,7 +204,7 @@ def neutral_protocol() -> bytes:
 
 
 class XInputReader:
-    """有状态读取器：记住槽位，掉线自动重找。线程安全（单轮询线程使用）。"""
+    """有状态读取器：记住槽位，掉线自动重找。仅限单轮询线程使用，非线程安全。"""
 
     def __init__(self) -> None:
         self.slot: int | None = find_controller()
@@ -253,8 +241,13 @@ class XInputReader:
 
 
 def parse_protocol(proto: bytes) -> dict:
-    """16 字节报文 -> UI / /command 共用的解析字典。长度不足补中位。"""
-    p = (bytes(proto) + _NEUTRAL_PROTO)[:16]
+    """16 字节报文 -> UI / /command 共用的解析字典。
+
+    长度异常直接抛错由调用方处理；调用方如需容错请自行补中位。
+    """
+    p = bytes(proto)
+    if len(p) != 16:
+        raise ValueError(f"protocol must be 16 bytes, got {len(p)}")
     lx = int.from_bytes(p[0:2], "little")
     ly = int.from_bytes(p[2:4], "little")
     rx = int.from_bytes(p[4:6], "little")

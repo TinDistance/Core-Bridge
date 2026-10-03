@@ -62,6 +62,11 @@ import httpx
 WARN_MS = 500.0
 HISTORY = 120
 
+# 把本机指标快照（render_age_ms 等）上报到 server /video/timing/client 的
+# 最小间隔。上报是为了让**不在操作手那台机器上**也能读到真实滞后（现场排障
+# 只需要 curl server）。5s 足够及时，又不至于每个 500ms 采样都多一次 HTTP。
+CLIENT_REPORT_MIN_S = 5.0
+
 # Agent A 契约字段 -> 面板语义。键是 viewer.stats() 的键，值是语义分组。
 # 全部 optional：viewer 还没上报就当 -1。
 STREAM_METRIC_KEYS = (
@@ -165,6 +170,7 @@ class LatencyMonitor:
         self._stream_stats: dict = {}
         self._stream_provider: Callable[[], dict] | None = None
         self._stream_lock = threading.Lock()
+        self._last_client_report = 0.0
 
     # ---------- 生命周期 ----------
     def start(self) -> None:
@@ -290,6 +296,37 @@ class LatencyMonitor:
             source=src or "无信号",
         )
         self._append(sample)
+        self._maybe_report_client_timing(client, base, sample)
+
+    def _maybe_report_client_timing(
+        self, client: httpx.Client, base: str, s: LatencySample
+    ) -> None:
+        """限频把本机指标快照推到 server，好让 /video/timing 能透出真实滞后。
+
+        只在真的有 render_age_ms 时才上报 —— 上报一堆 None 对排障没意义，
+        还会在 viewer 没起来时白刷一份"未知"快照覆盖掉上一次的有效值。
+        """
+        if s.render_age_ms < 0:
+            return
+        now = time.monotonic()
+        if now - self._last_client_report < CLIENT_REPORT_MIN_S:
+            return
+        self._last_client_report = now
+        body = {
+            "render_age_ms": s.render_age_ms,
+            "queue_ms": s.queue_ms,
+            "backlog_packets": s.backlog_packets,
+            "backlog_bytes": s.backlog_bytes,
+            "drops": s.drops,
+            "loop_us_avg": s.loop_us_avg,
+            "loop_us_max": s.loop_us_max,
+        }
+        body = {k: v for k, v in body.items() if v >= 0}
+        try:
+            client.post(f"{base}/video/timing/client", json=body)
+        except Exception:
+            # 上报是旁路，失败不影响采样线程 —— 它一挂整块面板就停更。
+            pass
 
     def _append(self, sample: LatencySample) -> None:
         with self._lock:

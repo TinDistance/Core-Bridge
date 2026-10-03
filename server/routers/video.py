@@ -12,8 +12,9 @@ import asyncio
 import logging
 import os
 import socket
+import time
 
-from fastapi import APIRouter, Query, Response
+from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from server import command_udp
@@ -35,6 +36,41 @@ UDP_HOST = os.environ.get("CORE_BRIDGE_VIDEO_UDP_HOST", "0.0.0.0")
 # 延迟上界才可比。
 
 _transport: asyncio.DatagramTransport | None = None
+
+# 桌面端上报的本机指标（见 POST /video/timing/client）。这些量产生在桌面
+# 进程里，server 自己测不出，所以只能由上报获得；从未上报时是 None ——
+# **不填 0，也不回退成 staleness_ms**，那正是 4227d80 之前"显示在骗人"的
+# 根因：把一个与现场无关的数（33ms 的到达陈旧度）当成延迟往外送。
+CLIENT_TIMING_KEYS = (
+    "render_age_ms",
+    "queue_ms",
+    "backlog_packets",
+    "backlog_bytes",
+    "drops",
+    "loop_us_avg",
+    "loop_us_max",
+)
+_client_timing: dict[str, float | None] = {k: None for k in CLIENT_TIMING_KEYS}
+_client_timing_at: float = 0.0
+_client_timing_recv: int = 0
+
+
+def _coerce_ms(v: object) -> float | None:
+    """上报值安全转 float；缺失/None/NaN/负数一律 None（优雅降级）。"""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        x = float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if x != x or x < 0:  # NaN 或负数无意义
+        return None
+    return round(x, 1)
+
+
+def _client_timing_payload() -> dict[str, float | None]:
+    """上报字段的对外视图。没有上报时全部 None，而不是缺键。"""
+    return {k: _client_timing.get(k) for k in CLIENT_TIMING_KEYS}
 
 
 class _VideoProtocol(asyncio.DatagramProtocol):
@@ -101,27 +137,80 @@ async def rtp_status() -> JSONResponse:
     return JSONResponse(relay_status())
 
 
+@router.post("/timing/client")
+async def timing_client_report(request: Request) -> JSONResponse:
+    """桌面端上报它**本机**测到的链路指标（Agent A 的 viewer.stats()）。
+
+    为什么需要这一跳：render_age_ms / queue_ms / backlog_* / drops 全都产生在
+    桌面进程里（AU 到达 -> 渲染完成），server 无从得知。但把这份快照记到
+    server 上是有价值的 —— 现场排障时对着 server 就能读到"操作手当时看到的
+    画面有多旧"，而不必去操作手那台机器上开面板。上一版恰恰做不到这一点：
+    server 只有 staleness_ms，压 4s 照样读 33ms。
+
+    契约：body 是任意 dict，**未知键忽略、坏值丢弃、缺键留 None**。任何
+    异常都不返回 5xx —— 上报失败不该影响链路或面板。
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = None
+    if not isinstance(payload, dict):
+        return JSONResponse({"ok": True, "accepted": 0})
+    clean: dict[str, float | None] = {}
+    for key in CLIENT_TIMING_KEYS:
+        clean[key] = _coerce_ms(payload.get(key))
+    global _client_timing, _client_timing_at, _client_timing_recv
+    _client_timing = clean
+    _client_timing_at = time.time()
+    _client_timing_recv = sum(1 for v in clean.values() if v is not None)
+    return JSONResponse({"ok": True, "accepted": _client_timing_recv})
+
+
 @router.get("/timing")
 async def timing(n: int = Query(default=60, ge=5, le=120)) -> JSONResponse:
-    """到达节奏诊断（原 /video/latency，改名因为它不含任何延迟）。
+    """到达节奏诊断 + 延迟上界（原 /video/latency）。
 
-    只给帧间隔序列 / 抖动 / fps / 陈旧度，供桌面端画曲线或做二次分析。
-    这里的 staleness_ms 是"最后一帧到 server 有多久"，不是端到端延迟 ——
-    旧名 /video/latency 会让人以为它能回答"画面滞后多少"，实际上链路压 4s
-    它照样读 33ms。真延迟要等 K230 侧 capture_ts（protocol v2）。
+    三组数，语义互不重叠，看的时候别混：
+
+    1. 到达节奏：frame_id / fps / jitter / intervals_ms / staleness_ms。
+       staleness_ms 是"最后一帧到 server 有多久"，**不是延迟**：新帧一直在
+       到，它满流时恒在 [0,33]ms，压 4s 延迟也读 33ms。只当停流旁证。
+    2. 延迟上界：kbps + rcvbuf_bytes + rcvbuf_max_queue_ms。
+       后者 = 缓冲字节*8/码率，是"包已到达但排在 socket 缓冲里没被读走"
+       能贡献的最坏秒数。延迟异常时先看它区分"空中段慢"还是"缓冲里排队"。
+    3. 桌面侧真实指标：render_age_ms / queue_ms / backlog_* / drops，
+       来自 POST /video/timing/client 的上报。**server 自己测不出**，从未
+       上报过时为 null（不是 0，也不是回退成 staleness —— 那正是 4227d80
+       之前的自欺）。client_report_age_ms 告诉你这份快照有多旧。
     """
     st = hub.status(UDP_PORT)
-    return JSONResponse(
-        {
-            "live": st["live"],
-            "frame_id": st["frame_id"],
-            "staleness_ms": st["staleness_ms"],
-            "fps": st["fps"],
-            "jitter_ms": st["jitter_ms"],
-            "intervals_ms": hub.recent_intervals_ms(n),
-            "server_time": st["server_time"],
-        }
-    )
+    rs = relay_status()
+    now = time.time()
+    payload: dict = {
+        # --- 1) 到达节奏（非延迟）---
+        "live": st["live"],
+        "frame_id": st["frame_id"],
+        "staleness_ms": st["staleness_ms"],
+        "fps": st["fps"],
+        "jitter_ms": st["jitter_ms"],
+        "intervals_ms": hub.recent_intervals_ms(n),
+        # --- 2) 延迟上界（server 可测）---
+        "kbps": rs.get("kbps", 0.0),
+        "pps": rs.get("pps", 0.0),
+        "rcvbuf_bytes": rs.get("rcvbuf_bytes", SO_RCVBUF_BYTES),
+        "rcvbuf_max_queue_ms": rs.get("rcvbuf_max_queue_ms", -1.0),
+        "rtp_live": rs.get("live", False),
+        "upstream": rs.get("upstream"),
+        "downstreams": rs.get("downstreams", 0),
+        # --- 3) 桌面侧真实指标（未上报则 null，绝不伪造）---
+        "server_time": st["server_time"],
+        "client_reported_at": _client_timing_at or None,
+        "client_report_age_ms": round((now - _client_timing_at) * 1000.0, 1)
+        if _client_timing_at else None,
+        "client_fields": _client_timing_recv,
+    }
+    payload.update(_client_timing_payload())
+    return JSONResponse(payload)
 
 
 @router.get("/latest.jpg")

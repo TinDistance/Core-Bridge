@@ -2,7 +2,6 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from server.command_udp import start_command_udp, stop_command_udp
 from server.logs import hub as log_hub
 from server.routers import command, heartbeat, logs, video, webrtc
 from server.routers.video import start_udp_listener, stop_udp_listener
@@ -14,11 +13,11 @@ async def lifespan(app: FastAPI):
 
     log_hub.set_loop(asyncio.get_running_loop())
     await start_udp_listener()
-    start_command_udp()
+    # 命令由 start_udp_listener 内部在同一视频 socket 上反向推送
+    # （server/command_udp.py，目标地址从视频分片学习，无需 K230 注册）
     try:
         yield
     finally:
-        stop_command_udp()
         await stop_udp_listener()
 
 

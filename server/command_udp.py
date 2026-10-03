@@ -1,15 +1,16 @@
-"""K230 命令通道 UDP 推送服务（UART 帧 v2）。
+"""K230 命令通道 UDP 反向推送服务（UART 帧 v2，复用视频 socket）。
 
-背景：K230 固件的 TCP connect 慢且不稳定（驱动层反复 connect timeout，
-socket 泄漏导致 errno 12），150Hz HTTP 轮询不可行；图传链路已证明 UDP
-在该 WiFi 上稳定，故命令通道改为 UDP 推送。K230 收 UDP 推送后转 UART3，
-不再走 TCP。
+背景：K230 发视频 UDP 分片到 server:8001，server 由此得知 K230 的
+(ip, port)，直接在同一 socket 上向该地址回推 v2 UART 帧。反向推送
+不被热点 NAT / 防火墙拦，K230 无需注册包（原 b"CQ"+hz 协议已废），
+掉线也无需重注册——视频一恢复地址自动刷新。
 
-协议（UDP，默认端口 8002，环境变量 CORE_BRIDGE_CMD_UDP_PORT 覆盖）：
-  注册：K230 周期性(0.5s)发送 b"CQ" + bytes([hz])，hz = 期望推送频率
-  推送：服务端按 hz 向注册地址推送 v2 UART 帧（见 build_uart_frame）；
+协议：
+  学习：video 路由收到合法视频分片（video_hub.feed_datagram 校验通过）
+    时调用 note_video_sender(ip, port) 记录推送目标并刷新 TTL
+  推送：按推送周期向目标发送 v2 UART 帧（见 build_uart_frame）；
     无激活条目时该周期不发送任何字节（但 next_send 照常推进）
-  注册 60s 未刷新则停止推送；K230 掉线自动重注册。
+  目标视频静默超过 ENDPOINT_STALE_S 则停止推送，静默期内不发送
 
 UART 命令帧 v2（K230 -> MCU UART3 原样转发）：
   [0]=0xAA [1]=0x55 [2]=N（条目数，1..8）
@@ -27,8 +28,6 @@ UART 命令帧 v2（K230 -> MCU UART3 原样转发）：
 from __future__ import annotations
 
 import logging
-import os
-import socket
 import threading
 import time
 
@@ -36,9 +35,7 @@ from server.routers.command import snapshot, _resolve_cmds
 
 logger = logging.getLogger("command_udp")
 
-UDP_PORT = int(os.environ.get("CORE_BRIDGE_CMD_UDP_PORT", "8002"))
-UDP_HOST = os.environ.get("CORE_BRIDGE_CMD_UDP_HOST", "0.0.0.0")
-REG_TTL = 60.0
+ENDPOINT_STALE_S = 2.5  # 视频静默超此时长即停止推送（30fps 视频约 75 帧余量）
 MIN_HZ, MAX_HZ = 30, 300
 DEFAULT_HZ = 150
 
@@ -53,6 +50,10 @@ _CMD_ORDER = ("MOVE", "TURRET")
 
 _stop = threading.Event()
 _thread: threading.Thread | None = None
+
+_lock = threading.Lock()
+_endpoint: tuple[str, int] | None = None
+_endpoint_at = 0.0  # monotonic，note_video_sender 刷新
 
 
 def crc8(payload: bytes) -> int:
@@ -145,34 +146,39 @@ def build_uart_frame(snap: dict,
     return body + bytes([crc8(body)])
 
 
-def _run(sock: socket.socket, default_hz: int) -> None:
-    client: tuple[str, int] | None = None
-    last_reg = 0.0
-    hz = default_hz
-    next_send = time.perf_counter()
+def note_video_sender(host: str, port: int) -> None:
+    """收到合法视频分片时由 video 路由调用（asyncio 事件循环线程）。
+
+    记录推送目标并刷新新鲜度；地址变化（K230 重启/换端口）日志提示。
+    """
+    global _endpoint, _endpoint_at
+    with _lock:
+        prev = _endpoint
+        _endpoint = (host, port)
+        _endpoint_at = time.monotonic()
+    if prev != _endpoint:
+        logger.info("command UDP target from video sender: %s:%d", host, port)
+
+
+def _current_endpoint() -> tuple[str, int] | None:
+    with _lock:
+        if _endpoint is None:
+            return None
+        if time.monotonic() - _endpoint_at > ENDPOINT_STALE_S:
+            return None
+        return _endpoint
+
+
+def _run(sendto, hz: int) -> None:
+    first_frame_logged_for: tuple[str, int] | None = None
     period = 1.0 / hz
+    next_send = time.perf_counter()
     active: dict[str, bool] = {n: False for n in _CMD_ORDER}
 
     while not _stop.is_set():
-        # 收注册包（非阻塞，排空）
-        sock.settimeout(0)
-        try:
-            while True:
-                data, addr = sock.recvfrom(64)
-                if data[:2] == b"CQ":
-                    hz = MAX_HZ
-                    if len(data) >= 3:
-                        hz = max(MIN_HZ, min(MAX_HZ, data[2]))
-                    client = (addr[0], addr[1])
-                    last_reg = time.monotonic()
-                    period = 1.0 / hz
-        except (BlockingIOError, socket.timeout):
-            pass
-        except OSError:
-            pass
-
+        endpoint = _current_endpoint()
         now = time.perf_counter()
-        if client is not None and time.monotonic() - last_reg < REG_TTL:
+        if endpoint is not None:
             if now >= next_send:
                 try:
                     snap = snapshot()
@@ -180,7 +186,11 @@ def _run(sock: socket.socket, default_hz: int) -> None:
                         active, _known_cmds_by_name(snap))
                     frame = build_uart_frame(snap, active)
                     if frame is not None:
-                        sock.sendto(frame, client)
+                        sendto(frame, endpoint)
+                        if endpoint != first_frame_logged_for:
+                            logger.info("first command UDP frame sent to %s:%d (%d bytes)",
+                                        endpoint[0], endpoint[1], len(frame))
+                            first_frame_logged_for = endpoint
                     # frame 为 None 也不补发：next_send 照常推进，避免恢复时突发
                 except OSError:
                     pass
@@ -194,27 +204,26 @@ def _run(sock: socket.socket, default_hz: int) -> None:
             next_send = now + period
 
 
-def start_command_udp(host: str = UDP_HOST, port: int = UDP_PORT,
-                      push_hz: int = DEFAULT_HZ) -> None:
-    """在 server lifespan 中调用；端口被占则记错但不让 HTTP 挂掉。"""
+def start_command_udp(sendto, push_hz: int = DEFAULT_HZ) -> None:
+    """复用视频 UDP socket：sendto 通常为视频 transport.sendto。
+
+    在 video UDP listener 就绪后调用；端口被占则不会走到这里。
+    """
     global _thread
     if _thread is not None:
         return
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind((host, port))
-    except OSError as e:
-        logger.error("command UDP bind %s:%d failed: %s", host, port, e)
-        return
     _stop.clear()
-    _thread = threading.Thread(target=_run, args=(sock, push_hz),
+    _thread = threading.Thread(target=_run, args=(sendto, push_hz),
                                daemon=True, name="command-udp")
     _thread.start()
-    logger.info("command UDP listening on %s:%d (push %dHz)",
-                host, port, push_hz)
+    logger.info("command UDP pusher started (target learned from video packets, %dHz)",
+                push_hz)
 
 
 def stop_command_udp() -> None:
     global _thread
     _stop.set()
     _thread = None
+    with _lock:
+        global _endpoint
+        _endpoint = None

@@ -16,6 +16,7 @@ import socket
 from fastapi import APIRouter, Query, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from server import command_udp
 from server.video_hub import hub
 
 logger = logging.getLogger("video_udp")
@@ -32,9 +33,13 @@ class _VideoProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, addr) -> None:  # noqa: ANN001
         try:
             host = addr[0] if isinstance(addr, tuple) else str(addr)
+            port = int(addr[1]) if isinstance(addr, tuple) else 0
         except Exception:
-            host = ""
-        hub.feed_datagram(data, host)
+            host, port = "", 0
+        valid = hub.feed_datagram(data, host)
+        # 学习视频发送地址，作为命令反向推送目标（头部校验通过即算）
+        if valid and port:
+            command_udp.note_video_sender(host, port)
 
 
 async def start_udp_listener(host: str = UDP_HOST, port: int = UDP_PORT) -> None:
@@ -49,20 +54,27 @@ async def start_udp_listener(host: str = UDP_HOST, port: int = UDP_PORT) -> None
             local_addr=(host, port),
         )
         # 加大内核收包缓冲，WiFi 突发下减少丢包
+        sock_obj = None
         try:
-            sock = transport.get_extra_info("socket")
-            if isinstance(sock, socket.socket):
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+            sock_obj = transport.get_extra_info("socket")
+            if isinstance(sock_obj, socket.socket):
+                sock_obj.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
         except Exception:
             pass
         _transport = transport
         logger.info("video UDP listening on %s:%d", host, port)
+        # 命令反向推送复用同一视频 socket：目标地址由收到的视频分片学习
+        # （note_video_sender），无需 K230 注册；取底层 socket.sendto
+        # （py3.14 的 get_extra_info 返回 TransportSocket 包装，需剥出 _sock）
+        raw_sock = getattr(sock_obj, "_sock", sock_obj)
+        command_udp.start_command_udp(sendto=raw_sock.sendto)
     except OSError as e:
         logger.error("video UDP bind %s:%d failed: %s", host, port, e)
 
 
 async def stop_udp_listener() -> None:
     global _transport
+    command_udp.stop_command_udp()
     t, _transport = _transport, None
     if t is not None:
         t.close()

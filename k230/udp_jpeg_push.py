@@ -1,8 +1,10 @@
-# 立创·庐山派-K230 图传 + 手柄命令桥（单脚本双任务）
+# 立创·庐山派-K230 图传 + 手柄命令桥（单脚本单 socket 双任务）
 # 1) UDP+JPEG 图传推流到桌面端 SERVER_UDP_PORT
-# 2) _thread 独立线程收桌面端 UDP 命令推送（CMD_UDP_PORT），纯转发 UART3
+# 2) 同一 socket 反向收 PC 的命令推送（v2 UART 帧），纯转发 UART3
 #    UART3_TXD -> GPIO32, UART3_RXD -> GPIO33
-#    每 0.5s 发注册包 b"CQ"+hz，服务端按 hz（默认 150Hz）推送 UART 帧
+#    PC 发视频包时得知本机 (ip, port)，直接往该地址回控制包——
+#    不被热点 NAT/防火墙拦，无需注册包（原 b"CQ"+hz 协议已废）。
+#    主循环每拍把 socket 缓冲读空只保留最新一帧，apply 后写 UART3。
 #    （不走 TCP：K230 固件 TCP connect 慢且会 socket 泄漏 errno 12）
 #
 # UART 命令帧 v2（二进制变长，总长<=32 字节）：
@@ -11,7 +13,7 @@
 #   [末字节]=crc8（从[0]到 payload 末所有字节异或）
 #   0x01 MOVE，len=2：payload = speed i8, turn i8（左摇杆 前+/后-，左-/右+）
 #   0x02 TURRET，len=2：payload = yaw i8, pitch i8（右摇杆 左-/右+，下-/上+）
-# 无激活命令时服务端整周期不发送任何字节；K230 只做纯转发，
+# 无激活命令时 PC 整周期不发送任何字节；K230 只做纯转发，
 # 无动作时串口零输出（失联也不补零速帧，仅翻 ok=False 状态）。
 import gc
 import socket
@@ -28,19 +30,15 @@ WIFI_SSID = "TF-Laptop"
 WIFI_PASSWORD = "TF@HTR.Hello"
 SERVER_IP = None
 SERVER_UDP_PORT = 8001
-CMD_UDP_PORT = 8002
-CMD_POLL_HZ = 150
-CMD_REG_INTERVAL_MS = 500
-CMD_RX_TIMEOUT_MS = 100
 CMD_STALE_MS = 200
 UART3_BAUD = 115200
 SENSOR_ID = 2
-WIDTH = 640
-HEIGHT = 480
+WIDTH = 1280
+HEIGHT = 720
 JPEG_QUALITY = 65
-FPS = 12
+FPS = 30
 CHUNK_SIZE = 1100
-CHUNK_GAP_MS = 2
+CHUNK_GAP_MS = 0
 GC_COLLECT_EVERY = 100
 # ================================================
 
@@ -206,89 +204,61 @@ def _ticks_ms():
 def _ticks_diff(a, b):
     return time.ticks_diff(a, b) if hasattr(time, "ticks_diff") else a - b
 
-class CommandPoller:
-    def __init__(self, server_ip, hz):
-        self.server_ip = server_ip
-        self.addr = (server_ip, CMD_UDP_PORT)
-        self.hz = hz
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.settimeout(CMD_RX_TIMEOUT_MS / 1000.0)
+class CommandLink:
+    """反向控制链路：把视频 socket 的缓冲读空，只保留最新合法 UART 帧。
+
+    PC 复用视频路径回推控制包，包到达本视频 socket；主循环每拍调用
+    pump()，非阻塞排空只取最新一帧原样写 UART3。失联只翻状态不补帧。
+    """
+
+    def __init__(self, uart):
+        self.uart = uart
         self.ok = False
         self.rx = 0
-        self._last_reg = 0
         self._last_rx = 0
 
-    def _register(self):
-        try:
-            self.sock.sendto(bytes([0x43, 0x51, self.hz & 0xFF]), self.addr)
-        except Exception:
-            pass
-
-    def poll_once(self):
+    def pump(self, sock):
         now = _ticks_ms()
-        if _ticks_diff(now, self._last_reg) >= CMD_REG_INTERVAL_MS:
-            self._register()
-            self._last_reg = now
+        latest = None
         try:
-            data = self.sock.recv(64)
-        except Exception:
-            data = None
-        if valid_frame(data):
+            sock.settimeout(0)
+            while True:                 # 把缓冲区读空，只保留最新
+                data = sock.recv(64)
+                if not data:
+                    break
+                if valid_frame(data):
+                    latest = data
+        except OSError:
+            pass
+        if latest is not None:
             try:
-                result = _uart.write(data)
+                result = self.uart.write(latest)
                 if result is False:
                     print("[CMD] UART write returned False")
                     self.ok = False
-                    return False
+                    return
             except Exception as e:
                 print("[CMD] UART write error: %s" % str(e))
                 self.ok = False
-                return False
+                return
             self.rx += 1
             self._last_rx = now
             if not self.ok:
                 print("[CMD] server streaming")
                 self.ok = True
-            return True
-        if _ticks_diff(now, self._last_rx) > CMD_STALE_MS:
+        elif _ticks_diff(now, self._last_rx) > CMD_STALE_MS and self._last_rx:
             if self.ok:
                 print("[CMD] feed lost")
                 self.ok = False
-        return False
 
-    def run(self):
-        last_stat = time.time()
-        while True:
-            try:
-                self.poll_once()
-            except Exception as e:
-                print("[CMD] poll exception: %s" % str(e))
-                self.ok = False
-                time.sleep_ms(20)
-            now = time.time()
-            if now - last_stat >= 5:
-                print("[CMD] rate=%dHz ok=%s" % (self.rx // 5, self.ok))
-                self.rx = 0
-                last_stat = now
-                gc.collect()
-
-def start_cmd_thread(server_ip):
-    init_uart3()
-    poller = CommandPoller(server_ip, CMD_POLL_HZ)
-    try:
-        import _thread
-        _thread.start_new_thread(poller.run, ())
-        print("[CMD] thread started, expect %dHz push" % CMD_POLL_HZ)
-        return poller, True
-    except Exception as e:
-        print("[CMD] _thread unavailable (%s), fallback to interleaved polling (rate will be lower)" % str(e))
-        return poller, False
+    def stats_line(self):
+        return "[CMD] rx=%d ok=%s" % (self.rx, self.ok)
 
 def send_frame(s, server_ip, frame_id, jpeg):
     total = (len(jpeg) + CHUNK_SIZE - 1) // CHUNK_SIZE
     if total < 1:
         return 0
-    if total > 256:
+    if total > 512:
         print("frame too big (%dB/%d chunks), drop" % (len(jpeg), total))
         return 0
     mv = memoryview(jpeg)
@@ -321,8 +291,9 @@ def main():
     print("[3/3] pushing udp+jpeg to %s:%d q=%d fps=%d" % (
         server_ip, SERVER_UDP_PORT, JPEG_QUALITY, FPS
     ))
-    poller, use_thread = start_cmd_thread(server_ip)
-    globals()["poller"] = poller
+    uart = init_uart3()
+    link = CommandLink(uart)
+    globals()["link"] = link
     sta = get_sta()
     s = make_sock()
     frame_id = 0
@@ -344,6 +315,8 @@ def main():
         if not ensure_wifi(sta):
             time.sleep(2)
             continue
+
+        link.pump(s)
 
         jpeg = None
         try:
@@ -394,8 +367,8 @@ def main():
                 free = gc.mem_free()
             except Exception:
                 free = -1
-            print("stat: sent=%d dropped=%d last=%dB free=%d" % (
-                sent_frames, dropped, last_len, free
+            print("stat: sent=%d dropped=%d last=%dB free=%d (%s)" % (
+                sent_frames, dropped, last_len, free, link.stats_line()
             ))
             t_stat = now
 
@@ -404,15 +377,7 @@ def main():
                 spent = time.ticks_diff(time.ticks_ms(), t0)
                 rest = interval_ms - spent
                 if rest > 0:
-                    if use_thread:
-                        time.sleep_ms(rest)
-                    else:
-                        step = 4
-                        while rest > 0:
-                            poller.poll_once()
-                            d = step if rest >= step else rest
-                            time.sleep_ms(d)
-                            rest -= d
+                    time.sleep_ms(rest)
             except Exception as e:
                 print("pacing error: %s" % str(e))
                 time.sleep_ms(interval_ms)
@@ -436,11 +401,8 @@ finally:
     except Exception:
         pass
     try:
-        if poller is not None:
-            try:
-                poller.sock.close()
-            except Exception:
-                pass
+        if _uart is not None:
+            _uart.deinit()
     except Exception:
         pass
     try:

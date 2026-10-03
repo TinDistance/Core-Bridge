@@ -121,6 +121,10 @@ PACER_BURST_BYTES = int(_PACER_BYTES_PER_S * 2 * FRAME_INTERVAL_MS / 1000.0)
 # 就因参考链语义而失效，且下一个 IDR 最多 500ms 后到。
 PACER_SPAN_MAX_MS = 200
 
+# IDR 请求合并/限频（详见 IdrGate 的注释）
+IDR_REQ_MIN_INTERVAL_MS = 800      # 两次"生效的"强制 IDR 请求的最小间隔
+IDR_REQ_SETTLE_MS = 500            # 最近真的发过 IDR 后的静默窗口
+
 # VENC 输出缓冲深度推导：节流器最长阻塞 PACER_SPAN_MAX_MS，期间编码器
 # 会产出 ceil(200/33)=7 帧；再加 2 帧余量 => 9，取整到 10。
 # **不要再往上加**：outbuf 越大，积压的过期 P 帧越多、延迟越高，
@@ -426,6 +430,66 @@ class Pacer:
 
 
 
+
+class IdrGate:
+    """IDR 请求合并/限频。
+
+    为什么必须限：编码器健康时 GOP=15@30fps 自然每 500ms 就出一个 IDR，
+    此时接收端的任何 IDR 请求都是多余的。而每强制一次 RequestIDR() 就多
+    一个 ~100KB 的 I 帧：旧实现限频 100ms => 最多 10 次/秒 => 1MB/s
+    = 8.4Mbps 的额外需求，单这一项就能灌爆 5Mbps 链路，并把队列撑到
+    秒级 —— 这正是"一落后就疯狂请求、越请求越延迟"的正反馈。
+
+    两道独立的闸门（都是纯合并，不丢"最后一次"的状态）：
+      * settle_ms : 最近真的发过 IDR 就合并掉。健康编码器下这条几乎总是
+        命中 => 强制 IDR 归零。
+      * interval_ms: 距上一次生效的强制请求不足就合并掉。这是硬上限，
+        保证强制 IDR 速率 <= 1000/interval_ms 次/秒。
+
+    被合并不等于丢恢复能力：编码器停了 IDR 的场景下，settle 闸门自然不再
+    命中，第一个请求就能生效，不会死锁。
+    """
+
+    def __init__(self, interval_ms, settle_ms):
+        self.interval_ms = interval_ms
+        self.settle_ms = settle_ms
+        self._last_idr_sent = None
+        self._last_grant = None
+        # ---- 诊断计数（只读）----
+        self.rx = 0
+        self.granted = 0
+        self.merged_idr = 0
+        self.merged_rate = 0
+
+    def note_idr_sent(self, now_ms):
+        self._last_idr_sent = now_ms
+
+    def reset_rolling(self):
+        """只清本窗口计数；合并状态（_last_idr_sent/_last_grant）必须保留。
+
+        这两个状态一旦被清掉，限频闸门就会每 10s 重新放行一次风暴。
+        """
+        self.rx = 0
+        self.granted = 0
+        self.merged_idr = 0
+        self.merged_rate = 0
+
+    def request(self, now_ms):
+        """返回 True = 这次请求应该真的调 encoder.RequestIDR()。"""
+        self.rx += 1
+        d_idr = ms_diff(now_ms, self._last_idr_sent)
+        if d_idr is not None and d_idr < self.settle_ms:
+            self.merged_idr += 1
+            return False
+        d_grant = ms_diff(now_ms, self._last_grant)
+        if d_grant is not None and d_grant < self.interval_ms:
+            self.merged_rate += 1
+            return False
+        self._last_grant = now_ms
+        self.granted += 1
+        return True
+
+
 class SendAborted(Exception):
     """send_paced 的 sink 抛这个来中止本帧（发送队列溢出时用）。"""
 
@@ -545,7 +609,7 @@ class CommandLink:
         self.ok = False
         self.rx = 0
         self._last_rx = 0
-        self._last_ctrl = 0
+        self.ctrl_rx = 0
         self._on_ctrl = on_ctrl
 
     def pump(self, sock):
@@ -558,11 +622,14 @@ class CommandLink:
                 if not data:
                     break
                 if len(data) >= 4 and bytes(data[:3]) == b"CBR\x01":
-                    # 桌面丢包/新接入 -> 立刻出新 IDR（限频 100ms）
-                    if _ticks_diff(now, self._last_ctrl) > 100 or self._last_ctrl == 0:
-                        self._last_ctrl = now
-                        if self._on_ctrl:
-                            self._on_ctrl(b"IDR")
+                    # 桌面丢包/新接入 -> 请求新 IDR。
+                    # 这里**不做任何合并**：CommandLink.pump 在一个 tick 里
+                    # 会把 socket 缓冲排空，一次 pump 可能收到几十个
+                    # CBR\x01，限频必须放在 IdrGate（合并语义 + 统计都在
+                    # 那里）。
+                    if self._on_ctrl:
+                        self._on_ctrl(b"IDR")
+                    self.ctrl_rx += 1
                     continue
                 if valid_frame(data):
                     latest = data
@@ -598,6 +665,7 @@ def stream_loop(sock, server_ip, sta):
     stream = StreamData()
     parameter_sets = None
     pacer = Pacer(PACER_WIRE_KBPS, PACER_BURST_BYTES, get_clock(), PACER_SPAN_MAX_MS)
+    gate = IdrGate(IDR_REQ_MIN_INTERVAL_MS, IDR_REQ_SETTLE_MS)
     addr = (server_ip, RTP_PORT)
     ssrc = 0x54494E44  # "TIND"
     seq = 0
@@ -638,10 +706,15 @@ def stream_loop(sock, server_ip, sta):
         cmdline.pump(sock)
 
         if pending_idr[0]:
-            # 出新 IDR：接收端无需等 GOP 到点即可解码
-            encoder.RequestIDR()
             pending_idr[0] = False
-            print("RTP: requested IDR")
+            # IdrGate 合并/限频：健康的编码器每 500ms 自然出一个 IDR，此时
+            # 请求是多余的（每个多余的请求 = 多一个 ~100KB 的 I 帧）。
+            if gate.request(_ticks_ms()):
+                # 出新 IDR：接收端无需等 GOP 到点即可解码
+                encoder.RequestIDR()
+                print("RTP: requested IDR")
+            # 被合并时保持静默：合并次数由 gate.rx/granted 统计上报，这里
+            # print 会在风暴（每秒几十次）时把串口刷爆。
 
         if encoder.GetStream(stream, timeout=20) != 0:
             continue
@@ -715,6 +788,7 @@ def stream_loop(sock, server_ip, sta):
                 continue
             if is_idr:
                 idr_count += 1
+                gate.note_idr_sent(_ticks_ms())
                 last_iframe_pkts = len(packets)
                 last_iframe_ms = air_ms
             else:
@@ -790,7 +864,12 @@ def stream_loop(sock, server_ip, sta):
             bytes_tx = 0
             pkt_err = 0
             max_frame_bytes = 0
+            if cmdline.ctrl_rx:
+                print("      IDR 请求 %d 次 -> 生效 %d 次（合并 %d：近期IDR=%d 限频=%d）" % (
+                    gate.rx, gate.granted, gate.rx - gate.granted,
+                    gate.merged_idr, gate.merged_rate))
             t_stat = now
+            gate.reset_rolling()
 
 
 def cleanup():

@@ -14,7 +14,8 @@ PyAV 解码。与 video.py 的 JPEG 分片重组（8001）完全独立，两链�
   * 控制：桌面 -> server 的 b"CBR\\x01"（请求 IDR）/ b"CBR\\x02"（预留
     码率档）直接转发给 K230；b"CBR\\x00"（PING）回 b"CBR\\x10"（PONG），
     供桌面探测 relay 存活。
-  * 统计按 RTP marker 位聚合帧：GET /video/rtp_status 可读
+  * 统计按 RTP marker 位聚合帧，且只跟上游走（下游是否有人在看不影响记账，
+    否则桌面端刚重启还没握手时 live 会假阴性）：GET /video/rtp_status 可读
     （live/fps/age_ms 与 /video/status 字段兼容，LatencyMonitor 可复用）。
 """
 from __future__ import annotations
@@ -145,6 +146,15 @@ class RtpRelay:
         if upstream_new:
             logger.info("RTP upstream learned: %s:%d", host, port)
         command_udp.note_video_sender(host, port)
+        # 上游统计与"有没有人在看"无关，必须先于下游扇出记账：桌面端刚重启
+        # 还没发第一个 PING、或下游全部超时老化时 targets 为空，旧实现在
+        # 早退里把这些包整个漏掉，于是 K230 明明在推流、status() 却报
+        # live=false / frame_id 卡死，运维会误判成 K230 掉线。
+        if data[1] & 0x80:  # marker：一帧（access unit）结束
+            self._frame_id += 1
+            self._last_frame_at = time.monotonic()
+            self._marker_times.append(self._last_frame_at)
+        self._pkt_times.append(time.monotonic())
         if not targets:
             return
         sent = 0
@@ -156,11 +166,6 @@ class RtpRelay:
                 pass
         if sent:
             self._pkts_tx += sent
-        if data[1] & 0x80:  # marker：一帧（access unit）结束
-            self._frame_id += 1
-            self._last_frame_at = time.monotonic()
-            self._marker_times.append(self._last_frame_at)
-        self._pkt_times.append(time.monotonic())
 
     def _on_control(self, data: bytes, addr: tuple[str, int]) -> None:
         kind = data[3] if len(data) > 3 else CTRL_PING

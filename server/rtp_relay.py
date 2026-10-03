@@ -1,23 +1,4 @@
-"""H264 裸 RTP 中转（方案 A 的 server 段）。
-
-背景：K230 硬编 H264 -> RTP over UDP:8002 -> 本模块纯转发 -> 桌面端
-PyAV 解码。与 video.py 的 JPEG 分片重组（8001）完全独立，两链路并存，
-桌面端可自动降级。
-
-设计要点（对应评审方案 A）：
-  * 纯 recvfrom -> sendto 转发，不解码、不重组、不进 asyncio 事件循环
-    （独立 daemon 线程，对齐 command_udp.py 的线程模式），转发开销 <1ms。
-  * 上游（K230）地址从 RTP 包学习（首字节高两位 == 0b10 即 RTP v2）；
-    下游（桌面）地址从控制包学习（前缀 b"CBR"）。无需信令/注册。
-  * 学到上游地址后调用 command_udp.note_video_sender，让 UART 命令
-    反向推送（走 8001 socket）即使 K230 只跑 RTP 推流也能工作。
-  * 控制：桌面 -> server 的 b"CBR\\x01"（请求 IDR）/ b"CBR\\x02"（预留
-    码率档）直接转发给 K230；b"CBR\\x00"（PING）回 b"CBR\\x10"（PONG），
-    供桌面探测 relay 存活。
-  * 统计按 RTP marker 位聚合帧，且只跟上游走（下游是否有人在看不影响记账，
-    否则桌面端刚重启还没握手时 live 会假阴性）：GET /video/rtp_status 可读
-    （live/fps/staleness_ms 与 /video/status 字段兼容，LatencyMonitor 可复用）。
-"""
+"""H264 裸 RTP 中转（方案 A 的 server 段）。"""
 from __future__ import annotations
 
 import logging
@@ -42,18 +23,7 @@ CTRL_PONG = 0x10
 UPSTREAM_STALE_S = 5.0
 DOWNSTREAM_STALE_S = 10.0
 
-# 内核接收缓冲 = 延迟上限，不是"抗突发"旋钮。
-# 推导：socket 缓冲里排队的字节必须按码率逐个消化，所以它能贡献的最坏
-# 延迟 = 缓冲字节 / 码率。3Mbps（375,000 B/s）下：
-#     4 MiB -> 11.18 s      1 MiB -> 2.80 s      256 KiB -> 0.70 s
-# 也就是说旧配置在链路一旦突发（WiFi 干扰、重传风暴、relay 线程被 GC 卡住）
-# 时，能把"丢一帧"换成"画面停在几秒前的旧帧"——而此时 /video/timing 的
-# staleness_ms 依然读 33ms，运维完全看不出来。这就是现场 4~10s 延迟上限
-# 的主要来源：不是空中段飞得慢，是包早就到了，排在 socket 缓冲里没被读走。
-# 256 KiB 仍能吃下 3Mbps 下约 85 个 1200B 包（~2.8 帧）的突发，代价远小于
-# 它省下的 10 秒。
 SO_RCVBUF_BYTES = 256 << 10
-# 仅用于文档/日志：SO_RCVBUF 收紧后延迟上界的推导基准码率（bps）
 RATE_ASSUMED_BPS = 3_000_000
 
 
@@ -67,9 +37,6 @@ class RtpRelay:
         self._lock = threading.Lock()
         self._upstream: tuple[str, int] | None = None
         self._upstream_at = 0.0
-        # 下游可以有多个（GUI + 探针 + 第二个监视器）。旧实现只存一个
-        # _downstream，后到的控制包会覆盖前面的，于是先到的客户端突然
-        # 收不到画面 —— 表现为"随机黑屏"，极难查。
         self._downstreams: dict[tuple[str, int], float] = {}
         self._downstream_at = 0.0
 
@@ -79,19 +46,21 @@ class RtpRelay:
         self._ctrl_rx = 0
         self._frame_id = -1
         self._last_frame_at = 0.0
-        # 滑动 2s 窗口统计 fps/pps：停流后 status() 读数平滑归零
         self._marker_times: deque[float] = deque(maxlen=240)
         self._pkt_times: deque[float] = deque(maxlen=1200)
-        # 吞吐率：K230->PC 实际占用多少带宽。这是验证"5Mbps 够不够"的唯一
-        # 直接证据，之前链路上没有任何地方能读到 kbps。
         self._bytes_at: deque[tuple[float, int]] = deque(maxlen=20000)
 
-    # ---------- 生命周期 ----------
     def start(self) -> bool:
-        if self._thread is not None:
+        if self._thread is not None and self._thread.is_alive():
             return True
+        # 旧线程已死但对象残留：先清理再重建，支持重启
+        self._thread = None
         try:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            except OSError:
+                pass
             try:
                 self._sock.setsockopt(
                     socket.SOL_SOCKET, socket.SO_RCVBUF, SO_RCVBUF_BYTES)
@@ -114,14 +83,26 @@ class RtpRelay:
 
     def stop(self) -> None:
         self._stop.set()
+        # 自唤醒：阻塞在 recvfrom 的线程在 Windows 上也能及时退出
+        try:
+            if self._sock is not None:
+                self._sock.sendto(b"", ("127.0.0.1", self._port))
+        except Exception:
+            pass
         if self._thread is not None:
             self._thread.join(timeout=2.0)
         self._thread = None
         if self._sock is not None:
-            self._sock.close()
+            try:
+                self._sock.close()
+            except Exception:
+                pass
             self._sock = None
+        with self._lock:
+            self._upstream = None
+            self._upstream_at = 0.0
+            self._downstreams.clear()
 
-    # ---------- 转发主循环 ----------
     def _loop(self) -> None:
         assert self._sock is not None
         while not self._stop.is_set():
@@ -129,19 +110,32 @@ class RtpRelay:
                 data, addr = self._sock.recvfrom(2048)
             except socket.timeout:
                 continue
-            except OSError:
+            except OSError as e:
+                if not self._stop.is_set():
+                    logger.warning("RTP relay loop stopped: %s", e)
                 break
-            self._pkts_rx += 1
-            self._bytes_rx += len(data)
-            self._bytes_at.append((time.monotonic(), len(data)))
-            if not data:
+            try:
+                if len(data) < 4:
+                    continue
+                with self._lock:
+                    self._pkts_rx += 1
+                # 计数器在锁内更新，字节窗追加同样加锁（见 _on_rtp/status）
+                with self._lock:
+                    self._bytes_rx += len(data)
+                    self._bytes_at.append((time.monotonic(), len(data)))
+                if not data:
+                    continue
+                if data[:3] == CONTROL_MAGIC:
+                    self._on_control(data, addr)
+                elif len(data) >= 12 and (data[0] & 0xC0) == 0x80:
+                    self._on_rtp(data, addr)
+            except Exception as e:
+                logger.warning("RTP packet handling failed: %s", e)
                 continue
-            if data[:3] == CONTROL_MAGIC:
-                self._on_control(data, addr)
-            elif (data[0] & 0xC0) == 0x80:
-                self._on_rtp(data, addr)
 
     def _on_rtp(self, data: bytes, addr: tuple[str, int]) -> None:
+        if len(data) < 12:
+            return
         host, port = addr
         upstream_new = False
         now = time.monotonic()
@@ -150,74 +144,94 @@ class RtpRelay:
                 self._upstream = (host, port)
                 upstream_new = True
             self._upstream_at = now
-            # 清理超时下游，再取一份快照在锁外发送
             for a in [a for a, t in self._downstreams.items()
                       if now - t > DOWNSTREAM_STALE_S]:
                 del self._downstreams[a]
             targets = list(self._downstreams)
-        # 上游地址（含变化）喂给命令通道：UART 推送走 8001 socket 反向直达
         if upstream_new:
             logger.info("RTP upstream learned: %s:%d", host, port)
-        command_udp.note_video_sender(host, port)
-        # 上游统计与"有没有人在看"无关，必须先于下游扇出记账：桌面端刚重启
-        # 还没发第一个 PING、或下游全部超时老化时 targets 为空，旧实现在
-        # 早退里把这些包整个漏掉，于是 K230 明明在推流、status() 却报
-        # live=false / frame_id 卡死，运维会误判成 K230 掉线。
-        if data[1] & 0x80:  # marker：一帧（access unit）结束
-            self._frame_id += 1
-            self._last_frame_at = time.monotonic()
-            self._marker_times.append(self._last_frame_at)
-        self._pkt_times.append(time.monotonic())
+        try:
+            command_udp.note_video_sender(host, port)
+        except Exception:
+            pass
+        marker = bool(data[1] & 0x80)
+        with self._lock:
+            if marker:
+                self._frame_id += 1
+                self._last_frame_at = time.monotonic()
+                self._marker_times.append(self._last_frame_at)
+            self._pkt_times.append(time.monotonic())
         if not targets:
             return
         sent = 0
+        sock = self._sock
+        if sock is None:
+            return
         for target in targets:
             try:
-                self._sock.sendto(data, target)
+                sock.sendto(data, target)
                 sent += 1
             except OSError:
                 pass
         if sent:
-            self._pkts_tx += sent
+            with self._lock:
+                self._pkts_tx += sent
 
     def _on_control(self, data: bytes, addr: tuple[str, int]) -> None:
         kind = data[3] if len(data) > 3 else CTRL_PING
         now = time.monotonic()
         with self._lock:
             self._downstreams[addr] = now
+            # 顺手 GC：上游停流后 downstream 不再永久 stale
+            for a in [a for a, t in self._downstreams.items()
+                      if now - t > DOWNSTREAM_STALE_S]:
+                if a != addr:
+                    del self._downstreams[a]
             self._downstream_at = now
             upstream = self._upstream
             upstream_stale = (
                 self._upstream is None
                 or now - self._upstream_at > UPSTREAM_STALE_S)
-        self._ctrl_rx += 1
+            self._ctrl_rx += 1
+        sock = self._sock
+        if sock is None:
+            return
         if kind == CTRL_PING:
             try:
-                self._sock.sendto(CONTROL_MAGIC + bytes([CTRL_PONG]), addr)
+                sock.sendto(CONTROL_MAGIC + bytes([CTRL_PONG]), addr)
             except OSError:
                 pass
         elif kind in (CTRL_IDR, CTRL_BITRATE):
             if upstream is not None and not upstream_stale:
                 try:
-                    self._sock.sendto(data, upstream)
+                    sock.sendto(data, upstream)
                 except OSError:
                     pass
 
-    # ---------- 状态 ----------
     def status(self) -> dict:
         now = time.monotonic()
-        fps = len([t for t in self._marker_times if now - t <= 2.0]) / 2.0
-        pps = len([t for t in self._pkt_times if now - t <= 2.0]) / 2.0
-        # 5s 滑动窗口吞吐率（应用层字节数，不含 UDP/IP 头）
-        while self._bytes_at and now - self._bytes_at[0][0] > 5.0:
-            self._bytes_at.popleft()
-        win_bytes = sum(b for _t, b in self._bytes_at)
+        with self._lock:
+            marker_times = list(self._marker_times)
+            pkt_times = list(self._pkt_times)
+            while self._bytes_at and now - self._bytes_at[0][0] > 5.0:
+                self._bytes_at.popleft()
+            bytes_at = list(self._bytes_at)
+            pkts_rx, pkts_tx, bytes_rx, ctrl_rx = (
+                self._pkts_rx, self._pkts_tx, self._bytes_rx, self._ctrl_rx)
+            frame_id, last_frame_at = self._frame_id, self._last_frame_at
+            # status 里也 GC downstream，避免上游停流后计数永久 stale
+            for a in [a for a, t in self._downstreams.items()
+                      if now - t > DOWNSTREAM_STALE_S]:
+                del self._downstreams[a]
+        fps = len([t for t in marker_times if now - t <= 2.0]) / 2.0
+        pps = len([t for t in pkt_times if now - t <= 2.0]) / 2.0
+        win_bytes = sum(b for _t, b in bytes_at)
         win_span = 5.0
-        if self._bytes_at:
-            span = max(1e-3, now - self._bytes_at[0][0])
+        if bytes_at:
+            span = max(1e-3, now - bytes_at[0][0])
             if span < win_span:
                 win_span = span
-        kbps = win_bytes * 8 / win_span / 1000.0 if self._bytes_at else 0.0
+        kbps = win_bytes * 8 / win_span / 1000.0 if bytes_at else 0.0
         with self._lock:
             upstream = self._upstream
             upstream_age = (now - self._upstream_at) if self._upstream else -1
@@ -225,36 +239,25 @@ class RtpRelay:
         live = (
             upstream is not None
             and upstream_age <= UPSTREAM_STALE_S
-            and now - self._last_frame_at <= UPSTREAM_STALE_S
+            and last_frame_at and now - last_frame_at <= UPSTREAM_STALE_S
         )
         return {
             "mode": "h264",
             "live": live,
             "fps": round(fps, 2),
             "pps": round(pps, 1),
-            "frame_id": self._frame_id,
-            # 注意：这是"最后一帧到 server 有多久"的**陈旧度**，不是延迟。
-            # _last_frame_at 是 marker 包刚进 socket 的时刻，跟 K230 采集时刻、
-            # WiFi 发送队列积压、桌面拉取时刻都无关：链路一直有流时它恒定在
-            # 一个帧间隔内（30fps≈33ms），真实延迟 4s 的链路照样读 33ms。
-            # 所以桌面端只把它当停流/抖动旁证展示，绝不加进 e2e。
-            "staleness_ms": round((now - self._last_frame_at) * 1000.0, 1)
-            if self._last_frame_at else -1.0,
+            "frame_id": frame_id,
+            "staleness_ms": round((now - last_frame_at) * 1000.0, 1)
+            if last_frame_at else -1.0,
             "upstream": f"{upstream[0]}:{upstream[1]}" if upstream else None,
             "downstreams": downs,
-            "pkts_rx": self._pkts_rx,
-            "pkts_tx": self._pkts_tx,
-            "bytes_rx": self._bytes_rx,
+            "pkts_rx": pkts_rx,
+            "pkts_tx": pkts_tx,
+            "bytes_rx": bytes_rx,
             "kbps": round(kbps, 1),
-            "ctrl_rx": self._ctrl_rx,
+            "ctrl_rx": ctrl_rx,
             "port": self._port,
-            # 缓冲字节 + kbps 可直接推出延迟上界：rcvbuf_bytes*8/(kbps*1000)
-            # 秒。把它暴露出来，延迟异常时才能一眼区分"空中段慢"还是
-            # "包到了但在 socket 缓冲里排队"。
             "rcvbuf_bytes": SO_RCVBUF_BYTES,
-            # 量纲：bytes*8 -> bit；kbps 的单位是 kbit/s = 1000 bit/s，
-            # 所以 bit/(kbit/s) 已经就是毫秒，不再除 1000。
-            # （此前误多除了一次 1000，349kbps 下把 6007ms 报成 6.0ms。）
             "rcvbuf_max_queue_ms": (
                 round(SO_RCVBUF_BYTES * 8 / kbps, 1)
                 if kbps > 0 else -1.0),

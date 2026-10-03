@@ -1,9 +1,9 @@
 import asyncio
 import logging
+import threading
 from collections import deque
 
 
-# 桌面端高频轮询的接口：access 日志不向 WebSocket 广播，只留控制台。
 _NOISY_ACCESS_PATHS = (
     "/video/status",
     "/video/latest.jpg",
@@ -14,6 +14,8 @@ _NOISY_ACCESS_PATHS = (
     "/command",
 )
 
+SUBSCRIBER_QUEUE_MAX = 500
+
 
 class BroadcastHandler(logging.Handler):
     def __init__(self, hub: "LogHub") -> None:
@@ -22,9 +24,6 @@ class BroadcastHandler(logging.Handler):
         self.hub = hub
 
     def emit(self, record: logging.LogRecord) -> None:
-        # 高频轮询接口的 access 日志只留控制台，不向桌面广播，避免刷屏
-        # （桌面 LatencyMonitor 0.5s 轮询 /video/status，Viewer 30fps 轮询
-        # /video/latest.jpg，全广播会把 LOGS 面板淹没）。
         if record.name == "uvicorn.access":
             try:
                 msg = record.getMessage()
@@ -33,7 +32,10 @@ class BroadcastHandler(logging.Handler):
             for noisy in _NOISY_ACCESS_PATHS:
                 if noisy in msg:
                     return
-        self.hub._publish(self.format(record))
+        try:
+            self.hub.publish(self.format(record))
+        except Exception:
+            pass
 
 
 class LogHub:
@@ -43,33 +45,67 @@ class LogHub:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._history: deque[str] = deque(maxlen=history_size)
         self._subscribers: set[asyncio.Queue] = set()
+        self._lock = threading.Lock()
+        self._attached = False
 
     def attach(self, logger_names: tuple[str, ...] = ("", "uvicorn", "uvicorn.access", "uvicorn.error")) -> None:
+        if self._attached:
+            return
         handler = BroadcastHandler(self)
         for name in logger_names:
             logging.getLogger(name).addHandler(handler)
+        self._attached = True
 
     @property
     def history(self) -> deque[str]:
         return self._history
 
-    def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+    def set_loop(self, loop: asyncio.AbstractEventLoop | None) -> None:
         self._loop = loop
 
     def subscribe(self) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue()
-        self._subscribers.add(q)
+        q: asyncio.Queue = asyncio.Queue(maxsize=SUBSCRIBER_QUEUE_MAX)
+        with self._lock:
+            self._subscribers.add(q)
         return q
 
     def unsubscribe(self, q: asyncio.Queue) -> None:
-        self._subscribers.discard(q)
+        with self._lock:
+            self._subscribers.discard(q)
+
+    def publish(self, line: str) -> None:
+        """公有发布入口（线程安全）。"""
+        self._publish(line)
 
     def _publish(self, line: str) -> None:
-        self._history.append(line)
-        if self._loop is None or self._loop.is_closed():
+        with self._lock:
+            self._history.append(line)
+            subs = list(self._subscribers)
+            loop = self._loop
+        if loop is None:
             return
-        for q in list(self._subscribers):
-            self._loop.call_soon_threadsafe(q.put_nowait, line)
+        try:
+            if loop.is_closed():
+                return
+        except Exception:
+            return
+        for q in subs:
+            try:
+                loop.call_soon_threadsafe(self._enqueue_drop_oldest, q, line)
+            except RuntimeError:
+                pass
+
+    @staticmethod
+    def _enqueue_drop_oldest(q: asyncio.Queue, line: str) -> None:
+        try:
+            if q.full():
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            q.put_nowait(line)
+        except Exception:
+            pass
 
 
 hub = LogHub()

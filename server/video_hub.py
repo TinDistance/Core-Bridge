@@ -168,7 +168,13 @@ class VideoHub:
         n = max(1, min(n, 120))
         return [round(x, 1) for x in list(self._intervals_ms)[-n:]]
 
-    def age_ms(self) -> int:
+    def staleness_ms(self) -> int:
+        """最新帧落 server 距今的毫秒数（无帧 -1）。
+
+        这是**陈旧度**不是延迟：latest_at 在分片重组完成那一刻打戳，只描述
+        server 收包节奏。WiFi 发送队列里压了几秒的数据它一点都看不见，30fps
+        满流时恒在 [0,33]ms。调用方不得把它当作链路延迟上报。
+        """
         if self.latest_jpeg is None:
             return -1
         return int((time.monotonic() - self.latest_at) * 1000)
@@ -178,7 +184,8 @@ class VideoHub:
             "live": self.live,
             "udp_port": udp_port,
             "frame_id": self.latest_frame_id,
-            "age_ms": self.age_ms(),
+            # 陈旧度，不是延迟：见 staleness_ms() 注释。
+            "staleness_ms": self.staleness_ms(),
             "fps": round(self.fps, 2),
             "jitter_ms": self.jitter_ms,
             "jpeg_bytes": len(self.latest_jpeg) if self.latest_jpeg else 0,

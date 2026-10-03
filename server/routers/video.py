@@ -92,15 +92,21 @@ async def rtp_status() -> JSONResponse:
     return JSONResponse(relay_status())
 
 
-@router.get("/latency")
-async def latency(n: int = Query(default=60, ge=5, le=120)) -> JSONResponse:
-    """延迟检测：返回最近帧间隔序列 + 当前抖动/fps，供桌面端画曲线或做二次分析。"""
+@router.get("/timing")
+async def timing(n: int = Query(default=60, ge=5, le=120)) -> JSONResponse:
+    """到达节奏诊断（原 /video/latency，改名因为它不含任何延迟）。
+
+    只给帧间隔序列 / 抖动 / fps / 陈旧度，供桌面端画曲线或做二次分析。
+    这里的 staleness_ms 是"最后一帧到 server 有多久"，不是端到端延迟 ——
+    旧名 /video/latency 会让人以为它能回答"画面滞后多少"，实际上链路压 4s
+    它照样读 33ms。真延迟要等 K230 侧 capture_ts（protocol v2）。
+    """
     st = hub.status(UDP_PORT)
     return JSONResponse(
         {
             "live": st["live"],
             "frame_id": st["frame_id"],
-            "age_ms": st["age_ms"],
+            "staleness_ms": st["staleness_ms"],
             "fps": st["fps"],
             "jitter_ms": st["jitter_ms"],
             "intervals_ms": hub.recent_intervals_ms(n),
@@ -120,7 +126,8 @@ async def latest(since: int | None = Query(default=None)) -> Response:
         media_type="image/jpeg",
         headers={
             "X-Frame-Id": str(hub.latest_frame_id),
-            "X-Frame-Age-Ms": str(hub.age_ms()),
+            # 陈旧度不是延迟，名字必须说清楚，否则客户端会拿它当管线延迟
+            "X-Frame-Staleness-Ms": str(hub.staleness_ms()),
             "Cache-Control": "no-store",
         },
     )

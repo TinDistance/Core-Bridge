@@ -30,7 +30,7 @@ _NUM = re.compile(r"\d+")
 _POLLING_PATHS = (
     "/video/status",
     "/video/latest.jpg",
-    "/video/latency",
+    "/video/timing",
     "/video/mjpeg",
     "/ping",
     "/test",

@@ -7,7 +7,7 @@ from collections import deque
 _NOISY_ACCESS_PATHS = (
     "/video/status",
     "/video/latest.jpg",
-    "/video/latency",
+    "/video/timing",
     "/video/mjpeg",
     "/ping",
     "/test",

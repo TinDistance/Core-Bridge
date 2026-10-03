@@ -16,7 +16,7 @@ PyAV 解码。与 video.py 的 JPEG 分片重组（8001）完全独立，两链�
     供桌面探测 relay 存活。
   * 统计按 RTP marker 位聚合帧，且只跟上游走（下游是否有人在看不影响记账，
     否则桌面端刚重启还没握手时 live 会假阴性）：GET /video/rtp_status 可读
-    （live/fps/age_ms 与 /video/status 字段兼容，LatencyMonitor 可复用）。
+    （live/fps/staleness_ms 与 /video/status 字段兼容，LatencyMonitor 可复用）。
 """
 from __future__ import annotations
 
@@ -220,7 +220,12 @@ class RtpRelay:
             "fps": round(fps, 2),
             "pps": round(pps, 1),
             "frame_id": self._frame_id,
-            "age_ms": round((now - self._last_frame_at) * 1000.0, 1)
+            # 注意：这是"最后一帧到 server 有多久"的**陈旧度**，不是延迟。
+            # _last_frame_at 是 marker 包刚进 socket 的时刻，跟 K230 采集时刻、
+            # WiFi 发送队列积压、桌面拉取时刻都无关：链路一直有流时它恒定在
+            # 一个帧间隔内（30fps≈33ms），真实延迟 4s 的链路照样读 33ms。
+            # 所以桌面端只把它当停流/抖动旁证展示，绝不加进 e2e。
+            "staleness_ms": round((now - self._last_frame_at) * 1000.0, 1)
             if self._last_frame_at else -1.0,
             "upstream": f"{upstream[0]}:{upstream[1]}" if upstream else None,
             "downstreams": downs,

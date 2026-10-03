@@ -1,22 +1,29 @@
-"""延迟检测方案（桌面端探针 + 服务端状态配合）。
+"""到达节奏检测（桌面端探针 + 服务端状态配合）。
 
-链路：K230 --UDP:8001--> server --HTTP--> desktop（server 与 desktop 同一台电脑，
-localhost 环节只有 1~2ms，所以右上曲线的主体是 K230 到 server 的空中延迟）。
+链路：K230 --UDP:8001/8002--> server --HTTP--> desktop（server 与 desktop 同一台电脑）。
 
-三层测量，全部由本 Monitor 在后台线程里每 500ms 采样一次：
-1. link_rtt_ms  本机 -> server 的 HTTP 往返（GET /video/status 计时）。
-   链路断了它会先跳变，是最快的心跳。
-2. frame_age_ms  server 报告的最新帧龄（now - latest_at）。
-   包含 K230 采集 + UDP 重组 + server  hold + 桌面轮询间隔，是空中延迟的主体。
-3. e2e_ms        对操作手真正有意义的数：frame_age_ms + link_rtt_ms。
-   server 与桌面同机时约等于“镜头前动一下，到屏幕上看到要多久”。
+⚠️ 这里的 e2e_ms 目前**不是**端到端延迟，全链路没有任何采集时刻戳。
+   server 上报的 staleness_ms 是"最新帧落到 server 有多久"（now - latest_at），
+   30fps 满流时恒在 [0,33]ms：WiFi 发送队列压 4 秒、UDP 重传堆积，它一概看不见。
+   旧实现把它加进 e2e，于是真实延迟 4000ms 的链路面板显示 ~50ms、状态"正常"，
+   WARN_MS=500 这条告警线在链路有流时**永远不可能触发**（等于死代码）。
+   现在 e2e 只累加两项真实成本：HTTP 往返 RTT + 本机拉帧耗时，都在 localhost
+   量级（1~10ms）。真正的端到端要等 K230 包头带 capture_ts（protocol v2）。
+
+两层采样，LatencyMonitor 后台线程每 500ms 一次：
+1. rtt_ms        本机 -> server 的 HTTP 往返（GET /video/status 计时）。
+                 链路断了它先跳变，是最快的心跳；也是当前 e2e 的主要成分。
+2. staleness_ms  server 报告的到达陈旧度。**不是延迟**，只证明"还在收帧"，
+                 链路有流时小于一个帧间隔，停流才飙升；面板单列一格标"陈旧度"，
+                 不进 e2e。
+3. e2e_ms        max(0, rtt) + max(0, fetch_ms)。不含空中段，见开头 ⚠️。
 
 历史保留 120 点（约 60s），LatencyPanel 直接读它画曲线；
 p50/p95 由 stats() 给出，>500ms 判 warn，断流判 bad。
+500ms 阈值现在实际只对 RTT/拉帧有意义；空中段告警要等 capture_ts 落地。
 
-未来想更准：K230 在 UDP 头里加 8 字节 capture_ts（protocol v2），
-server 回传 capture->server 分段耗时，本文件 report_fetch() 已预留 fetch_ms
-注入位，届时 e2e 可拆成 空中段 / 本地段 两条曲线。
+协议 v2（capture_ts）接入时的落点：本文件 _sample_once() 里 e2e 的算法
+与 HAS_CAPTURE_TS 标志，届时把空中段并入并给面板补第二条曲线。
 """
 from __future__ import annotations
 
@@ -30,13 +37,23 @@ import httpx
 WARN_MS = 500.0
 HISTORY = 120
 
+# 真实端到端延迟的数据源标记。False = K230 侧还没有采集时刻戳，e2e_ms 只能
+# 由 RTT + 本机拉帧两项 localhost 成本构成，**不含 WiFi 空中段**。
+# 后续任务在包头加 capture_ts（protocol v2）后置 True，并在 _sample_once 里
+# 把采集到 server、server 到桌面两段并入 e2e。
+HAS_CAPTURE_TS: bool = False
+
 
 @dataclass
 class LatencySample:
     t: float  # wall clock
     rtt_ms: float  # 本机->server RTT
-    age_ms: float  # server 帧龄（-1 表示无帧）
-    e2e_ms: float  # age + rtt（无帧时 = -1）
+    # server 侧到达陈旧度（now - 最新帧落 server 的时刻），-1 表示无帧。
+    # 是"帧有多新"，**不是延迟**：30fps 满流恒在 [0,33]ms，WiFi 队列压 4s 也
+    # 读不出差别。所以它只当停流/抖动的旁证，不进 e2e。
+    staleness_ms: float
+    # max(0, rtt) + max(0, fetch)；无帧时 -1。当前不含空中段（见模块头 ⚠️）
+    e2e_ms: float
     fps: float
     jitter_ms: float
     frame_id: int
@@ -107,7 +124,7 @@ class LatencyMonitor:
                     LatencySample(
                         t=time.time(),
                         rtt_ms=-1,
-                        age_ms=-1,
+                        staleness_ms=-1,
                         e2e_ms=-1,
                         fps=0,
                         jitter_ms=0,
@@ -133,12 +150,16 @@ class LatencyMonitor:
                 # 会 NameError，整个延迟面板停止更新。
                 src = "无信号"
         self.last_error = ""
-        age = float(data.get("age_ms", -1))
+        staleness = float(data.get("staleness_ms", -1))
         live = bool(data.get("live", False))
-        if not live or age < 0:
+        if not live or staleness < 0:
             e2e = -1.0
         else:
-            e2e = age + max(0.0, rtt)
+            # 只累加两项真实成本：HTTP 往返 + 本机拉帧耗时。
+            # staleness 绝不能加进来 —— 它是 server 收包节奏，WiFi 空中段的
+            # 积压它看不见，加进去等于把 4s 延迟粉饰成 ~50ms"正常"。
+            # HAS_CAPTURE_TS 翻转之前，这里就是全部能诚实测到的量。
+            e2e = max(0.0, rtt)
             if self._fetch_ms is not None:
                 e2e += max(0.0, self._fetch_ms)
         with self._lock:
@@ -146,7 +167,7 @@ class LatencyMonitor:
                 LatencySample(
                     t=time.time(),
                     rtt_ms=round(rtt, 1),
-                    age_ms=age,
+                    staleness_ms=staleness,
                     e2e_ms=round(e2e, 1) if e2e >= 0 else -1,
                     fps=float(data.get("fps", 0) or 0),
                     jitter_ms=float(data.get("jitter_ms", 0) or 0),
@@ -170,8 +191,11 @@ class LatencyMonitor:
         cur = self.current()
         return {
             "current_ms": cur.e2e_ms if cur else -1,
+            # 与 current_ms 同值，给不想猜语义的地方一个明确名字
+            "e2e_ms": cur.e2e_ms if cur else -1,
             "rtt_ms": cur.rtt_ms if cur else -1,
-            "age_ms": cur.age_ms if cur else -1,
+            # 陈旧度：到达节奏，不是延迟；面板单独一格，不进 e2e
+            "staleness_ms": cur.staleness_ms if cur else -1,
             "fps": cur.fps if cur else 0,
             "jitter_ms": cur.jitter_ms if cur else 0,
             "frame_id": cur.frame_id if cur else -1,

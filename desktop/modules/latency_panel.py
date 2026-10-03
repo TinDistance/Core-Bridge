@@ -58,14 +58,14 @@ class LatencyPanel(BasePanel):
         self._canvas.pack(fill=tk.X, padx=theme.PAD, pady=4)
         self._canvas.bind("<Configure>", lambda _e: self._draw())
 
-        # 小格：RTT / FPS / 帧龄 / 抖动
+        # 小格：RTT / FPS / 陈旧度 / 抖动
         grid = tk.Frame(self, bg=theme.PANEL)
         grid.pack(fill=tk.X, padx=theme.PAD, pady=(0, theme.PAD))
         for i in range(4):
             grid.columnconfigure(i, weight=1)
         self._cells: dict[str, tk.StringVar] = {}
         for i, (key, label) in enumerate(
-            [("rtt", "RTT"), ("fps", "FPS"), ("age", "帧龄"), ("jit", "抖动")]
+            [("rtt", "RTT"), ("fps", "FPS"), ("staleness", "陈旧度"), ("jit", "抖动")]
         ):
             cell = tk.Frame(grid, bg=theme.PANEL)
             cell.grid(row=0, column=i, sticky="w")
@@ -113,8 +113,8 @@ class LatencyPanel(BasePanel):
         rtt = st["rtt_ms"]
         self._cells["rtt"].set(f"{rtt:.0f}ms" if rtt >= 0 else "—")
         self._cells["fps"].set(f"{st['fps']:.1f}" if live else "—")
-        age = st["age_ms"]
-        self._cells["age"].set(f"{age:.0f}ms" if age >= 0 else "—")
+        staleness = st["staleness_ms"]
+        self._cells["staleness"].set(f"{staleness:.0f}ms" if staleness >= 0 else "—")
         self._cells["jit"].set(f"{st['jitter_ms']:.0f}ms" if live else "—")
 
     # ---------- 曲线 ----------

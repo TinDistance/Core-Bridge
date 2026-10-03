@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from server import command_udp
 from server.rtp_relay import relay_status
+from server.rtp_relay import SO_RCVBUF_BYTES
 from server.video_hub import hub
 
 logger = logging.getLogger("video_udp")
@@ -26,6 +27,12 @@ router = APIRouter(prefix="/video", tags=["video"])
 
 UDP_PORT = int(os.environ.get("CORE_BRIDGE_VIDEO_UDP_PORT", "8001"))
 UDP_HOST = os.environ.get("CORE_BRIDGE_VIDEO_UDP_HOST", "0.0.0.0")
+
+# 内核接收缓冲就是这条链路的延迟上界：上界 = 缓冲字节 / 码率。
+# 3Mbps（375,000 B/s）下旧值 1 MiB -> 2.80 s，256 KiB -> 0.70 s。
+# 缓冲越大，"丢一帧"越容易变成"停在几秒前的旧画面"，而到达陈旧度依然
+# 读 33ms，看板上完全看不出来。与 RTP 链路用同一个常量，两条链路的
+# 延迟上界才可比。
 
 _transport: asyncio.DatagramTransport | None = None
 
@@ -54,12 +61,14 @@ async def start_udp_listener(host: str = UDP_HOST, port: int = UDP_PORT) -> None
             _VideoProtocol,
             local_addr=(host, port),
         )
-        # 加大内核收包缓冲，WiFi 突发下减少丢包
+        # 内核收包缓冲刻意压到 256KiB：缓冲越大越能把丢包换成排队延迟，
+        # 上界 = 字节 / 码率（见 SO_RCVBUF_BYTES 注释）。
         sock_obj = None
         try:
             sock_obj = transport.get_extra_info("socket")
             if isinstance(sock_obj, socket.socket):
-                sock_obj.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+                sock_obj.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_RCVBUF, SO_RCVBUF_BYTES)
         except Exception:
             pass
         _transport = transport

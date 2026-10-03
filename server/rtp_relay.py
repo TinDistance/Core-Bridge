@@ -42,6 +42,20 @@ CTRL_PONG = 0x10
 UPSTREAM_STALE_S = 5.0
 DOWNSTREAM_STALE_S = 10.0
 
+# 内核接收缓冲 = 延迟上限，不是"抗突发"旋钮。
+# 推导：socket 缓冲里排队的字节必须按码率逐个消化，所以它能贡献的最坏
+# 延迟 = 缓冲字节 / 码率。3Mbps（375,000 B/s）下：
+#     4 MiB -> 11.18 s      1 MiB -> 2.80 s      256 KiB -> 0.70 s
+# 也就是说旧配置在链路一旦突发（WiFi 干扰、重传风暴、relay 线程被 GC 卡住）
+# 时，能把"丢一帧"换成"画面停在几秒前的旧帧"——而此时 /video/timing 的
+# staleness_ms 依然读 33ms，运维完全看不出来。这就是现场 4~10s 延迟上限
+# 的主要来源：不是空中段飞得慢，是包早就到了，排在 socket 缓冲里没被读走。
+# 256 KiB 仍能吃下 3Mbps 下约 85 个 1200B 包（~2.8 帧）的突发，代价远小于
+# 它省下的 10 秒。
+SO_RCVBUF_BYTES = 256 << 10
+# 仅用于文档/日志：SO_RCVBUF 收紧后延迟上界的推导基准码率（bps）
+RATE_ASSUMED_BPS = 3_000_000
+
 
 class RtpRelay:
     def __init__(self, port: int = RTP_PORT) -> None:
@@ -79,9 +93,8 @@ class RtpRelay:
         try:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
-                # 3Mbps@30fps ≈ 313pps，缓冲抗几秒突发
                 self._sock.setsockopt(
-                    socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+                    socket.SOL_SOCKET, socket.SO_RCVBUF, SO_RCVBUF_BYTES)
             except OSError:
                 pass
             self._sock.bind(("0.0.0.0", self._port))
@@ -235,6 +248,13 @@ class RtpRelay:
             "kbps": round(kbps, 1),
             "ctrl_rx": self._ctrl_rx,
             "port": self._port,
+            # 缓冲字节 + kbps 可直接推出延迟上界：rcvbuf_bytes*8/(kbps*1000)
+            # 秒。把它暴露出来，延迟异常时才能一眼区分"空中段慢"还是
+            # "包到了但在 socket 缓冲里排队"。
+            "rcvbuf_bytes": SO_RCVBUF_BYTES,
+            "rcvbuf_max_queue_ms": (
+                round(SO_RCVBUF_BYTES * 8 / kbps / 1000.0, 1)
+                if kbps > 0 else -1.0),
             "server_time": round(time.time(), 3),
         }
 

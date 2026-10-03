@@ -76,20 +76,6 @@ _PKTS_AVG = BIT_RATE * 1000 // FPS // 8 // MAX_PAYLOAD + 1   # 平均帧包数
 IFRAME_PEAK_RATIO = 16
 IFRAME_PKTS_MAX = _PKTS_AVG * IFRAME_PEAK_RATIO + 8
 
-# 令牌桶定容（关键，见 stream_loop 的注释）：
-#   PACER_BURST 必须 >= 一个 I 帧的包数。否则预检 pacer.has() 会把 I 帧
-#   整帧丢掉，而 I 帧是丢包后唯一的画面恢复手段 —— 结果是桌面端永远卡在
-#   wait_idr，一帧都出不来。
-#
-#   PACER_PPS 的作用不是"限平均码率"（那是 BIT_RATE 的事），而是把 I 帧
-#   突发摊开到一帧多以内。定成平均包率(330)会掏空令牌桶：实测 3Mbps 下
-#   GOP=15 需要约 557pps，而 330pps 发一个 44 包 I 帧要 133ms(4 个帧间隔)，
-#   期间 has() 预检把 37% 的 P 帧全丢了。这里取 I 帧峰值在 ~2 个帧间隔
-#   内发完，既摊开了突发，又永远饿不死 P 帧。
-#   实测平均帧 ~13 包、I 帧 44~98 包、目标 ~322pps。
-PACER_PPS = IFRAME_PKTS_MAX * FPS // 2
-PACER_BURST = IFRAME_PKTS_MAX
-
 # 链路余量守卫：5Mbps 是实测值，估一帧在空中要占多久，超了就整帧丢弃。
 # 只对 P 帧生效 —— I 帧是恢复手段，宁可超发也不能丢。
 # 链路跟不上时继续往 AP 队列里灌包，只会让缓冲溢出、延迟累积，反而更糟。
@@ -98,6 +84,48 @@ WIRE_OVERHEAD_PER_PKT = 12 + 8 + 20               # RTP头+UDP头+IP头
 FRAME_INTERVAL_MS = 1000 // FPS
 FRAME_PERIOD_MS = 1000 // FPS     # 软件帧率闸门周期
 MAX_PFRAME_DUTY = 0.8      # P 帧 airtime 占帧间隔的上限
+
+# ---- airtime 节流器（pacer）------------------------------------------
+# 背景（数字全部可复算，见文件末尾注释）：
+#   旧实现是"按包数"的令牌桶：PACER_PPS = IFRAME_PKTS_MAX * FPS // 2
+#   = 184*30//2 = 2760 pps，桶容量 PACER_BURST = 184 个 token。
+#   **它从来没有限过速。** 推导：
+#     * 令牌补充速率 2760 pps，而需求 = 平均帧包数 / 帧间隔
+#       ≈ 13 / 0.0333 = 390 pps。补充 >> 消耗，桶被容量 184 顶死在满格。
+#     * 仿真（13 包 P 帧 / GOP15 / 98 包 I 帧，300 帧）实测 5600 个包里
+#       等待次数 = 0，令牌最低只跌到 87/184。
+#     * I 帧路径连 pacer.has() 预检都跳过，take(1) 又因为桶是满的而不睡
+#       => 整帧在几微秒内灌进 AP 队列。
+#   所以旧的 PACER_PPS=2760 只是一个"永远不会被触碰的数字"，注释里
+#   "≈60 次/秒"的说法与代码也不符（2760 是 pps，不是每 2760 包等一次）。
+#   真正限制平均码率的是 VENC 的 CBR + 下面的软件帧率闸门，不是 pacer。
+#
+# 新实现：按**字节**的 airtime 令牌桶，所有包（含关键帧）都必须 take()。
+#   * 目标线速 = LINK_KBPS * PACER_DUTY，留 15% 给 WiFi 重传/ACK 开销。
+#   * 每包消耗 = payload + 每包 40B 线速开销，即它真实占用链路的时间。
+#   * => 相邻包最小间隔 = 1240*8 / 4.25e6 = 2.33ms，即节流上限 428pps。
+#     内容侧只有 3.07Mbps/1240B = 309pps，所以稳态由内容限速（309pps），
+#     pacer 只在 I 帧突发期间介入（瞬时不超过 428pps）。
+#   * 桶容量 = 2 个帧间隔的目标线速字节数（~35KB）：启动时能快速灌满管道，
+#     又不至于一次性放出整个 I 帧。
+PACER_DUTY = 0.85
+PACER_WIRE_KBPS = int(LINK_KBPS * PACER_DUTY)              # 4250 Kbps 上限
+_PACER_BYTES_PER_S = PACER_WIRE_KBPS * 1000 / 8.0          # 531250 B/s
+PACER_BURST_BYTES = int(_PACER_BYTES_PER_S * 2 * FRAME_INTERVAL_MS / 1000.0)
+
+# 单帧节流时长上限。I 帧实测可达 ~100KB（≈81 包 * 2.33ms = 189ms 的 airtime），
+# 上限必须 >= 这个值，否则最该被摊平的 I 帧反而残留突发。
+# 取 200ms = 6 个帧间隔：编���器 outbuf 能在主循环阻塞期间接住新帧；
+# 超预算时不再等待（受控突发）并把 token 打成负数，让紧随其后的 P 帧被
+# can_send() 预检丢掉 —— 用"丢 P 帧"换"不打爆队列"。I 帧之后 P 帧本来
+# 就因参考链语义而失效，且下一个 IDR 最多 500ms 后到。
+PACER_SPAN_MAX_MS = 200
+
+# VENC 输出缓冲深度推导：节流器最长阻塞 PACER_SPAN_MAX_MS，期间编码器
+# 会产出 ceil(200/33)=7 帧；再加 2 帧余量 => 9，取整到 10。
+# **不要再往上加**：outbuf 越大，积压的过期 P 帧越多、延迟越高，
+# 而节流器修好后突发已被摊平，够用即可。要改必须先看真机 pacer cap / txerr。
+OUT_BUFS = max(8, -(-PACER_SPAN_MAX_MS // FRAME_INTERVAL_MS) + 3)
 
 # ================================================
 
@@ -114,12 +142,6 @@ def _ticks_ms():
 
 def _ticks_diff(a, b):
     return time.ticks_diff(a, b) if hasattr(time, "ticks_diff") else a - b
-
-
-def _airtime_ms(frame_bytes, npkts):
-    """估一帧占满链路 airtime 的毫秒数（payload + 每包 40B 头开销）。"""
-    wire = frame_bytes + npkts * WIRE_OVERHEAD_PER_PKT
-    return wire * 8 / LINK_KBPS
 
 
 def init_camera():
@@ -192,7 +214,7 @@ def init_encoder():
     global encoder, link
     width = ALIGN_UP(WIDTH, 16)
     encoder = Encoder()
-    encoder.SetOutBufs(8, width, HEIGHT)
+    encoder.SetOutBufs(OUT_BUFS, width, HEIGHT)
     profile, profile_name = pick_profile(encoder)
     chnAttr = ChnAttrStr(
         encoder.PAYLOAD_TYPE_H264,
@@ -266,33 +288,157 @@ def packetize_nalu(nalu, ts, seq, ssrc, out_packets):
     return seq
 
 
-class Pacer:
-    """令牌桶：PPS 上限，突发超余量的帧整帧丢弃（主循环预检）。"""
+# >>> PURE-PACER-CORE v1 >>>
+# 本段不引用任何 K230 专有 API：时钟/睡眠由外部注入，link_kbps 全部传参。
+# test/test_k230_pacer.py 抽取这两个标记之间的源码 exec 到带假时钟的命名
+# 空间里做纯逻辑仿真；改这里请同步看那个文件。
+PacerWireOverhead = 12 + 8 + 20          # RTP 12 + UDP 8 + IP 20
+TICKS_MS_PERIOD = 1 << 30               # MicroPython ticks_ms 回绕周期
 
-    def __init__(self, rate=PACER_PPS, burst=PACER_BURST):
-        self.rate = rate
-        self.burst = burst
-        self.tokens = float(burst)
-        self.last = time.ticks_us()
+
+def ms_diff(now, then):
+    """time.ticks_ms 差值，回绕安全（then 可以是 None）。"""
+    if then is None:
+        return None
+    d = now - then
+    if d < 0:
+        d += TICKS_MS_PERIOD
+    return d
+
+
+def airtime_ms(frame_bytes, npkts, link_kbps):
+    """估一帧占满链路 airtime 的毫秒数（payload + 每包 40B 头开销）。"""
+    wire = frame_bytes + npkts * PacerWireOverhead
+    return wire * 8.0 / link_kbps
+
+
+class SysClock:
+    """生产环境时钟：rt-smart MicroPython 的 ticks_us/sleep_us。"""
+
+    def now_us(self):
+        if hasattr(time, "ticks_us"):
+            return time.ticks_us()
+        return int(time.time() * 1000000)
+
+    def diff_us(self, a, b):
+        if hasattr(time, "ticks_diff"):
+            return time.ticks_diff(a, b)
+        return a - b
+
+    def sleep_us(self, us):
+        if us <= 0:
+            return
+        if hasattr(time, "sleep_us"):
+            time.sleep_us(int(us))
+        else:
+            time.sleep(us / 1000000.0)
+
+
+class Pacer:
+    """字节级 airtime 令牌桶。**每一个**发出的包（含关键帧）都必须 take()。
+
+    rate_kbps : 目标线速（wire Kbps）。相邻包最小间隔由它决定：
+                (payload + 40B) * 8 / rate_kbps。
+    burst     : 桶容量（wire 字节）= 允许的瞬时突发上限。
+    span_max_ms: 单帧节流时长上限，防止一个大 I 帧把主循环阻塞几百 ms。
+
+    取用逻辑（take）：
+      * 桶里够 -> 立刻放行，零等待。
+      * 不够   -> 分片 sleep 直到够，或直到本帧 span 预算耗尽。
+      * span 耗尽 -> 仍然放行（I 帧不能丢），但把 token 打成负数，
+        于是紧随其后的 P 帧在 can_send() 预检里被丢掉。
+        这就是"I 帧优先但不无节制突发"：优先靠 FIFO + 预检实现，
+        限突发靠"负 token 连带压制后续 P 帧"实现。
+    """
+
+    def __init__(self, rate_kbps, burst_bytes, clock, span_max_ms):
+        self.clock = clock
+        self.rate_bps = rate_kbps * 1000.0
+        self.burst = float(burst_bytes)
+        self.tokens = float(burst_bytes)
+        self.last = clock.now_us()
+        self.span_max_us = int(span_max_ms * 1000)
+        # 初始就等于满预算：忘调 begin_frame() 时最坏只是"没有单帧上限"，
+        # 而不是"完全不节流"。fail-safe 方向必须是这个。
+        self.span_left = self.span_max_us
+        # ---- 诊断计数（只读，不影响行为）----
+        self.packets = 0
+        self.wire_bytes = 0
+        self.wait_us = 0        # 累计节流等待时长
+        self.sleeps = 0         # sleep 次数
+        self.max_wait_us = 0    # 单包最长等待
+        self.cap_events = 0     # span 上限触发次数（>0 说明节流被截断）
+        self.min_gap_us = None  # 相邻包最小间隔
+
+    def wire_bytes_for(self, nbytes):
+        return nbytes + PacerWireOverhead
 
     def refill(self):
-        now = time.ticks_us()
-        self.tokens += time.ticks_diff(now, self.last) * self.rate / 1000000.0
+        now = self.clock.now_us()
+        d_us = self.clock.diff_us(now, self.last)
         self.last = now
-        if self.tokens > self.burst:
-            self.tokens = float(self.burst)
+        if d_us > 0:
+            self.tokens += d_us * (self.rate_bps / 8.0) / 1000000.0
+            if self.tokens > self.burst:
+                self.tokens = self.burst
+        return self.tokens
 
-    def has(self, n):
-        self.refill()
-        return self.tokens >= n
+    def begin_frame(self):
+        """每帧调一次：重置单帧节流时长预算。"""
+        self.span_left = self.span_max_us
 
-    def take(self, n=1):
-        self.refill()
-        while self.tokens < n:
-            wait_us = int((n - self.tokens) / self.rate * 1000000.0) + 100
-            time.sleep_us(wait_us)
+    def can_send(self, frame_bytes, npkts):
+        """非阻塞预检：整帧的线速字节是否拿得到。用于 P 帧的丢弃决策。"""
+        return self.refill() >= frame_bytes + npkts * PacerWireOverhead
+
+    def take(self, nbytes):
+        """为 nbytes payload 阻塞取用线速时间，返回本次等待 us。"""
+        need = self.wire_bytes_for(nbytes)
+        t0 = self.clock.now_us()
+        self.packets += 1
+        self.wire_bytes += need
+        gap = self.clock.diff_us(t0, self.last)
+        if gap > 0 and (self.min_gap_us is None or gap < self.min_gap_us):
+            self.min_gap_us = gap
+        waited = 0
+        while True:
             self.refill()
-        self.tokens -= n
+            if self.tokens >= need:
+                break
+            deficit = need - self.tokens
+            wait_us = int(deficit / (self.rate_bps / 8.0) * 1000000.0) + 50
+            if self.span_left <= 0:
+                # 单帧预算耗尽：受控突发放行，并把 token 打成负数压制后续 P 帧。
+                self.tokens = max(self.tokens - need, -self.burst)
+                self.cap_events += 1
+                return waited
+            if wait_us > self.span_left:
+                wait_us = self.span_left
+            self.clock.sleep_us(wait_us)
+            self.sleeps += 1
+            waited += wait_us
+            self.span_left -= wait_us
+        self.tokens -= need
+        self.wait_us += waited
+        if waited > self.max_wait_us:
+            self.max_wait_us = waited
+        return waited
+
+
+SYS_CLOCK = None
+
+
+def get_clock():
+    global SYS_CLOCK
+    if SYS_CLOCK is None:
+        SYS_CLOCK = SysClock()
+    return SYS_CLOCK
+
+# <<< PURE-PACER-CORE v1 <<<
+
+
+def _airtime_ms(frame_bytes, npkts):
+    return airtime_ms(frame_bytes, npkts, LINK_KBPS)
 
 
 # ==================== UART 命令桥（与 udp_jpeg_push 一致） ====================
@@ -406,7 +552,7 @@ class CommandLink:
 def stream_loop(sock, server_ip, sta):
     stream = StreamData()
     parameter_sets = None
-    pacer = Pacer(PACER_PPS, PACER_BURST)
+    pacer = Pacer(PACER_WIRE_KBPS, PACER_BURST_BYTES, get_clock(), PACER_SPAN_MAX_MS)
     addr = (server_ip, RTP_PORT)
     ssrc = 0x54494E44  # "TIND"
     seq = 0
@@ -497,31 +643,33 @@ def stream_loop(sock, server_ip, sta):
             # marker 打在 access unit 最后一个包上
             packets[-1] = bytearray(packets[-1])
             packets[-1][1] |= 0x80
+
+            air_ms = _airtime_ms(frame_bytes, len(packets))
             last_len = frame_bytes
             if frame_bytes > max_frame_bytes:
                 max_frame_bytes = frame_bytes
 
-            # 整帧预检：令牌不够就整帧丢弃，不发半帧。
-            # 但 I 帧必须无条件放行 —— 它是丢包后唯一的画面恢复手段，
-            # 丢了 I 帧桌面端就只能一直等下一个 IDR。
             if is_idr:
                 last_iframe_pkts = len(packets)
-                last_iframe_ms = _airtime_ms(frame_bytes, len(packets))
+                last_iframe_ms = air_ms
                 idr_count += 1
             else:
-                air_ms = _airtime_ms(frame_bytes, len(packets))
                 last_pframe_ms = air_ms
                 if air_ms > FRAME_INTERVAL_MS * MAX_PFRAME_DUTY:
                     dropped += 1
                     over_duty += 1
                     continue
-                if not pacer.has(len(packets)):
+                if not pacer.can_send(frame_bytes, len(packets)):
                     dropped += 1
                     starved += 1
                     continue
 
+            # 逐包节流：每包按 (payload + 40B) 的真实线速占用取令牌。
+            # begin_frame 重置本帧的节流时长预算，防止一个超大帧把主循环
+            # 阻塞到 outbuf 溢出。
+            pacer.begin_frame()
             for pkt in packets:
-                pacer.take(1)
+                pacer.take(len(pkt))
                 try:
                     sock.sendto(pkt, addr)
                 except TypeError:

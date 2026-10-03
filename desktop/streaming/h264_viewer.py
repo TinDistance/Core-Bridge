@@ -226,7 +226,13 @@ class H264Viewer:
     def _thread_main(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+            # 4MB 太大了。socket 缓冲的作用只是吸收一个解码循环的突发，
+            # 4MB(≈27s@1.2Mbps) 意味着"接收线程彻底停住 27 秒"都看不出来
+            # —— 积压全堆在这，桌面早就没画面了而统计里一切正常。降到
+            # 256KB(≈1.7s) 让缓冲规模回到"一个短突发"的量级：真堵住的话
+            # UDP 会在内核层丢包(计数进 relay 的 loss)，而不是在桌面无声地
+            # 攒成一个几秒的延迟。
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 << 10)
             sock.bind(("0.0.0.0", 0))
             sock.settimeout(0.2)
             self._run_loop(sock)

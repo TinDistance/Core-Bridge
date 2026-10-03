@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from server.logs import hub as log_hub
 from server.routers import command, heartbeat, logs, video, webrtc
 from server.routers.video import start_udp_listener, stop_udp_listener
+from server.rtp_relay import start_relay, stop_relay
 
 
 @asynccontextmanager
@@ -15,9 +16,11 @@ async def lifespan(app: FastAPI):
     await start_udp_listener()
     # 命令由 start_udp_listener 内部在同一视频 socket 上反向推送
     # （server/command_udp.py，目标地址从视频分片学习，无需 K230 注册）
+    start_relay()  # H264 裸 RTP 中转（udp:8002），与 JPEG 链路并存
     try:
         yield
     finally:
+        stop_relay()
         await stop_udp_listener()
 
 

@@ -126,7 +126,7 @@ class DesktopApp(tk.Tk):
         foot = tk.Frame(self, bg=theme.PANEL, highlightthickness=1,
                         highlightbackground=theme.LINE)
         foot.pack(fill=tk.X)
-        self._foot_var = tk.StringVar(value="udp:8001 · 等待 K230 推流…")
+        self._foot_var = tk.StringVar(value="等待 K230 推流…")
         tk.Label(foot, textvariable=self._foot_var, bg=theme.PANEL,
                  fg=theme.MUTE, font=theme.FONT_MONO_SM).pack(
             side=tk.LEFT, padx=12, pady=5)
@@ -144,7 +144,8 @@ class DesktopApp(tk.Tk):
                     self._hdr_pill_var.set("无信号")
                     self._hdr_pill.config(fg=theme.MUTE, bg="#232E42")
                     self._hdr_lat_var.set("— ms")
-                    self._foot_var.set("udp:8001 · 等待 K230 推流…")
+                    src = getattr(st, "get", lambda k, d=None: None)("source") or "udp:8001"
+                    self._foot_var.set(f"{src} · 等待 K230 推流…")
                 else:
                     self._hdr_lat_var.set(f"{int(cur)} ms")
                     if cur >= 500:
@@ -153,11 +154,12 @@ class DesktopApp(tk.Tk):
                     else:
                         self._hdr_pill_var.set("● LIVE")
                         self._hdr_pill.config(fg=theme.OK, bg="#14352B")
+                    src = st.get("source") or "udp:8001"
                     self._foot_var.set(
-                        f"udp:8001 · K230→server · fps {st['fps']:.1f} "
+                        f"{src} · K230→server · fps {st['fps']:.1f} "
                         f"· 帧 #{st['frame_id']} · p95 {int(st['p95_ms'])}ms"
                         if st["p95_ms"] >= 0 else
-                        f"udp:8001 · K230→server · fps {st['fps']:.1f} · 帧 #{st['frame_id']}"
+                        f"{src} · K230→server · fps {st['fps']:.1f} · 帧 #{st['frame_id']}"
                     )
         finally:
             self.after(500, self._tick_chrome)

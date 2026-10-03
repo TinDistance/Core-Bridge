@@ -41,6 +41,7 @@ class LatencySample:
     jitter_ms: float
     frame_id: int
     live: bool
+    source: str = "udp:8001"  # 数据来自哪个链路（JPEG hub / RTP relay）
 
 
 def _percentile(xs: list[float], q: float) -> float:
@@ -115,6 +116,18 @@ class LatencyMonitor:
                     )
                 )
             return
+        # H264 裸 RTP 模式下 JPEG hub 无流，改读 rtp_relay 状态（字段兼容）
+        if not data.get("live"):
+            try:
+                resp = client.get(f"{base}/video/rtp_status")
+                rtp = resp.json()
+                if rtp.get("live"):
+                    data = rtp
+                    src = "rtp:8002"
+            except Exception:
+                pass
+        else:
+            src = "udp:8001"
         self.last_error = ""
         age = float(data.get("age_ms", -1))
         live = bool(data.get("live", False))
@@ -135,6 +148,7 @@ class LatencyMonitor:
                     jitter_ms=float(data.get("jitter_ms", 0) or 0),
                     frame_id=int(data.get("frame_id", -1)),
                     live=live,
+                    source=src,
                 )
             )
 
@@ -158,6 +172,7 @@ class LatencyMonitor:
             "jitter_ms": cur.jitter_ms if cur else 0,
             "frame_id": cur.frame_id if cur else -1,
             "live": cur.live if cur else False,
+            "source": cur.source if cur else None,
             "p50_ms": round(_percentile(vals, 0.5), 1) if vals else -1,
             "p95_ms": round(_percentile(vals, 0.95), 1) if vals else -1,
             "count": len(vals),

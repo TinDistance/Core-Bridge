@@ -17,6 +17,7 @@ from fastapi import APIRouter, Query, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from server import command_udp
+from server.rtp_relay import relay_status
 from server.video_hub import hub
 
 logger = logging.getLogger("video_udp")
@@ -83,6 +84,12 @@ async def stop_udp_listener() -> None:
 @router.get("/status")
 async def status() -> JSONResponse:
     return JSONResponse(hub.status(UDP_PORT))
+
+
+@router.get("/rtp_status")
+async def rtp_status() -> JSONResponse:
+    """H264 裸 RTP 中转状态（server/rtp_relay.py，udp:8002）。"""
+    return JSONResponse(relay_status())
 
 
 @router.get("/latency")

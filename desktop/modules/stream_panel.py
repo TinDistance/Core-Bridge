@@ -13,6 +13,7 @@ from PIL import Image, ImageTk
 
 from desktop import theme
 from desktop.modules.base_panel import BasePanel
+from desktop.streaming.h264_viewer import H264Viewer, available as h264_available
 from desktop.streaming.viewer import Viewer
 
 NO_STREAM_TEXT = "没有设备在推流"
@@ -88,29 +89,34 @@ class StreamPanel(BasePanel):
             self._redraw()
 
     def _ensure_viewer(self) -> None:
-        if self._viewer is None:
-            self._viewer = Viewer(self._server_var.get())
-            self._viewer.start()
+        if self._viewer is not None:
+            return
+        url = self._server_var.get()
+        # 默认走 H264 裸 RTP（低延迟主链路）；PyAV 缺失时自动用 JPEG
+        if h264_available():
+            self._viewer = H264Viewer(url)
+        else:
+            self._viewer = Viewer(url)
+        self._viewer.start()
 
     def _set_pill(self, text: str, fg: str, bg: str) -> None:
         self._pill_var.set(text)
         self._pill.config(fg=fg, bg=bg)
 
+    def _switch_to_jpeg(self) -> None:
+        if self._viewer is not None:
+            self._viewer.stop()
+        self._viewer = Viewer(self._server_var.get())
+        self._viewer.start()
+        self._foot_var.set("H264 不可用，已降级 JPEG/UDP")
+
     # ---------- 帧循环 ----------
     def _poll(self) -> None:
         if self._viewer is not None:
+            last_frame: Image.Image | None = None
             for kind, payload in self._viewer.events():
                 if kind == "frame":
-                    t0 = time.monotonic()
-                    self._streaming = True
-                    self._draw_frame(payload)
-                    self._fetch_ms = (time.monotonic() - t0) * 1000.0
-                    if self._monitor is not None:
-                        try:
-                            self._monitor.report_fetch(self._fetch_ms)
-                        except Exception:
-                            pass
-                    self._set_pill("● LIVE", theme.OK, "#14352B")
+                    last_frame = payload  # 只画最新一帧，积压的旧帧直接丢
                 elif kind == "status":
                     if payload == "streaming":
                         self._streaming = True
@@ -119,10 +125,23 @@ class StreamPanel(BasePanel):
                         self._streaming = False
                         self._set_pill("无信号", theme.MUTE, "#232E42")
                         self._redraw()
+                    elif payload == "fallback":
+                        self._switch_to_jpeg()
                     else:
                         self._set_pill("连接中", theme.WARN, "#3A2E14")
                         self._foot_var.set(str(payload))
-        self.after(100, self._poll)
+            if last_frame is not None:
+                t0 = time.monotonic()
+                self._streaming = True
+                self._draw_frame(last_frame)
+                self._fetch_ms = (time.monotonic() - t0) * 1000.0
+                if self._monitor is not None:
+                    try:
+                        self._monitor.report_fetch(self._fetch_ms)
+                    except Exception:
+                        pass
+                self._set_pill("● LIVE", theme.OK, "#14352B")
+        self.after(33, self._poll)
 
     def _current_image_size(self) -> tuple[int, int]:
         if self._photo is None:

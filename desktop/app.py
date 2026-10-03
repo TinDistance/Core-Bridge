@@ -11,7 +11,7 @@
 +--------------------------------------+------------------------+
 | GAMEPAD · 手柄  [●手柄]  按键灯 / 双摇杆 / 扳机 / 16字节协议   | 通栏手柄条
 +---------------------------------------------------------------+
-| udp:8001 · K230→server · fps 12 · 帧 #1234                     | 底栏
+| udp:8001 · K230→server · fps 30 · 帧 #1234                     | 底栏
 +---------------------------------------------------------------+
 手柄链路：XInput ~100Hz 轮询 -> 16 字节 HID -> POST /command，
 应用启动即自动连接手柄（无柄则后台重连等待，不卡 UI）。
@@ -66,7 +66,9 @@ class DesktopApp(tk.Tk):
         self._monitor = LatencyMonitor(get_base_url=lambda: base_url)
         self._monitor.start()
 
-        # 手柄：应用启动即尝试连接，后台 ~100Hz 轮询 + 实时 POST /command
+        # 手柄：应用启动即尝试连接，后台 ~100Hz 轮询 + 实时 POST /command。
+        # 命令下发链路：POST /command -> server 从视频 socket 反向推 v2 UART 帧
+        # 给 K230（server/command_udp.py），K230 收到后原样写 UART3。
         self._gamepad = GamepadPusher(get_base_url=lambda: base_url)
         self._gamepad.start()
 

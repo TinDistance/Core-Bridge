@@ -23,7 +23,7 @@ class BroadcastHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         # 高频轮询接口的 access 日志只留控制台，不向桌面广播，避免刷屏
-        # （桌面 LatencyMonitor 0.5s 轮询 /video/status，Viewer 12fps 轮询
+        # （桌面 LatencyMonitor 0.5s 轮询 /video/status，Viewer 30fps 轮询
         # /video/latest.jpg，全广播会把 LOGS 面板淹没）。
         if record.name == "uvicorn.access":
             try:

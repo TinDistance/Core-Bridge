@@ -20,9 +20,9 @@ class Viewer:
     接口与旧 WebRTC Viewer 一致，StreamPanel 无需改动。
     """
 
-    def __init__(self, server_url: str, fps: int = 12) -> None:
+    def __init__(self, server_url: str, fps: int = 30) -> None:
         self.server_url = server_url.rstrip("/")
-        self.fps = max(1, min(fps, 20))
+        self.fps = max(1, min(fps, 30))
         # 帧队列只留最新几帧，避免网络抖动时延迟堆积
         self._events: deque[Event] = deque(maxlen=8)
         self._lock = threading.Lock()

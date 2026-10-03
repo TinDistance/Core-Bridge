@@ -139,7 +139,7 @@ def _normalize_k230_offer(sdp: str) -> str:
     but aiortc only ships H264 with `packetization-mode=1` and requires an
     exact match, otherwise setRemoteDescription fails with "Failed to set
     remote video description send parameters". The K230 sends fragmented
-    720p frames that only fit in FU-A (mode 1), so advertising mode 1 is
+    1080p frames that only fit in FU-A (mode 1), so advertising mode 1 is
     the correct description of the wire format.
     """
     lines = []

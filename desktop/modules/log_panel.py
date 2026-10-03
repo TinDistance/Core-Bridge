@@ -26,7 +26,7 @@ _TIME_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[,.]\d+)?\
 _NUM = re.compile(r"\d+")
 
 # 桌面自己发出的高频轮询：LatencyMonitor 0.5s 一次 /video/status，
-# Viewer 12fps 轮询 /video/latest.jpg，健康检查 /command 等。
+# Viewer 30fps 轮询 /video/latest.jpg，健康检查 /command 等。
 _POLLING_PATHS = (
     "/video/status",
     "/video/latest.jpg",
@@ -38,7 +38,7 @@ _POLLING_PATHS = (
 )
 
 # 同一组重复超过这么久还没断，插一条小结落数，避免计数永远不落地。
-# （比如 12fps 的图传拉帧日志停不下来时，每 2s 只多一行小结。）
+# （比如 30fps 的图传拉帧日志停不下来时，每 2s 只多一行小结。）
 _SUMMARY_INTERVAL = 2.0
 
 
@@ -74,7 +74,7 @@ class LogPanel(BasePanel):
         self._queue: queue.Queue = queue.Queue()
         self._follow = True
         # 批量省略状态：连续重复只展示首条，其余计数+定时落小结；
-        # 轮询类（12fps 拉帧、0.5s 探针…）默认整类隐藏
+        # 轮询类（30fps 拉帧、0.5s 探针…）默认整类隐藏
         self._dedup = True
         self._hide_polling = True
         self._pending_key: str | None = None
@@ -222,7 +222,7 @@ class LogPanel(BasePanel):
                     line = self._queue.get_nowait()
                 except queue.Empty:
                     break
-                # 轮询类（12fps 图传拉帧、0.5s 状态探针…）默认整类隐藏
+                # 轮询类（30fps 图传拉帧、0.5s 状态探针…）默认整类隐藏
                 if self._hide_polling and _is_polling(line):
                     self._collapsed_total += 1
                     continue

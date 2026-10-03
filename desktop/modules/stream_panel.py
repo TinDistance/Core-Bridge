@@ -14,7 +14,6 @@ from desktop.streaming.viewer import Viewer
 
 NO_STREAM_TEXT = "没有设备在推流"
 NO_STREAM_HINT = "检查 K230 是否已上电，确认推流地址指向本机 UDP 8002"
-H264_SILENT_S = 5.0
 SIGNAL_LOSS_GRACE_S = 5.0
 
 
@@ -145,7 +144,7 @@ class StreamPanel(BasePanel):
         self._h264_last = time.monotonic()
 
     def _ensure_jpeg(self) -> None:
-        """JPEG 链路只在 H264 沉默时按需拉起；H264 一恢复立刻停掉。"""
+        """JPEG 链路仅在本机无 PyAV（无法解码 H264）时兜底拉起。"""
         if self._jpeg is None:
             self._jpeg = Viewer(self._server_var.get())
             self._jpeg.start()
@@ -182,36 +181,14 @@ class StreamPanel(BasePanel):
                         h264_img = payload
                     elif kind == "status":
                         h264_status = payload
-                        if payload == "fallback":
-                            # 主链路明确 fallback：立即拉起 JPEG
-                            self._ensure_jpeg()
+            if h264_status:
+                self._last_status = str(h264_status)
 
             if h264_img is not None:
-                self._h264_last = now
-                self._stop_jpeg()
-            elif self._h264_last and now - self._h264_last < H264_SILENT_S:
-                pass
-            else:
-                self._ensure_jpeg()
-
-            img = h264_img
-            jpeg_status = None
-            if img is None and self._jpeg is not None:
-                for kind, payload in self._jpeg.events():
-                    if kind == "frame":
-                        img = payload
-                    elif kind == "status":
-                        jpeg_status = payload
-
-            status_text = h264_status or jpeg_status
-            if status_text:
-                self._last_status = str(status_text)
-
-            if img is not None:
                 self._last_frame_ts = now
                 self._streaming = True
                 t0 = time.monotonic()
-                self._draw_frame(img)
+                self._draw_frame(h264_img)
                 self._draw_ms = (time.monotonic() - t0) * 1000.0
                 if self._monitor is not None:
                     try:
@@ -219,9 +196,7 @@ class StreamPanel(BasePanel):
                     except Exception:
                         pass
                 self._set_pill("● LIVE", theme.OK, "#14352B")
-                if img is not h264_img:
-                    self._foot_var.set(f"JPEG 回退 · {self._size_var.get()} · {self._last_status}")
-                elif self._last_status and self._last_status not in ("streaming",):
+                if self._last_status and self._last_status not in ("streaming",):
                     self._foot_var.set(f"{self._last_status} · {self._size_var.get()}")
             elif self._last_frame_ts and (now - self._last_frame_ts) < SIGNAL_LOSS_GRACE_S:
                 self._streaming = True

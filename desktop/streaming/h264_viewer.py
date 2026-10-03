@@ -236,7 +236,8 @@ class H264Viewer:
     def _thread_main(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 << 10)
+            # 15Mbps×冗余拷贝多入口扇出，加大内核缓冲吸收解码抖动
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 << 10)
             sock.bind(("0.0.0.0", 0))
             sock.settimeout(0.2)
             self._run_loop(sock)

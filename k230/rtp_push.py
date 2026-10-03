@@ -30,16 +30,39 @@ try:
 except Exception:
     pass
 RTP_PORT = 8002
+try:
+    _cfg_port = os.environ.get("RTP_PORT") if hasattr(os, "environ") else None
+    if _cfg_port:
+        RTP_PORT = int(_cfg_port)
+except Exception:
+    pass
 SENSOR_ID = 2
 WIDTH = 1280
 HEIGHT = 720
-# 码率必须给 duty 门留余量：BIT_RATE 远小于 LINK_KBPS * MAX_PFRAME_DUTY。
-# 实测上行 UDP 12Mbps / TCP 18Mbps，LINK_KBPS 取实测 UDP 值。
-# 旧配置 16000 vs 20000*0.8=16000 恰好相等 -> 平均帧 airtime 27.6ms > 26.4ms
-# 预算，95% 的帧被 frame_admission 判 FRAME_DROP_DUTY，桌面端直接黑屏。
-BIT_RATE = 4000
-# 旧 GOP=60(2s) 时单个 I 帧 220KB / 90ms airtime，光关键帧就吃掉近 1Mbps；
-# 缩短 GOP 让 I 帧更小更频繁，丢帧后恢复更快。
+
+# === 15Mbps 多链冗余 RTP（同帧同包同 seq 同 SSRC，多目的端口互为备份）===
+# 三链共用一条 WiFi 信道，所有拷贝共享同一个 pacer 令牌桶；
+# 接收端按 seq 去重、先到先用，单链抖动/丢包不再影响画面。
+WIFI_LINK_KBPS = 15000
+try:
+    _cfg_link = os.environ.get("WIFI_LINK_KBPS") if hasattr(os, "environ") else None
+    if _cfg_link:
+        WIFI_LINK_KBPS = int(_cfg_link)
+except Exception:
+    pass
+LINK_COPIES = 3      # P 帧冗余拷贝数（实际拷贝数按 airtime 预算自适应下调）
+IDR_COPIES = 2       # I 帧本体大，低拷贝 + 接收端 IDR 重试防节流长尾
+try:
+    _cfg_copies = os.environ.get("LINK_COPIES") if hasattr(os, "environ") else None
+    if _cfg_copies:
+        LINK_COPIES = max(1, int(_cfg_copies))
+    _cfg_idr = os.environ.get("IDR_COPIES") if hasattr(os, "environ") else None
+    if _cfg_idr:
+        IDR_COPIES = max(1, int(_cfg_idr))
+except Exception:
+    pass
+RTP_PORTS = (RTP_PORT, RTP_PORT + 1, RTP_PORT + 2)
+
 GOP_LEN = 15
 FPS = 30
 MAX_PAYLOAD = 1200
@@ -47,13 +70,16 @@ CMD_STALE_MS = 200
 UART3_BAUD = 115200
 GC_COLLECT_EVERY = 100
 
-LINK_KBPS = 12000
+# 码率预算：3 链共享 PACER_WIRE_KBPS 的节流池。
+# P 帧准入要求 copies×single_airtime <= FRAME_INTERVAL_MS×MAX_PFRAME_DUTY，
+# 反推 BIT_RATE ≈ PACER_WIRE_KBPS / LINK_COPIES × duty × 帧率分摊。
+BIT_RATE = 4200
 FRAME_INTERVAL_MS = 1000 // FPS
 FRAME_PERIOD_MS = FRAME_INTERVAL_MS
-MAX_PFRAME_DUTY = 0.8
+MAX_PFRAME_DUTY = 0.95
 
-PACER_DUTY = 0.90
-PACER_WIRE_KBPS = int(LINK_KBPS * PACER_DUTY)
+PACER_DUTY = 0.92
+PACER_WIRE_KBPS = int(WIFI_LINK_KBPS * PACER_DUTY)
 _PACER_BYTES_PER_S = PACER_WIRE_KBPS * 1000 / 8.0
 PACER_BURST_BYTES = int(_PACER_BYTES_PER_S * 2 * FRAME_INTERVAL_MS / 1000.0)
 
@@ -385,24 +411,58 @@ FRAME_DROP_STARVE = 2
 
 
 def frame_admission(frame_bytes, npkts, is_idr, link_kbps,
-                    frame_interval_ms, max_pframe_duty, pacer):
-    """整帧准入判定（纯函数，无副作用）。返回 (action, airtime_ms)。"""
-    air = airtime_ms(frame_bytes, npkts, link_kbps)
+                    frame_interval_ms, max_pframe_duty, pacer,
+                    max_copies=1, idr_copies=1):
+    """整帧准入判定 + 冗余拷贝数自适应（纯函数）。
+
+    返回 (action, copies, air_ms)。I 帧低拷直发；P 帧按 duty 预算选最大
+    拷贝数（a×n <= interval×duty），pacer 令牌不够继续降拷，拷到 1 都不够
+    才判 STARVE 丢弃。
+    """
+    single = airtime_ms(frame_bytes, npkts, link_kbps)
+    budget = frame_interval_ms * max_pframe_duty
     if is_idr:
-        return FRAME_SEND, air
-    if air > frame_interval_ms * max_pframe_duty:
-        return FRAME_DROP_DUTY, air
-    if not pacer.can_send(frame_bytes, npkts):
-        return FRAME_DROP_STARVE, air
-    return FRAME_SEND, air
+        return (FRAME_SEND, max(1, min(max_copies, idr_copies)), single)
+    best = 0
+    for n in range(max_copies, 0, -1):
+        if single * n > budget:
+            continue
+        if pacer is None or pacer.can_send(frame_bytes * n, npkts * n):
+            return FRAME_SEND, n, single * n
+        best = n
+    if best:
+        return FRAME_DROP_STARVE, 0, single * best
+    return FRAME_DROP_DUTY, 0, single
 
 
-def send_paced(pacer, packets, sink):
-    """逐包节流发送，返回实际发出的包数。"""
+def fanout_sink(targets, sock, stats):
+    """多端口扇出 sink：单包发往所有目标端口；任一 OSError 即中止本帧。"""
+    n = len(targets)
+
+    def _send(pkt):
+        try:
+            for t in targets:
+                sock.sendto(pkt, t)
+        except TypeError:
+            pkt = bytes(pkt)
+            for t in targets:
+                sock.sendto(pkt, t)
+        except OSError as e:
+            stats.pkt_err += 1
+            raise SendAborted(str(e))
+        stats.bytes_tx += len(pkt) * n
+    return _send
+
+
+def send_paced(pacer, packets, sink, copies=1):
+    """逐包节流发送，返回实际发出的包数。
+
+    令牌按 copies×包长计费：三链拷贝共用同一个节流池，线速预算不超发。
+    """
     sent = 0
     pacer.begin_frame()
     for pkt in packets:
-        pacer.take(len(pkt))
+        pacer.take(len(pkt) * copies)
         sink(pkt)
         sent += 1
     return sent
@@ -452,6 +512,7 @@ class TxStats:
         self.forced_idr = 0
         self.resyncs = 0
         self.max_frame_bytes = 0
+        self.fanout_copies = 0
 
     def line(self, span, pacer, gate, free):
         kbps = self.bytes_tx * 8 / span / 1000.0
@@ -600,7 +661,7 @@ def stream_loop(sock, server_ip, sta):
     pacer = Pacer(PACER_WIRE_KBPS, PACER_BURST_BYTES, get_clock(), PACER_SPAN_MAX_MS)
     gate = IdrGate(IDR_REQ_MIN_INTERVAL_MS, IDR_REQ_SETTLE_MS)
     st = TxStats()
-    addr = (server_ip, RTP_PORT)
+    targets = [(server_ip, p) for p in RTP_PORTS]
     ssrc = 0x54494E44
     seq = 0
     ts_step = 90000 // FPS
@@ -668,47 +729,37 @@ def stream_loop(sock, server_ip, sta):
             packets[-1] = bytearray(packets[-1])
             packets[-1][1] |= 0x80
 
-            air_ms = None
-            action, air_ms = frame_admission(
-                frame_bytes, len(packets), is_idr, LINK_KBPS,
-                FRAME_INTERVAL_MS, MAX_PFRAME_DUTY, pacer)
+            action, copies, air_ms = frame_admission(
+                frame_bytes, len(packets), is_idr, WIFI_LINK_KBPS,
+                FRAME_INTERVAL_MS, MAX_PFRAME_DUTY, pacer,
+                max_copies=LINK_COPIES, idr_copies=IDR_COPIES)
             if action == FRAME_DROP_DUTY:
                 st.dropped += 1
                 st.over_duty += 1
-                if not is_idr:
-                    need_resync = True
+                need_resync = True
                 continue
             if action == FRAME_DROP_STARVE:
                 st.dropped += 1
                 st.starved += 1
-                if not is_idr:
-                    need_resync = True
+                need_resync = True
                 continue
             if is_idr:
                 gate.note_idr_sent(_ticks_ms())
                 need_resync = False
 
-            send_err = [None]
-
-            def _sink(pkt, _sock=sock, _addr=addr, _err=send_err,
-                      _st=st):
-                try:
-                    _sock.sendto(pkt, _addr)
-                except TypeError:
-                    _sock.sendto(bytes(pkt), _addr)
-                except OSError as e:
-                    _err[0] = str(e)
-                    raise SendAborted()
-                _st.bytes_tx += len(pkt)
+            _sink = fanout_sink(targets[:copies], sock, st)
 
             try:
-                send_paced(pacer, packets, _sink)
-            except SendAborted:
+                send_paced(pacer, packets, _sink, copies)
+                st.note_frame(frame_bytes * copies, len(packets), is_idr,
+                              air_ms)
+                if copies > 1:
+                    st.fanout_copies += copies - 1
+            except SendAborted as e:
                 st.pkt_err += 1
-                print("sendto err: %s" % send_err[0])
+                print("sendto err: %s" % str(e))
             seq = seq_next
             frame_count = (frame_count + 1) & 0xFFFFFFFF
-            st.note_frame(frame_bytes, len(packets), is_idr, air_ms)
             if need_resync and not is_idr:
                 # 参考链断过：等下一帧真的发出去了再要 IDR，避免空转刷请求。
                 # IdrGate 自带限频/合并，不会退化成 IDR 风暴。
@@ -734,13 +785,14 @@ def stream_loop(sock, server_ip, sta):
             kbps = st.bytes_tx * 8 / span / 1000.0
             fps = st.sent_frames / span
             print(st.line(span, pacer, gate, free) + " (%s)" % cmdline.stats_line())
-            util = kbps / LINK_KBPS
+            util = kbps / WIFI_LINK_KBPS
             print(st.detail(pacer, gate))
-            print("      P帧airtime %.1fms / 预算 %.1fms | 节流上限 %dKbps | "
+            print("      P帧airtime %.1fms×拷%d / 预算 %.1fms | 节流上限 %dKbps | "
                   "链路占用 %.0f%%%s" % (
-                      st.last_pframe_ms, FRAME_INTERVAL_MS * MAX_PFRAME_DUTY,
+                      st.last_pframe_ms, LINK_COPIES,
+                      FRAME_INTERVAL_MS * MAX_PFRAME_DUTY,
                       PACER_WIRE_KBPS, util * 100.0,
-                      "  << 超 5Mbps，必然丢包!" if util > 0.9 else ""))
+                      "  << 接近链路上限，拷贝数将自适应下调" if util > 0.9 else ""))
             if fps > FPS * 1.15:
                 print("      !! 实际 %.1f fps 超过配置 %d，码率分母错，"
                       "软件闸门失效" % (fps, FPS))
@@ -804,8 +856,10 @@ def main():
     server_ip = SERVER_IP or gateway
     init_encoder()
     sock = make_sock()
-    print("[4/4] pushing RTP h264 to %s:%d (%dKbps, gop=%d)" % (
-        server_ip, RTP_PORT, BIT_RATE, GOP_LEN))
+    print("[4/4] pushing RTP h264 to %s ports=%s (%dKBps enc, %dKBps link, "
+          "copies=%d, gop=%d)" % (
+              server_ip, "/".join(str(p) for p in RTP_PORTS),
+              BIT_RATE * 1000 // 8, WIFI_LINK_KBPS, LINK_COPIES, GOP_LEN))
     stream_loop(sock, server_ip, get_sta())
 
 

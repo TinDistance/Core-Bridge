@@ -124,13 +124,13 @@ class DesktopApp(tk.Tk):
                     self._hdr_pill_var.set("无信号")
                     self._hdr_pill.config(fg=theme.MUTE, bg="#232E42")
                     self._foot_var.set(
-                        f"{st.get('source') or 'udp:8001'} · 等待 K230 推流…")
+                        f"{st.get('source') or 'rtp:8002'} · 等待 K230 推流…")
                 elif not has_latency or cur < 0:
                     self._hdr_lat_var.set("— ms")
                     self._hdr_pill_var.set("无 render_age")
                     self._hdr_pill.config(fg=theme.MUTE, bg="#232E42")
                     self._foot_var.set(
-                        f"{st.get('source') or 'udp:8001'} · fps {st['fps']:.1f}"
+                        f"{st.get('source') or 'rtp:8002'} · fps {st['fps']:.1f}"
                         f" · 帧 #{st['frame_id']} · viewer 未上报 render_age")
                 else:
                     self._hdr_lat_var.set(f"{int(cur)} ms")
@@ -147,7 +147,7 @@ class DesktopApp(tk.Tk):
                         extra += f" · 队列 {queue:.0f}ms"
                     if drops >= 0:
                         extra += f" · 丢 {int(drops)}"
-                    src = st.get("source") or "udp:8001"
+                    src = st.get("source") or "rtp:8002"
                     base = (f"{src} · K230→server · fps {st['fps']:.1f}"
                             f" · 帧 #{st['frame_id']}")
                     if st["p95_ms"] >= 0:

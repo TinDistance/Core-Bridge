@@ -65,7 +65,7 @@ class LatencySample:
     jitter_ms: float = 0.0
     frame_id: int = -1
     live: bool = False
-    source: str = "udp:8001"
+    source: str = "rtp:8002"
 
     @property
     def local_ms(self) -> float:
@@ -173,19 +173,18 @@ class LatencyMonitor:
             self.last_error = str(e)
             self._append(LatencySample(t=time.time()))
             return
-        src = "udp:8001"
-        if not data.get("live"):
-            src = None
+        src = "rtp:8002"
+        jpeg_live = bool(data.get("live"))
+        if not jpeg_live:
             try:
                 t1 = time.monotonic()
                 resp = client.get(f"{base}/video/rtp_status")
                 rtp = resp.json()
                 if rtp.get("live"):
                     data = rtp
-                    src = "rtp:8002"
             except Exception:
                 pass
-            if src is None:
+            if not data.get("live"):
                 src = "无信号"
         rtt = (time.monotonic() - t0) * 1000.0
         self.last_error = ""

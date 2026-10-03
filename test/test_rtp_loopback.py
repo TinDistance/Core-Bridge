@@ -1,4 +1,4 @@
-"""H264 裸 RTP 链路本地回环测试（不需要 K230 硬件）。
+﻿"""H264 裸 RTP 链路本地回环测试（不需要 K230 硬件）。
 
 模拟 K230：用 PyAV/libx264 编合成测试帧 -> RTP(FU-A) 打包 -> 打到
 relay(:18002)；relay 纯转发；H264Viewer 接收解码出 PIL 帧。
@@ -155,7 +155,8 @@ def main() -> int:
     print(f"sent={frames_sent} decoded={len(got)} statuses={statuses}")
     print(f"relay: live={relay_status.get('live')} fps={relay_status.get('fps')} "
           f"pkts_rx={relay_status.get('pkts_rx')} pkts_tx={relay_status.get('pkts_tx')} "
-          f"up={relay_status.get('upstream')} down={relay_status.get('downstream')}")
+          f"kbps={relay_status.get('kbps')} "
+          f"up={relay_status.get('upstream')} downs={relay_status.get('downstreams')}")
     ok = len(got) >= 10 and relay_status.get("live") and frames_sent >= DURATION_S * FPS * 0.8
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
@@ -163,3 +164,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

@@ -7,7 +7,7 @@
     version    u8  = 1
     flags      u8  = 0（保留）
     frame_id   u16 （循环 0..65535）
-    total      u16 （该帧总片数，1..256）
+    total      u16 （该帧总片数，1..512）
     idx        u16 （本片序号，0..total-1）
     plen       u16 （本片 payload 实际长度，需 == len(package)-12）
 
@@ -15,7 +15,7 @@
   * 单片 payload <= 1200B（MTU 安全，WiFi 下避免 IP 分片）
   * 发送端片间 pacing 1~2ms，避免突发丢包
   * 未收齐的帧超时 0.6s 丢弃；同时只保留最近 3 个未完成帧
-  * 单帧上限 400KB、total 上限 256，超限直接丢（防攻击/错包卡死）
+  * 单帧上限 1MB、total 上限 512，超限直接丢（防攻击/错包卡死）
   * 组装后校验 JPEG SOI(FFD8)/EOI(FFD9)，坏帧丢弃不发布
   * 只保留最新完整帧，desktop 通过 HTTP 轮询拉取（无长连接不断线）
 """
@@ -32,10 +32,10 @@ HEADER_FMT = ">HBBHHHH"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)  # 12
 
 CHUNK_PAYLOAD_MAX = 1200
-MAX_CHUNKS = 256
-MAX_FRAME_BYTES = 400 * 1024
+MAX_CHUNKS = 512
+MAX_FRAME_BYTES = 1024 * 1024
 FRAME_TIMEOUT_S = 0.6
-MAX_INFLIGHT = 3
+MAX_INFLIGHT = 8
 
 
 @dataclass
@@ -67,30 +67,33 @@ class VideoHub:
         self._partials: dict[int, _Partial] = {}
 
     # ---------- 组包入口（UDP 协议回调调用） ----------
-    def feed_datagram(self, data: bytes, addr: str) -> None:
+    def feed_datagram(self, data: bytes, addr: str) -> bool:
+        """校验头部并组包；头部合法返回 True（命令推送学习地址用）。"""
         if len(data) < HEADER_SIZE:
             self.chunks_bad += 1
-            return
+            return False
         try:
             magic, ver, _flags, frame_id, total, idx, plen = struct.unpack(
                 HEADER_FMT, data[:HEADER_SIZE]
             )
         except struct.error:
             self.chunks_bad += 1
-            return
+            return False
         payload = data[HEADER_SIZE:]
         if magic != MAGIC or ver != VERSION:
             self.chunks_bad += 1
-            return
+            return False
         if not (1 <= total <= MAX_CHUNKS):
             self.chunks_bad += 1
-            return
+            return False
         if not (0 <= idx < total):
             self.chunks_bad += 1
-            return
+            return False
         if plen != len(payload) or len(payload) > CHUNK_PAYLOAD_MAX or len(payload) == 0:
             self.chunks_bad += 1
-            return
+            return False
+        # 头部合法：来源地址可作为命令反向推送目标
+        self.sender = addr
 
         now = time.monotonic()
         self.chunks_rx += 1
@@ -110,29 +113,29 @@ class VideoHub:
             part = self._partials[frame_id] = _Partial(total=total, first_seen=now)
 
         if idx in part.chunks:
-            return  # 重复片，忽略
+            return True  # 重复片，忽略
         part.chunks[idx] = payload
         part.size += len(payload)
         if part.size > MAX_FRAME_BYTES:
             del self._partials[frame_id]
             self.frames_dropped += 1
-            return
+            return True
 
         if len(part.chunks) == part.total:
             del self._partials[frame_id]
             jpeg = b"".join(part.chunks[i] for i in range(part.total))
             if not _looks_like_jpeg(jpeg):
                 self.frames_bad_jpeg += 1
-                return
+                return True
             self.latest_jpeg = jpeg
             self.latest_frame_id = frame_id
             self.latest_at = now
             self.latest_wall = time.time()
-            self.sender = addr
             self.frames_ok += 1
             if self._frame_times:
                 self._intervals_ms.append((now - self._frame_times[-1]) * 1000.0)
             self._frame_times.append(now)
+        return True
 
     # ---------- 查询 ----------
     @property

@@ -35,7 +35,7 @@ PUSH_PATH = "/webrtc/push"
 SENSOR_ID = 2
 WIDTH = 1280                # 编码宽度（会自动 16 对齐）
 HEIGHT = 720
-BIT_RATE = 1024             # Kbit/s
+BIT_RATE = 2048             # Kbit/s
 GOP_LEN = 30
 # ================================================
 

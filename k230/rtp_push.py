@@ -33,15 +33,21 @@ RTP_PORT = 8002
 SENSOR_ID = 2
 WIDTH = 1280
 HEIGHT = 720
-BIT_RATE = 16000
-GOP_LEN = 60
+# 码率必须给 duty 门留余量：BIT_RATE 远小于 LINK_KBPS * MAX_PFRAME_DUTY。
+# 实测上行 UDP 12Mbps / TCP 18Mbps，LINK_KBPS 取实测 UDP 值。
+# 旧配置 16000 vs 20000*0.8=16000 恰好相等 -> 平均帧 airtime 27.6ms > 26.4ms
+# 预算，95% 的帧被 frame_admission 判 FRAME_DROP_DUTY，桌面端直接黑屏。
+BIT_RATE = 4000
+# 旧 GOP=60(2s) 时单个 I 帧 220KB / 90ms airtime，光关键帧就吃掉近 1Mbps；
+# 缩短 GOP 让 I 帧更小更频繁，丢帧后恢复更快。
+GOP_LEN = 15
 FPS = 30
 MAX_PAYLOAD = 1200
 CMD_STALE_MS = 200
 UART3_BAUD = 115200
 GC_COLLECT_EVERY = 100
 
-LINK_KBPS = 20000
+LINK_KBPS = 12000
 FRAME_INTERVAL_MS = 1000 // FPS
 FRAME_PERIOD_MS = FRAME_INTERVAL_MS
 MAX_PFRAME_DUTY = 0.8
@@ -444,6 +450,7 @@ class TxStats:
         self.bytes_tx = 0
         self.pkt_err = 0
         self.forced_idr = 0
+        self.resyncs = 0
         self.max_frame_bytes = 0
 
     def line(self, span, pacer, gate, free):
@@ -451,12 +458,12 @@ class TxStats:
         fps = self.sent_frames / span
         return (
             "stat: sent=%d drop=%d(duty=%d starve=%d) overfps=%d idr=%d "
-            "(forced=%d) last=%dB max=%dB kbps=%.0f fps=%.1f pps=%.0f "
+            "(forced=%d resync=%d) last=%dB max=%dB kbps=%.0f fps=%.1f pps=%.0f "
             "txerr=%d idrshare=%.0f%% free=%d" % (
                 self.sent_frames, self.dropped, self.over_duty, self.starved,
-                self.overfps, self.idr_frames, self.forced_idr, self.last_len,
-                self.max_frame_bytes, kbps, fps, pacer.packets / span,
-                self.pkt_err, self.idr_share(), free))
+                self.overfps, self.idr_frames, self.forced_idr, self.resyncs,
+                self.last_len, self.max_frame_bytes, kbps, fps,
+                pacer.packets / span, self.pkt_err, self.idr_share(), free))
 
     def detail(self, pacer, gate):
         return (
@@ -601,6 +608,9 @@ def stream_loop(sock, server_ip, sta):
     last_sent_ms = _ticks_ms() - FRAME_PERIOD_MS
     t_stat = time.time()
     pending_idr = [True]
+    # 丢过 P 帧后置位：参考链已断，而丢帧不消耗 seq，接收端看不到缺口，
+    # 不会自行请求 IDR。下一帧成功发出后据此补一个 IDR 请求重新起链。
+    need_resync = False
 
     def _on_ctrl(_data):
         pending_idr[0] = True
@@ -665,13 +675,18 @@ def stream_loop(sock, server_ip, sta):
             if action == FRAME_DROP_DUTY:
                 st.dropped += 1
                 st.over_duty += 1
+                if not is_idr:
+                    need_resync = True
                 continue
             if action == FRAME_DROP_STARVE:
                 st.dropped += 1
                 st.starved += 1
+                if not is_idr:
+                    need_resync = True
                 continue
             if is_idr:
                 gate.note_idr_sent(_ticks_ms())
+                need_resync = False
 
             send_err = [None]
 
@@ -694,6 +709,12 @@ def stream_loop(sock, server_ip, sta):
             seq = seq_next
             frame_count = (frame_count + 1) & 0xFFFFFFFF
             st.note_frame(frame_bytes, len(packets), is_idr, air_ms)
+            if need_resync and not is_idr:
+                # 参考链断过：等下一帧真的发出去了再要 IDR，避免空转刷请求。
+                # IdrGate 自带限频/合并，不会退化成 IDR 风暴。
+                pending_idr[0] = True
+                need_resync = False
+                st.resyncs += 1
         except Exception as e:
             print("send drop: " + str(e))
             st.dropped += 1

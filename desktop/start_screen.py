@@ -16,8 +16,15 @@ class StartScreen(tk.Frame):
     def __init__(self, master, on_ready, **kwargs) -> None:
         self._on_ready = on_ready
         self._result: queue.Queue = queue.Queue()
+        self._cancelled = threading.Event()
+        self._pending: ServerManager | None = None
         super().__init__(master, bg=theme.BG, **kwargs)
         self.build()
+
+    def destroy(self) -> None:
+        """窗口在启动过程中被关掉时，通知后台 worker 收尾，别留下占端口的孤儿。"""
+        self._cancelled.set()
+        super().destroy()
 
     def build(self) -> None:
         self.columnconfigure(0, weight=1)
@@ -70,11 +77,21 @@ class StartScreen(tk.Frame):
         self._status_var.set("正在启动 Server…")
 
         def work() -> None:
+            manager: ServerManager | None = None
             try:
                 manager = ServerManager(port=port)
+                self._pending = manager
+                if self._cancelled.is_set():
+                    return
                 ok: bool = manager.start()
-                self._result.put((manager, ok, ""))
+                if self._cancelled.is_set():
+                    # 窗口已关：拉起来的 server 立刻收掉，否则它会一直占着端口
+                    threading.Thread(target=manager.stop, daemon=True).start()
+                    return
+                self._result.put((manager, ok, manager.last_error))
             except Exception as e:
+                if manager is not None:
+                    threading.Thread(target=manager.stop, daemon=True).start()
                 try:
                     self._result.put((None, False, str(e)[:200]))
                 except Exception:
@@ -86,15 +103,22 @@ class StartScreen(tk.Frame):
         try:
             manager, ok, err = self._result.get_nowait()
         except queue.Empty:
-            self.after(200, self._poll_result)
+            if not self._cancelled.is_set():
+                try:
+                    self.after(200, self._poll_result)
+                except tk.TclError:
+                    pass
+            return
+        if self._cancelled.is_set():
+            if manager is not None:
+                threading.Thread(target=manager.stop, daemon=True).start()
             return
         if ok:
             self._status_var.set("启动成功")
             self._on_ready(manager)
         else:
             self._start_btn.config(state=tk.NORMAL)
-            msg = f"启动失败：{err}，换个端口再试一次" if err else "启动失败，换个端口再试一次"
-            self._status_var.set(msg)
+            self._status_var.set(f"启动失败：{err}" if err else "启动失败，换个端口再试一次")
             if manager is not None:
                 # 丢后台停服，避免 UI 线程卡 5s
                 threading.Thread(target=manager.stop, daemon=True).start()

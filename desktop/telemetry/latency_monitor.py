@@ -65,7 +65,7 @@ class LatencySample:
     jitter_ms: float = 0.0
     frame_id: int = -1
     live: bool = False
-    source: str = "rtp:8002"
+    source: str = "rtp:8002 (h265)"
 
     @property
     def local_ms(self) -> float:
@@ -122,7 +122,7 @@ class LatencyMonitor:
             self._fetch_ms = draw_ms
 
     def report_stream_stats(self, stats: dict | None) -> None:
-        """喂 H264Viewer.stats()。字段缺失/None 一律存 None，后续按 -1 显示。"""
+        """喂 H265Viewer.stats()。字段缺失/None 一律存 None，后续按 -1 显示。"""
         with self._stream_lock:
             if stats is None:
                 return
@@ -173,7 +173,7 @@ class LatencyMonitor:
             self.last_error = str(e)
             self._append(LatencySample(t=time.time()))
             return
-        src = "rtp:8002"
+        src = "rtp:8002 (h265)"
         jpeg_live = bool(data.get("live"))
         if not jpeg_live:
             try:

@@ -1,4 +1,4 @@
-"""H264 裸 RTP 多链中转（方案 A 的 server 段）。
+"""H265 裸 RTP 多链中转（方案 A 的 server 段）。
 
 K230 同帧同 seq 同 SSRC 多拷贝发往多入口端口（8002/8003/8004），
 每条入口独立 socket/独立内核缓冲，互为备份；本中转不按内容去重
@@ -296,7 +296,7 @@ class RtpRelay:
             and last_frame_at and now - last_frame_at <= UPSTREAM_STALE_S
         )
         return {
-            "mode": "h264",
+            "mode": "h265",
             "live": live,
             "fps": round(fps, 2),
             "pps": round(pps, 1),
@@ -343,5 +343,5 @@ def stop_relay() -> None:
 
 def relay_status() -> dict:
     if _relay is None:
-        return {"mode": "h264", "live": False, "started": False}
+        return {"mode": "h265", "live": False, "started": False}
     return _relay.status()

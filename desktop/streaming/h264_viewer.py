@@ -1,4 +1,4 @@
-"""Receive H.264 RTP, decode with PyAV, and emit the newest PIL frames."""
+"""Receive H.265/HEVC RTP, decode with PyAV, and emit the newest PIL frames."""
 from __future__ import annotations
 
 import logging
@@ -23,7 +23,7 @@ CONTROL_MAGIC = b"CBR"
 CTRL_PING = 0x00
 CTRL_IDR = 0x01
 CTRL_PONG = 0x10
-PT_H264 = 96
+PT_H264 = 96  # 动态 PT；发送侧用 96 承载 HEVC（无 SDP 协商的裸 RTP 自定约定）
 
 Event = tuple[str, object]
 
@@ -70,7 +70,7 @@ def available() -> bool:
 
 
 class _Depacketizer:
-    """RFC 6184 子集：单 NAL 包 / STAP-A / FU-A -> Annex-B access unit。"""
+    """RFC 7798 子集：单 NAL / AP(type 48) / FU(type 49) -> Annex-B access unit。"""
 
     def __init__(self) -> None:
         self._au: list[bytes] = []
@@ -106,41 +106,50 @@ class _Depacketizer:
         if len(self._au) > AU_MAX_PACKETS or au_bytes > AU_MAX_BYTES:
             self.reset()
             return None
-        nal_type = payload[0] & 0x1F
-        if nal_type == 28:
-            if len(payload) < 2:
+        if len(payload) < 2:
+            self.reset()
+            return None
+        # HEVC NAL：6bit type = (byte0 >> 1) & 0x3F（H.265 采用 2 字节头）
+        nal_type = (payload[0] >> 1) & 0x3F
+        if nal_type == 49:
+            if len(payload) < 3:
                 return None
-            fu_hdr = payload[1]
-            nal_hdr = (payload[0] & 0xE0) | (fu_hdr & 0x1F)
+            fu_hdr = payload[2]
             if fu_hdr & 0x80:
                 self._flush_fu()
-                self._fu_nal = bytes([nal_hdr]) + payload[2:]
-                if fu_hdr & 0x1F == 5:
+                # RFC 7798 §4.4.2：重组原 NAL 头 = PayloadHdr(2B)，
+                # 但 type 字段恢复为 FU header 中的原始 nal_unit_type
+                # FU header 布局：S(1) E(1) P(1) FuType(5)
+                nal_hdr = bytes([(payload[0] & 0x81)
+                                 | ((fu_hdr & 0x1F) << 1), payload[1]])
+                self._fu_nal = nal_hdr + payload[3:]
+                # IDR_W_RADL(19)/IDR_N_LP(20)：HEVC 的两类瞬时 IDR
+                if fu_hdr & 0x1F in (19, 20):
                     self._au_idr = True
             elif self._fu_nal is not None:
-                self._fu_nal += payload[2:]
+                self._fu_nal += payload[3:]
             if fu_hdr & 0x40:
                 self._flush_fu()
-        elif nal_type == 24:
-            off = 1
+        elif nal_type == 48:
+            off = 2
             n = len(payload)
-            while off + 2 <= n:
+            while off + 3 <= n:
                 size = struct.unpack_from(">H", payload, off)[0]
                 off += 2
                 if size and off + size <= n:
                     nal = bytes(payload[off:off + size])
                     self._au.append(nal)
-                    if nal[0] & 0x1F == 5:
+                    if (nal[0] >> 1) & 0x3F in (19, 20):
                         self._au_idr = True
                 off += size
         else:
-            if nal_type == 0 or nal_type >= 29:
-                # 未支持的 NAL（STAP-B/MTAP/FU-B/保留）：复位并等 IDR
+            if nal_type >= 41:
+                # 未支持的 NAL（PACI/保留/SEI 以外的新类型）：复位并等 IDR
                 self.reset()
                 return None
             self._flush_fu()
             self._au.append(bytes(payload))
-            if nal_type == 5:
+            if nal_type in (19, 20):
                 self._au_idr = True
         if marker:
             return self._take_au()
@@ -243,7 +252,7 @@ class H264Viewer:
             self._run_loop(sock)
         except Exception as e:
             logger.exception("h264 viewer crashed: %s", e)
-            self._emit(("status", f"H264 接收异常: {e}"))
+            self._emit(("status", f"H265 接收异常: {e}"))
             self._set_streaming(False)
         finally:
             sock.close()
@@ -252,7 +261,7 @@ class H264Viewer:
     def _run_loop(self, sock: socket.socket) -> None:
         target = (self.server_host, self.port)
         depack = _Depacketizer()
-        codec = av.CodecContext.create("h264", "r")
+        codec = av.CodecContext.create("hevc", "r")
         codec.options = {"flags": "low_delay"}
         last_ping = 0.0
         idr_until_frame = True
@@ -556,7 +565,7 @@ class H264Viewer:
                 last_stat = now
                 st = self.stats()
                 logger.warning(
-                    "h264 rtp: rx=%d lost=%d(%.2f%%) gaps=%d fixed=%d "
+                    "h265 rtp: rx=%d lost=%d(%.2f%%) gaps=%d fixed=%d "
                     "frames=%d dropped=%d fails=%d dup=%d | backlog=%d pkt/"
                     "%dB drops=%d(%d 次) resets=%d | render_age=%.0fms "
                     "queue=%.0fms %dkbps loop=%.0f/%.0fus",
@@ -628,7 +637,7 @@ class H264Viewer:
             render_age, queue = self._render_age_ms, self._queue_ms
             bitrate, lavg, lmax = self._bitrate_kbps, self._loop_us_avg, self._loop_us_max
         total = pkts_rx + lost
-        return {"mode": "h264", "frames": frames,
+        return {"mode": "h265", "frames": frames,
                 "streaming": streaming,
                 "decode_fails": decode_fails,
                 "dropped_wait_idr": dropped,

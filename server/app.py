@@ -26,7 +26,7 @@ async def lifespan(app: FastAPI):
     try:
         ok_rtp = start_relay()
         if not ok_rtp:
-            logger.warning("RTP relay not started; H264 chain disabled")
+            logger.warning("RTP relay not started; H265 chain disabled")
     except Exception as e:
         logger.error("RTP relay crashed: %s", e)
     try:

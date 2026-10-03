@@ -124,7 +124,7 @@ async def status() -> JSONResponse:
 
 @router.get("/rtp_status")
 async def rtp_status() -> JSONResponse:
-    """H264 裸 RTP 中转状态（server/rtp_relay.py，udp:8002）。"""
+    """H265 裸 RTP 中转状态（server/rtp_relay.py，udp:8002）。"""
     return JSONResponse(relay_status())
 
 

@@ -9,7 +9,7 @@ from PIL import Image, ImageTk
 
 from desktop import theme
 from desktop.modules.base_panel import BasePanel
-from desktop.streaming.h264_viewer import H264Viewer, available as h264_available
+from desktop.streaming.h264_viewer import H264Viewer, available as h265_available
 from desktop.streaming.viewer import Viewer
 
 NO_STREAM_TEXT = "没有设备在推流"
@@ -22,9 +22,9 @@ class StreamPanel(BasePanel):
                  monitor=None, **kwargs) -> None:
         self._default_server = default_server
         self._monitor = monitor
-        self._h264: H264Viewer | None = None
+        self._h265: H264Viewer | None = None
         self._jpeg: Viewer | None = None
-        self._h264_last = 0.0
+        self._h265_last = 0.0
         self._last_frame_ts = 0.0
         self._last_status = ""
         self._paused = False
@@ -84,7 +84,7 @@ class StreamPanel(BasePanel):
         if self._monitor is not None:
             try:
                 self._monitor.set_stream_stats_provider(
-                    lambda: self._h264.stats() if self._h264 is not None else {})
+                    lambda: self._h265.stats() if self._h265 is not None else {})
             except Exception:
                 pass
         self._poll_after = self.after(33, self._poll)
@@ -97,8 +97,8 @@ class StreamPanel(BasePanel):
         except Exception:
             pass
         try:
-            if self._h264 is not None:
-                self._h264.stop()
+            if self._h265 is not None:
+                self._h265.stop()
         except Exception:
             pass
         try:
@@ -111,40 +111,40 @@ class StreamPanel(BasePanel):
         """地址编辑后重建 viewer（防抖：由下次 _poll 实际执行）。"""
         # 标记强制重建：停掉旧对象，下轮 _ensure 会用新地址创建
         try:
-            if self._h264 is not None:
-                self._h264.stop()
-                self._h264 = None
+            if self._h265 is not None:
+                self._h265.stop()
+                self._h265 = None
             self._stop_jpeg()
-            self._h264_last = 0.0
+            self._h265_last = 0.0
         except Exception:
             pass
 
     def _toggle(self) -> None:
         self._paused = not self._paused
         if self._paused:
-            if self._h264 is not None:
-                self._h264.stop()
-                self._h264 = None
+            if self._h265 is not None:
+                self._h265.stop()
+                self._h265 = None
             self._stop_jpeg()
             self._streaming = False
             self._toggle_btn.config(text="继续看")
             self._set_pill("已暂停", theme.MUTE, "#232E42")
             self._redraw()
         else:
-            self._h264_last = time.monotonic()
+            self._h265_last = time.monotonic()
             self._toggle_btn.config(text="暂停")
 
-    def _ensure_h264(self) -> None:
-        """H264 裸 RTP 是主链路，常驻。PyAV 缺失才退回 JPEG。"""
-        if self._h264 is not None or not h264_available():
+    def _ensure_h265(self) -> None:
+        """H265 裸 RTP 是主链路，常驻。PyAV 缺失才退回 JPEG。"""
+        if self._h265 is not None or not h265_available():
             return
-        self._h264 = H264Viewer(self._server_var.get())
-        self._h264.start()
+        self._h265 = H264Viewer(self._server_var.get())
+        self._h265.start()
         # 预热窗口：刚创建尚未完成 IDR 握手，避免下一轮误拉 JPEG 双耗
-        self._h264_last = time.monotonic()
+        self._h265_last = time.monotonic()
 
     def _ensure_jpeg(self) -> None:
-        """JPEG 链路仅在本机无 PyAV（无法解码 H264）时兜底拉起。"""
+        """JPEG 链路仅在本机无 PyAV（无法解码 H265）时兜底拉起。"""
         if self._jpeg is None:
             self._jpeg = Viewer(self._server_var.get())
             self._jpeg.start()
@@ -168,27 +168,27 @@ class StreamPanel(BasePanel):
             now = time.monotonic()
             if self._paused:
                 return
-            self._ensure_h264()
+            self._ensure_h265()
             # 无 PyAV：直接 JPEG（原 elif 逻辑导致黑屏）
-            if not h264_available():
+            if not h265_available():
                 self._ensure_jpeg()
 
-            h264_img = None
-            h264_status = None
-            if self._h264 is not None:
-                for kind, payload in self._h264.events():
+            h265_img = None
+            h265_status = None
+            if self._h265 is not None:
+                for kind, payload in self._h265.events():
                     if kind == "frame":
-                        h264_img = payload
+                        h265_img = payload
                     elif kind == "status":
-                        h264_status = payload
-            if h264_status:
-                self._last_status = str(h264_status)
+                        h265_status = payload
+            if h265_status:
+                self._last_status = str(h265_status)
 
-            if h264_img is not None:
+            if h265_img is not None:
                 self._last_frame_ts = now
                 self._streaming = True
                 t0 = time.monotonic()
-                self._draw_frame(h264_img)
+                self._draw_frame(h265_img)
                 self._draw_ms = (time.monotonic() - t0) * 1000.0
                 if self._monitor is not None:
                     try:

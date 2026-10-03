@@ -52,7 +52,10 @@ class RtpRelay:
         self._lock = threading.Lock()
         self._upstream: tuple[str, int] | None = None
         self._upstream_at = 0.0
-        self._downstream: tuple[str, int] | None = None
+        # 下游可以有多个（GUI + 探针 + 第二个监视器）。旧实现只存一个
+        # _downstream，后到的控制包会覆盖前面的，于是先到的客户端突然
+        # 收不到画面 —— 表现为"随机黑屏"，极难查。
+        self._downstreams: dict[tuple[str, int], float] = {}
         self._downstream_at = 0.0
 
         self._pkts_rx = 0
@@ -64,6 +67,9 @@ class RtpRelay:
         # 滑动 2s 窗口统计 fps/pps：停流后 status() 读数平滑归零
         self._marker_times: deque[float] = deque(maxlen=240)
         self._pkt_times: deque[float] = deque(maxlen=1200)
+        # 吞吐率：K230->PC 实际占用多少带宽。这是验证"5Mbps 够不够"的唯一
+        # 直接证据，之前链路上没有任何地方能读到 kbps。
+        self._bytes_at: deque[tuple[float, int]] = deque(maxlen=20000)
 
     # ---------- 生命周期 ----------
     def start(self) -> bool:
@@ -113,6 +119,7 @@ class RtpRelay:
                 break
             self._pkts_rx += 1
             self._bytes_rx += len(data)
+            self._bytes_at.append((time.monotonic(), len(data)))
             if not data:
                 continue
             if data[:3] == CONTROL_MAGIC:
@@ -123,28 +130,32 @@ class RtpRelay:
     def _on_rtp(self, data: bytes, addr: tuple[str, int]) -> None:
         host, port = addr
         upstream_new = False
+        now = time.monotonic()
         with self._lock:
             if self._upstream != (host, port):
                 self._upstream = (host, port)
                 upstream_new = True
-            self._upstream_at = time.monotonic()
-            downstream = self._downstream
-            downstream_stale = (
-                self._downstream is None
-                or time.monotonic() - self._downstream_at > DOWNSTREAM_STALE_S)
+            self._upstream_at = now
+            # 清理超时下游，再取一份快照在锁外发送
+            for a in [a for a, t in self._downstreams.items()
+                      if now - t > DOWNSTREAM_STALE_S]:
+                del self._downstreams[a]
+            targets = list(self._downstreams)
         # 上游地址（含变化）喂给命令通道：UART 推送走 8001 socket 反向直达
         if upstream_new:
             logger.info("RTP upstream learned: %s:%d", host, port)
-            command_udp.note_video_sender(host, port)
-        elif time.monotonic() - self._upstream_at < 1.0:
-            command_udp.note_video_sender(host, port)
-        if downstream is None or downstream_stale:
+        command_udp.note_video_sender(host, port)
+        if not targets:
             return
-        try:
-            self._sock.sendto(data, downstream)
-            self._pkts_tx += 1
-        except OSError:
-            pass
+        sent = 0
+        for target in targets:
+            try:
+                self._sock.sendto(data, target)
+                sent += 1
+            except OSError:
+                pass
+        if sent:
+            self._pkts_tx += sent
         if data[1] & 0x80:  # marker：一帧（access unit）结束
             self._frame_id += 1
             self._last_frame_at = time.monotonic()
@@ -153,13 +164,14 @@ class RtpRelay:
 
     def _on_control(self, data: bytes, addr: tuple[str, int]) -> None:
         kind = data[3] if len(data) > 3 else CTRL_PING
+        now = time.monotonic()
         with self._lock:
-            self._downstream = addr
-            self._downstream_at = time.monotonic()
+            self._downstreams[addr] = now
+            self._downstream_at = now
             upstream = self._upstream
             upstream_stale = (
                 self._upstream is None
-                or time.monotonic() - self._upstream_at > UPSTREAM_STALE_S)
+                or now - self._upstream_at > UPSTREAM_STALE_S)
         self._ctrl_rx += 1
         if kind == CTRL_PING:
             try:
@@ -178,11 +190,20 @@ class RtpRelay:
         now = time.monotonic()
         fps = len([t for t in self._marker_times if now - t <= 2.0]) / 2.0
         pps = len([t for t in self._pkt_times if now - t <= 2.0]) / 2.0
+        # 5s 滑动窗口吞吐率（应用层字节数，不含 UDP/IP 头）
+        while self._bytes_at and now - self._bytes_at[0][0] > 5.0:
+            self._bytes_at.popleft()
+        win_bytes = sum(b for _t, b in self._bytes_at)
+        win_span = 5.0
+        if self._bytes_at:
+            span = max(1e-3, now - self._bytes_at[0][0])
+            if span < win_span:
+                win_span = span
+        kbps = win_bytes * 8 / win_span / 1000.0 if self._bytes_at else 0.0
         with self._lock:
             upstream = self._upstream
             upstream_age = (now - self._upstream_at) if self._upstream else -1
-            downstream = self._downstream
-            downstream_age = (now - self._downstream_at) if self._downstream else -1
+            downs = len(self._downstreams)
         live = (
             upstream is not None
             and upstream_age <= UPSTREAM_STALE_S
@@ -197,10 +218,11 @@ class RtpRelay:
             "age_ms": round((now - self._last_frame_at) * 1000.0, 1)
             if self._last_frame_at else -1.0,
             "upstream": f"{upstream[0]}:{upstream[1]}" if upstream else None,
-            "downstream": f"{downstream[0]}:{downstream[1]}" if downstream else None,
+            "downstreams": downs,
             "pkts_rx": self._pkts_rx,
             "pkts_tx": self._pkts_tx,
             "bytes_rx": self._bytes_rx,
+            "kbps": round(kbps, 1),
             "ctrl_rx": self._ctrl_rx,
             "port": self._port,
             "server_time": round(time.time(), 3),

@@ -10,11 +10,23 @@
 #     AA55 帧转发 UART3，CBR\x01 控制包触发 RequestIDR。
 #
 # 低延迟要点：
-#   * profile=BASELINE（禁 B 帧）；bit_rate CBR；gopLen=30（1s 自愈窗口）
+#   * profile=BASELINE（禁 B 帧）；bit_rate CBR；gopLen=15（0.5s 自愈窗口，
+#     GOP 直接等于桌面端最坏黑屏时长，见下面 GOP_LEN 处注释）
 #   * GetStream timeout=20ms；时间戳用帧计数 * 3000（90kHz/30fps），
 #     不依赖 stream.pts 单位
-#   * 令牌桶 pacing（PPS 上限），单帧片数超余量则整帧丢弃不发半帧
 #   * sendto 失败只丢当帧：不重建 socket、不 sleep（对比 JPEG 版老问题）
+#
+# 拥塞控制（丢包策略，见下面"带宽预算"）：
+#   帧间编码和帧内编码的丢包代价完全不同：
+#     * JPEG 丢一包 = 丢一帧，下一帧立刻可用。
+#     * H264 丢一个 P 帧 = 参考链断裂，直到下一个 IDR 才能解码。桌面端
+#       因此在检测到 seq 跳变后会 wait_idr 拒收所有 P 帧。
+#   => I 帧是唯一的画面恢复手段，必须无条件发送，绝不能被限速/丢弃。
+#   => P 帧按 airtime 守卫丢：估这帧占满 5Mbps 需要多久，超过帧间隔的
+#      MAX_PFRAME_DUTY 就整帧丢弃。链路跟不上时继续往 AP 队列灌包只会
+#      让缓冲溢出、延迟累积，反而更糟。
+#   => 不做重传：25ms 后才到的帧对 5Mbps@30fps 毫无价值，且重传会挤占
+#      本来就不够的带宽。恢复靠"立刻请求新 IDR"。
 #
 # 验证实验（实施前置，见 k230/rtp_diag.py）：
 #   E1 UDP goodput（test/udp_flood_rx.py + diag_udp_flood）
@@ -41,14 +53,52 @@ SENSOR_ID = 2
 WIDTH = 1280                # 编码宽度（自动 16 对齐）
 HEIGHT = 720
 BIT_RATE = 3072             # Kbit/s CBR（2.4G 下 3M 安全，必要时调低）
-GOP_LEN = 30
+GOP_LEN = 15              # IDR 间隔 0.5s。桌面端一旦判丢包就拒收所有 P 帧，
+                          # 等下一个 IDR 才恢复画面，所以 GOP 直接等于最坏
+                          # 黑屏时长。30 帧(1s)对遥控太长了；15 帧配合
+                          # CBR 不涨码率（IDR 变小即可），只轻微掉画质。
 FPS = 30
 MAX_PAYLOAD = 1200          # 单 RTP 包 payload 上限（<1472 不触发 IP 分片）
-PACER_PPS = 600             # 令牌桶速率（3M ≈ 313pps，留余量）
-PACER_BURST = 40            # 令牌桶容量（> 一个 I 帧的片数即不设限）
 CMD_STALE_MS = 200
 UART3_BAUD = 115200
 GC_COLLECT_EVERY = 100
+# ================================================
+
+# ==================== 带宽预算 ====================
+# 5Mbps 链路 @30fps 的每帧预算是 5e6/30/8 ≈ 20.8KB（已扣 RTP+UDP+IP 头
+# 约 2.9%，可用 ~20.2KB）。JPEG 帧内编码达不到这个质量档（720p q65 实测
+# 60~100KB，超预算 3~5 倍），所以必须走帧间编码 —— 这就是本脚本存在的原因。
+#
+# 换算成 RTP 包数：
+_PKTS_AVG = BIT_RATE * 1000 // FPS // 8 // MAX_PAYLOAD + 1   # 平均帧包数
+# I 帧峰值按平均的 IFRAME_PEAK_RATIO 倍留量。实测 720p30@3Mbps 时 I 帧是
+# 平均的 5~8 倍，16 倍是保守上界。
+IFRAME_PEAK_RATIO = 16
+IFRAME_PKTS_MAX = _PKTS_AVG * IFRAME_PEAK_RATIO + 8
+
+# 令牌桶定容（关键，见 stream_loop 的注释）：
+#   PACER_BURST 必须 >= 一个 I 帧的包数。否则预检 pacer.has() 会把 I 帧
+#   整帧丢掉，而 I 帧是丢包后唯一的画面恢复手段 —— 结果是桌面端永远卡在
+#   wait_idr，一帧都出不来。
+#
+#   PACER_PPS 的作用不是"限平均码率"（那是 BIT_RATE 的事），而是把 I 帧
+#   突发摊开到一帧多以内。定成平均包率(330)会掏空令牌桶：实测 3Mbps 下
+#   GOP=15 需要约 557pps，而 330pps 发一个 44 包 I 帧要 133ms(4 个帧间隔)，
+#   期间 has() 预检把 37% 的 P 帧全丢了。这里取 I 帧峰值在 ~2 个帧间隔
+#   内发完，既摊开了突发，又永远饿不死 P 帧。
+#   实测平均帧 ~13 包、I 帧 44~98 包、目标 ~322pps。
+PACER_PPS = IFRAME_PKTS_MAX * FPS // 2
+PACER_BURST = IFRAME_PKTS_MAX
+
+# 链路余量守卫：5Mbps 是实测值，估一帧在空中要占多久，超了就整帧丢弃。
+# 只对 P 帧生效 —— I 帧是恢复手段，宁可超发也不能丢。
+# 链路跟不上时继续往 AP 队列里灌包，只会让缓冲溢出、延迟累积，反而更糟。
+LINK_KBPS = 5000           # 实测 K230<->PC 可用带宽
+WIRE_OVERHEAD_PER_PKT = 12 + 8 + 20               # RTP头+UDP头+IP头
+FRAME_INTERVAL_MS = 1000 // FPS
+FRAME_PERIOD_MS = 1000 // FPS     # 软件帧率闸门周期
+MAX_PFRAME_DUTY = 0.8      # P 帧 airtime 占帧间隔的上限
+
 # ================================================
 
 sensor = None
@@ -64,6 +114,12 @@ def _ticks_ms():
 
 def _ticks_diff(a, b):
     return time.ticks_diff(a, b) if hasattr(time, "ticks_diff") else a - b
+
+
+def _airtime_ms(frame_bytes, npkts):
+    """估一帧占满链路 airtime 的毫秒数（payload + 每包 40B 头开销）。"""
+    wire = frame_bytes + npkts * WIRE_OVERHEAD_PER_PKT
+    return wire * 8 / LINK_KBPS
 
 
 def init_camera():
@@ -351,7 +407,6 @@ def stream_loop(sock, server_ip, sta):
     stream = StreamData()
     parameter_sets = None
     pacer = Pacer(PACER_PPS, PACER_BURST)
-    cmdline = CommandLink(init_uart3())
     addr = (server_ip, RTP_PORT)
     ssrc = 0x54494E44  # "TIND"
     seq = 0
@@ -360,12 +415,26 @@ def stream_loop(sock, server_ip, sta):
     sent_frames = 0
     dropped = 0
     last_len = 0
+    idr_count = 0
+    over_duty = 0
+    starved = 0
+    last_iframe_pkts = 0
+    last_iframe_ms = 0.0
+    last_pframe_ms = 0.0
+    pkts_tx = 0
+    bytes_tx = 0
+    pkt_err = 0
+    max_frame_bytes = 0
+    overfps = 0
+    last_sent_ms = _ticks_ms() - FRAME_PERIOD_MS
     t_stat = time.time()
     pending_idr = [True]  # 首次出流 + 桌面请求时出新 IDR
 
     def _on_ctrl(_data):
         pending_idr[0] = True
 
+    # UART3 只初始化一次：init_uart3() 会重设 FPIOA 引脚并重建 UART 对象，
+    # 调两次会泄漏第一个句柄并可能复位外设。
     cmdline = CommandLink(init_uart3(), on_ctrl=_on_ctrl)
 
     while True:
@@ -385,33 +454,71 @@ def stream_loop(sock, server_ip, sta):
 
         if encoder.GetStream(stream, timeout=20) != 0:
             continue
+
+        # ---- 软件帧率闸门（必须放在 ReleaseStream 之前）----
+        # K230 VENC 的 dst_frame_rate 实测无效：配置 30fps 实际出流 ~49fps。
+        # 而码率控制的分母用的是"配置帧率"，所以每帧仍是 bit_rate/30 ≈
+        # 12800B，实际总码率 = 12800 x 49 = 5.0Mbps，直接灌满 5Mbps 链路
+        # （占用 101%，零余量）-> 持续丢包 -> 桌面端永远收不齐 IDR -> 黑屏。
+        # 这里按真实时间戳硬限到 FPS，12800B x 30 = 3.07Mbps（占用 61%）。
+        # 不依赖固件行为，比赌 dst_frame_rate 生效可靠。
+        now_ms = _ticks_ms()
+        if _ticks_diff(now_ms, last_sent_ms) < FRAME_PERIOD_MS:
+            overfps += 1
+            encoder.ReleaseStream(stream)
+            continue
+        last_sent_ms = now_ms
+
         try:
             packets = []
             frame_bytes = 0
+            is_idr = False
+            # 关键：seq 先写进局部变量，只有这一帧真的发出去了才提交。
+            # 若在丢弃分支就 advance，丢帧会在 RTP 序号空间里留下永久空洞，
+            # 接收端每次都判丢包 -> wait_idr -> 黑屏，实测直接"没信号"。
+            seq_next = seq
             for i in range(stream.pack_cnt):
                 data = uctypes.bytearray_at(stream.data[i], stream.data_size[i])
                 stype = stream.stream_type[i]
                 if stype == encoder.STREAM_TYPE_HEADER:
                     parameter_sets = bytes(data)
                     continue
+                if stype == encoder.STREAM_TYPE_I:
+                    is_idr = True
                 data_bytes = bytes(data)
                 frame_bytes += len(data_bytes)
                 if stype == encoder.STREAM_TYPE_I and parameter_sets:
                     for nalu in split_nalus(parameter_sets):
-                        seq = packetize_nalu(nalu, frame_count * ts_step, seq, ssrc, packets)
+                        seq_next = packetize_nalu(nalu, frame_count * ts_step, seq_next, ssrc, packets)
                 for nalu in split_nalus(data_bytes):
-                    seq = packetize_nalu(nalu, frame_count * ts_step, seq, ssrc, packets)
+                    seq_next = packetize_nalu(nalu, frame_count * ts_step, seq_next, ssrc, packets)
             if not packets:
                 continue
             # marker 打在 access unit 最后一个包上
             packets[-1] = bytearray(packets[-1])
             packets[-1][1] |= 0x80
             last_len = frame_bytes
+            if frame_bytes > max_frame_bytes:
+                max_frame_bytes = frame_bytes
 
-            # 整帧预检：令牌不够就整帧丢弃，不发半帧
-            if not pacer.has(len(packets)):
-                dropped += 1
-                continue
+            # 整帧预检：令牌不够就整帧丢弃，不发半帧。
+            # 但 I 帧必须无条件放行 —— 它是丢包后唯一的画面恢复手段，
+            # 丢了 I 帧桌面端就只能一直等下一个 IDR。
+            if is_idr:
+                last_iframe_pkts = len(packets)
+                last_iframe_ms = _airtime_ms(frame_bytes, len(packets))
+                idr_count += 1
+            else:
+                air_ms = _airtime_ms(frame_bytes, len(packets))
+                last_pframe_ms = air_ms
+                if air_ms > FRAME_INTERVAL_MS * MAX_PFRAME_DUTY:
+                    dropped += 1
+                    over_duty += 1
+                    continue
+                if not pacer.has(len(packets)):
+                    dropped += 1
+                    starved += 1
+                    continue
 
             for pkt in packets:
                 pacer.take(1)
@@ -419,6 +526,16 @@ def stream_loop(sock, server_ip, sta):
                     sock.sendto(pkt, addr)
                 except TypeError:
                     sock.sendto(bytes(pkt), addr)
+                except OSError as e:
+                    # sendto 失败必须计数：ENOBUFS/EAGAIN 说明本机发送队列
+                    # 溢出，这是"帧在建网前就丢了"，不改代码永远看不见。
+                    pkt_err += 1
+                    print("sendto err: %s" % str(e))
+                    break
+                pkts_tx += 1
+                bytes_tx += len(pkt)
+            # 只有真正发出去才提交序号/时间戳：见上面 seq_next 的注释
+            seq = seq_next
             frame_count = (frame_count + 1) & 0xFFFFFFFF
             sent_frames += 1
         except Exception as e:
@@ -437,8 +554,34 @@ def stream_loop(sock, server_ip, sta):
                 free = gc.mem_free()
             except Exception:
                 free = -1
-            print("stat: sent=%d dropped=%d last=%dB free=%d (%s)" % (
-                sent_frames, dropped, last_len, free, cmdline.stats_line()))
+            span = max(1e-6, now - t_stat)
+            kbps = bytes_tx * 8 / span / 1000.0
+            fps = sent_frames / span
+            print("stat: sent=%d drop=%d(duty=%d starve=%d) overfps=%d idr=%d "
+                  "last=%dB max=%dB kbps=%.0f fps=%.1f pps=%.0f txerr=%d "
+                  "free=%d (%s)" % (
+                      sent_frames, dropped, over_duty, starved, overfps,
+                      idr_count, last_len, max_frame_bytes, kbps, fps,
+                      pkts_tx / span, pkt_err, free, cmdline.stats_line()))
+            util = kbps / LINK_KBPS
+            print("      P帧airtime %.1fms / 预算 %.1fms | I帧 %d包 %.0fms | "
+                  "链路占用 %.0f%%%s" % (
+                      last_pframe_ms, FRAME_INTERVAL_MS * MAX_PFRAME_DUTY,
+                      last_iframe_pkts, last_iframe_ms, util * 100.0,
+                      "  << 超 5Mbps，必然丢包!" if util > 0.9 else ""))
+            if fps > FPS * 1.15:
+                print("      !! 实际 %.1f fps 超过配置 %d，码率分母错，"
+                      "软件闸门失效" % (fps, FPS))
+            sent_frames = 0
+            dropped = 0
+            over_duty = 0
+            starved = 0
+            overfps = 0
+            idr_count = 0
+            pkts_tx = 0
+            bytes_tx = 0
+            pkt_err = 0
+            max_frame_bytes = 0
             t_stat = now
 
 

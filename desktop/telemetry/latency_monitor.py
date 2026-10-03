@@ -117,7 +117,9 @@ class LatencyMonitor:
                 )
             return
         # H264 裸 RTP 模式下 JPEG hub 无流，改读 rtp_relay 状态（字段兼容）
+        src = "udp:8001"
         if not data.get("live"):
+            src = None
             try:
                 resp = client.get(f"{base}/video/rtp_status")
                 rtp = resp.json()
@@ -126,8 +128,10 @@ class LatencyMonitor:
                     src = "rtp:8002"
             except Exception:
                 pass
-        else:
-            src = "udp:8001"
+            if src is None:
+                # 两条链路都无流：src 必须有值，否则下面 LatencySample(source=src)
+                # 会 NameError，整个延迟面板停止更新。
+                src = "无信号"
         self.last_error = ""
         age = float(data.get("age_ms", -1))
         live = bool(data.get("live", False))

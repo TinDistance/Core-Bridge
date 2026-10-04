@@ -454,11 +454,52 @@ def test_k3_module_import_never_raises_and_falls_back_to_defaults():
     assert rp.SETTINGS["ssid"] == rp.WIFI_SSID
     assert rp.SETTINGS["password"] == rp.WIFI_PASSWORD
     assert rp.WIFI_SSID and rp.WIFI_PASSWORD    # 凭据内置，开箱即用
-    # main() 不再因缺配置 raise：有配置错误只打印回落提示后继续跑
+    # 凭据/tier 类配置错误只打印回落提示，不 raise（见 CONFIG_ERROR 分支）。
+    # main() 唯一会 raise 的是「接收端 IP 没手动设置」，由下面那条钉住。
     import inspect
     src = inspect.getsource(rp.main)
     assert "CONFIG_ERROR" in src
-    assert "raise RuntimeError" not in src
+
+
+def test_k3_server_ip_must_be_manually_set(monkeypatch):
+    """接收端 IP 手动设置：不设就退出，**不再退回 WiFi 网关地址**。
+
+    旧行为是 `SERVER_IP or gateway` —— 推流照跑，但对端不是收流的那台机器时
+    表现为纯黑屏，排查全靠猜地址。现在必须显式指定，且失败要发生在碰摄像头
+    和连 WiFi 之前（否则「配置没写对」要等硬件初始化完才报）。
+    """
+    rp = _load()
+    touched = []
+    monkeypatch.setattr(rp, "init_camera", lambda: touched.append("camera"))
+    monkeypatch.setattr(rp, "connect_wifi", lambda: touched.append("wifi"))
+    monkeypatch.setattr(rp, "SERVER_IP", None)
+    try:
+        rp.main()
+        raise AssertionError("未设置 server_ip 时 main() 必须退出，不得推流")
+    except RuntimeError as e:
+        assert "server_ip" in str(e)
+    assert touched == []      # 在初始化任何硬件之前就停下
+
+
+def test_k3_server_ip_must_be_ipv4_literal():
+    """server_ip 只接受 IPv4 字面量：域名要 DNS（会阻塞主循环），手写错则是
+    UDP 静默发进黑洞 —— 两种都不该等到推流时才发现。"""
+    rp = _load()
+    for good in ("192.168.1.50", "10.0.0.1", "0.0.0.0", " 172.16.0.9 "):
+        assert rp.valid_server_ip(good)
+        assert rp.resolve_settings({"server_ip": good})["server_ip"] \
+            == good.strip()
+    for bad in ("", "   ", "192.168.1", "192.168.1.5.6", "192.168.1.256",
+                "192.168.1.a", "192.168.1.1.", "pc-host.local", "::1",
+                "192.168.1.-1"):
+        assert not rp.valid_server_ip(bad), bad
+    try:
+        rp.resolve_settings({"server_ip": "192.168.1.300"})
+        raise AssertionError("非法 IPv4 必须被拒")
+    except RuntimeError as e:
+        assert "server_ip" in str(e)
+    # 没配就是 None（没有默认值），由 main() 决定退出
+    assert rp.resolve_settings(None, {})["server_ip"] is None
 
 
 # =====================================================================

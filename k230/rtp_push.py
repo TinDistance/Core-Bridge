@@ -22,6 +22,18 @@ CONFIG_FIELDS = ("ssid", "password", "server_ip", "tier", "link_kbps")
 # 凭据不再必填：有默认值兜底，配置文件只负责覆盖。
 REQUIRED_CONFIG_FIELDS = ()
 
+# === 接收端 IP：手动设置，不再默认推网关 ===
+# 旧行为：server_ip 没配时退回 WiFi 网关地址（Windows 移动热点通常是
+# 192.168.137.1）。那是个「猜」出来的地址 —— 推流照跑，但对端不是收流的那台
+# 机器时表现为「一直黑屏 / 一直重连」，排查成本全在猜上。现在没有默认地址：
+# 三处都没有就启动即报错退出，绝不往网关发包。
+#
+# 三种手动设置方式（优先级 env > 配置文件 > 这里的常量）：
+#   1) 改下面这一行（最直接：改完再把脚本传上板子）
+#   2) /sdcard/tindistance.json 里的 "server_ip"
+#   3) 环境变量 SERVER_IP（rt-smart 上一般不存在，非主路径）
+SERVER_IP = ""
+
 # === 档位（K9/K10，文档 §1.1 带宽预算表）===
 # tier -> (width, height, bit_rate_kbps)
 TIERS = {
@@ -121,11 +133,35 @@ def load_config(path):
     return out
 
 
+def valid_server_ip(ip):
+    """纯函数：server_ip 必须是 IPv4 点分十进制字面量。
+
+    刻意**不支持域名**：rt-smart 上一次 DNS 解析会阻塞主循环，而「手写错一个
+    字符的 IP」如果放行，表现是 UDP 静默发进黑洞（对端永远收不到，也不会
+    有任何报错）。宁可在启动时炸掉，也不要黑屏一整晚。
+    """
+    if not isinstance(ip, str):
+        return False
+    parts = ip.strip().split(".")
+    if len(parts) != 4:
+        return False
+    for part in parts:
+        if not part or len(part) > 3:
+            return False
+        for ch in part:
+            if ch not in "0123456789":
+                return False
+        if int(part) > 255:
+            return False
+    return True
+
+
 def resolve_settings(cfg, env=None):
     """纯函数：默认值 + 配置覆盖 + 可选 env 覆盖 → 运行期设置 dict。
 
     优先级 env > 配置文件 > 硬编码默认值。`cfg` 为 None 表示没有配置文件。
     env 是普通 dict（模块层从 os.environ 收集，单测直接传字面量）。
+    server_ip 没有默认值：没配就是 None，由 main() 报错退出，绝不退回网关地址。
     """
     cfg = cfg or {}
     env = env or {}
@@ -141,6 +177,14 @@ def resolve_settings(cfg, env=None):
         raise RuntimeError("link_kbps must be an integer number")
     if link_kbps <= 0:
         raise RuntimeError("link_kbps must be > 0")
+    server_ip = env.get("server_ip") or cfg.get("server_ip") or SERVER_IP or None
+    if server_ip is not None:
+        server_ip = server_ip.strip()
+        if not server_ip:
+            server_ip = None
+        elif not valid_server_ip(server_ip):
+            raise RuntimeError("server_ip %r is not a valid IPv4 address"
+                               % server_ip)
     warnings = []
     need = TIER_MIN_LINK_KBPS[tier]
     if link_kbps < need:
@@ -151,7 +195,7 @@ def resolve_settings(cfg, env=None):
     return {
         "ssid": env.get("ssid") or cfg.get("ssid") or WIFI_SSID,
         "password": env.get("password") or cfg.get("password") or WIFI_PASSWORD,
-        "server_ip": env.get("server_ip") or cfg.get("server_ip") or None,
+        "server_ip": server_ip,
         "tier": tier,
         "width": width,
         "height": height,
@@ -182,6 +226,16 @@ def _env_int(name):
         return int(val) if val else None
     except Exception:
         return None
+
+
+class ConfigError(RuntimeError):
+    """配置没对（没设接收端 IP 等）。
+
+    单独一个类型，只为了**不打调用栈**：配置问题不是 bug，`sys.print_exception`
+    在 rt-smart 的 REPL 上打一串 traceback 会让人以为脚本炸了，而正确的处理
+    只是照着提示改一行。继承 RuntimeError 是为了不破坏调用方（和单测）按
+    RuntimeError 捕获的习惯。
+    """
 
 
 CONFIG = None
@@ -1439,19 +1493,30 @@ def main():
         print("[cfg] ERROR: " + CONFIG_ERROR)
         print("[cfg] 已回落到内置默认值；请修正 %s，例如："
               % CONFIG_PATH)
-        print('[cfg] {"ssid":"...","password":"...","server_ip":"192.168.137.1",'
-              '"tier":"T1","link_kbps":8000}')
+        print('[cfg] {"ssid":"...","password":"...","server_ip":"192.168.1.50",'
+              '"tier":"%s","link_kbps":%d}' % (DEFAULT_TIER,
+                                              DEFAULT_WIFI_LINK_KBPS))
     elif CONFIG is None:
-        print("[cfg] %s 不存在，使用内置默认值（SSID=%s）"
+        print("[cfg] %s 不存在，使用内置默认值（SSID=%s，接收端 IP 需手动设置）"
               % (CONFIG_PATH, WIFI_SSID))
     for w in SETTINGS["warnings"]:
         print("[cfg] WARN: " + w)
-    print("[cfg] tier=%s %dx%d %dkbps | link=%dkbps (pacer %dkbps) | %s" % (
+    # 接收端 IP 必须手动设置。旧版这里没配就退回 WiFi 网关地址，于是「推流
+    # 正常启动」但对端可能根本不是收流的那台机器 —— 表现是纯黑屏，排查全靠
+    # 猜。现在没有默认地址：没配就在碰摄像头/WiFi 之前直接退出。
+    server_ip = SERVER_IP
+    if not server_ip:
+        print("[cfg] ERROR: 未设置接收端 IP（server_ip），已停止，不推送。")
+        print("[cfg] 请手动设置以下任意一处：")
+        print('[cfg]   1) 本文件顶部 SERVER_IP = "192.168.x.x"')
+        print('[cfg]   2) %s 里的 "server_ip": "192.168.x.x"' % CONFIG_PATH)
+        print("[cfg]   3) 环境变量 SERVER_IP=192.168.x.x")
+        raise ConfigError("server_ip not set")
+    print("[cfg] tier=%s %dx%d %dkbps | link=%dkbps (pacer %dkbps) | target %s | %s" % (
         TIER, WIDTH, HEIGHT, BIT_RATE, WIFI_LINK_KBPS, PACER_WIRE_KBPS,
-        CONFIG_PATH))
+        server_ip, CONFIG_PATH))
     init_camera()
-    _ip, gateway = connect_wifi()
-    server_ip = SERVER_IP or gateway
+    connect_wifi()
     init_encoder()
     sock = make_sock()
     print("[4/4] pushing RTP h264 to %s ports=%s (tier=%s %dKBps enc, "
@@ -1466,6 +1531,10 @@ try:
     main()
 except KeyboardInterrupt as e:
     print("User stop: " + str(e))
+except ConfigError as e:
+    # 上面已经把「怎么改」打全了，这里只补一句结论，**不再打调用栈**：
+    # 配置没写对不是 bug，打 traceback 会让人以为脚本炸了。
+    print("[cfg] 未推流（%s）。按上面任一方式设置后重新运行即可。" % e)
 except BaseException as e:
     import sys
     sys.print_exception(e)

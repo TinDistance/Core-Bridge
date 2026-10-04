@@ -3,6 +3,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 import weakref
 from pathlib import Path
@@ -66,6 +67,10 @@ class ServerManager:
         self._log_file = None
         self._log_mark = 0
         self.last_error = ""
+        # start()/stop() 会被启动屏的后台 worker 和 atexit 同时碰到。没有锁时
+        # 两次并发的 start() 会各自 Popen 一个 uvicorn，后一个把前一个杀掉 ——
+        # 表现就是 server.out 里连续出现多个 "Started server process"。
+        self._lock = threading.RLock()
         _LIVE_MANAGERS.add(self)
 
     @property
@@ -74,16 +79,25 @@ class ServerManager:
 
     def start(self, timeout: float = 20.0, reuse_existing: bool = True) -> bool:
         """拉起 server 并等到可用；失败返回 False（不抛异常给 UI）。"""
-        # 端口已有人 listen：健康就直接复用（上次残留 / 手动起的），不重启、不误杀
-        if self._port_in_use():
-            if reuse_existing and self._healthy():
+        with self._lock:
+            # 自己的子进程还活着且健康 → 什么都不做。重复调用 start() 不应该
+            # 把正在服务的 server 换掉（换的瞬间所有 HTTP 客户端都会短暂断链）。
+            if self._proc is not None and self._proc.poll() is None and self._healthy():
+                self.last_error = ""
                 return True
-            # 不健康 = 僵死的残留，控制台被强杀时 atexit 跑不到，这里精确认领后回收
-            self._reap_own_leftovers()
+            # 端口已有人 listen：健康就直接复用（上次残留 / 手动起的），不重启、不误杀
             if self._port_in_use():
-                self.last_error = self._port_holder_hint()
-                return False
-        self.stop()
+                if reuse_existing and self._healthy():
+                    return True
+                # 不健康 = 僵死的残留，控制台被强杀时 atexit 跑不到，这里精确认领后回收
+                self._reap_own_leftovers()
+                if self._port_in_use():
+                    self.last_error = self._port_holder_hint()
+                    return False
+            self.stop()
+            return self._spawn(timeout)
+
+    def _spawn(self, timeout: float) -> bool:
         kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
         # 独立进程组：控制台 Ctrl+C / 关窗口不会波及 server，退出时由我们自己收尸
         if sys.platform == "win32":
@@ -157,12 +171,14 @@ class ServerManager:
         return False
 
     def stop(self) -> None:
-        self._release(graceful=True)
+        with self._lock:
+            self._release(graceful=True)
 
     def _release(self, graceful: bool = False) -> None:
         """收掉自己拉起的 server 子进程；无子进程时静默返回。"""
-        proc, self._proc = self._proc, None
-        log_file, self._log_file = self._log_file, None
+        with self._lock:
+            proc, self._proc = self._proc, None
+            log_file, self._log_file = self._log_file, None
         if proc is not None and proc.poll() is None:
             self._kill_tree(proc, graceful=graceful)
         if log_file is not None:

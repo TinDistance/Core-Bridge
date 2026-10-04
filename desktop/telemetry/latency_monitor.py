@@ -1,6 +1,7 @@
 """延迟测量（桌面端探针 + 链路两端状态配合）。"""
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections import deque
@@ -37,6 +38,12 @@ STREAM_METRIC_KEYS = (
 )
 
 STREAM_PRIMARY_KEY = "render_age_ms"
+
+logger = logging.getLogger(__name__)
+
+# 样本「算过期」的阈值。正常节拍是 interval（0.5s），留 10 倍余量；超过就说明
+# 探针线程卡住或已死，面板必须改口报故障而不是继续显示最后一个样本。
+STALE_SAMPLE_FACTOR = 10
 
 
 def _num(v: object, lo: float | None = None) -> float:
@@ -118,11 +125,20 @@ class LatencyMonitor:
         self._stream_provider: Callable[[], dict] | None = None
         self._stream_lock = threading.Lock()
         self._last_client_report = 0.0
+        # 探针自身的健康度。样本可以「很旧」但线程仍活着（服务器全挂），也可以
+        # 线程已经死了而样本还留在 deque 里 —— 面板必须能区分这两种情况，否则
+        # 「探针崩了」会被 forever 渲染成「无信号」（见 LatencyPanel._render_numbers）。
+        self._last_sample_at = 0.0
+        self._error_count = 0
+        self._url_lock = threading.Lock()
+        self._base_url_override: str | None = None
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop.clear()
+        self._error_count = 0
+        self._last_sample_at = time.monotonic()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="latency-probe")
         self._thread.start()
 
@@ -131,6 +147,31 @@ class LatencyMonitor:
         t, self._thread = self._thread, None
         if t is not None and t is not threading.current_thread():
             t.join(timeout=timeout)
+
+    def set_base_url(self, url: str) -> None:
+        """让探针跟随图传面板里改过的 Server 地址。
+
+        没有这个入口时，探针的 URL 在构造那一刻就冻结了，而 StreamPanel 的
+        Server 输入框是可编辑的 —— 改完地址视频跟着变、遥测还在打老地址，
+        表现就是「图传正常但右侧永久无信号」。
+        """
+        with self._url_lock:
+            new = (url or "").strip().rstrip("/") or None
+            if new != self._base_url_override:
+                logger.info("telemetry target -> %s", new or "(unset)")
+                self._base_url_override = new
+
+    def probe_alive(self) -> bool:
+        t = self._thread
+        return t is not None and t.is_alive()
+
+    def sample_age_s(self) -> float:
+        """最新样本的年龄（秒）。没有样本时返回 -1。"""
+        with self._lock:
+            last = self._last_sample_at
+        if last <= 0.0:
+            return -1.0
+        return max(0.0, time.monotonic() - last)
 
     def report_draw(self, draw_ms: float) -> None:
         """绘制耗时（原 report_fetch 的真实语义）；暂与 fetch 共用字段，避免混入 local_ms 需另算。"""
@@ -161,16 +202,36 @@ class LatencyMonitor:
         try:
             with httpx.Client(timeout=3.0, trust_env=False) as client:
                 while not self._stop.is_set():
-                    self._sample_once(client)
+                    try:
+                        self._sample_once(client)
+                    except Exception:
+                        # 这一行是整个遥测面板能不能活下来的关键：任何从
+                        # _sample_once 逃出去的异常都会结束循环、让线程永久消失，
+                        # 而 UI 上只表现为「无信号」，看不出是探针崩了。
+                        # 单次采样失败（服务器重启、端口抖动、返回体不是 dict）绝不能
+                        # 带走整条流水线 —— 记数 + 限频记日志，然后继续下一拍。
+                        self._error_count += 1
+                        if self._error_count in (1, 5) or self._error_count % 50 == 0:
+                            logger.exception(
+                                "latency probe sample failed (#%d)", self._error_count)
                     self._stop.wait(self.interval)
         finally:
             self._thread = None
+            logger.warning("latency probe thread exited (errors=%d)", self._error_count)
+
+    def _resolve_base(self) -> str:
+        """目标地址优先级：set_base_url 覆盖值 > 构造时传入的回调。"""
+        with self._url_lock:
+            override = self._base_url_override
+        if override:
+            return override
+        try:
+            return (self._get_base_url() or "").rstrip("/")
+        except Exception:
+            return ""
 
     def _sample_once(self, client: httpx.Client) -> None:
-        try:
-            base = (self._get_base_url() or "").rstrip("/")
-        except Exception:
-            base = ""
+        base = self._resolve_base()
         if not base:
             self._append(LatencySample(t=time.time(), source="无信号"))
             return
@@ -272,6 +333,7 @@ class LatencyMonitor:
     def _append(self, sample: LatencySample) -> None:
         with self._lock:
             self._samples.append(sample)
+            self._last_sample_at = time.monotonic()
 
     def samples(self) -> list[LatencySample]:
         with self._lock:
@@ -292,7 +354,18 @@ class LatencyMonitor:
         # 统计（日志/底栏）。窗口值不够一个窗口时 covered=False，由面板决定标注。
         win = loss_window_of(samples, span_s=WINDOW_S)
         tot = loss_totals_of(samples)
+        alive = self.probe_alive()
+        age = self.sample_age_s()
+        stale_limit = max(1.0, self.interval * STALE_SAMPLE_FACTOR)
         return {
+            # 探针健康度：线程在跑，且样本没过期。面板用它把「探针崩了/卡住了」
+            # 和「真的没信号」区分开 —— 两者在数据上都只是 live=False。
+            "probe_alive": alive,
+            "sample_age_s": age,
+            "sample_stale": age < 0 or age > stale_limit,
+            "probe_error_count": self._error_count,
+            "probe_last_error": self.last_error,
+
             "current_ms": cur.render_age_ms if cur else -1,
             "render_age_ms": cur.render_age_ms if cur else -1,
             "latency_source": "render_age" if has_render else "unavailable",

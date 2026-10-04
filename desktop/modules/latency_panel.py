@@ -201,12 +201,27 @@ class LatencyPanel(BasePanel):
         self._closed = True
         super().destroy()
 
+    @staticmethod
+    def _probe_fault(st: dict) -> bool:
+        """探针是否已经不能产新样本（线程死了，或样本陈旧到不再可信）。"""
+        if not st.get("probe_alive", True):
+            return True
+        return bool(st.get("sample_stale", False))
+
     def _render_numbers(self, st: dict) -> None:
         cur = st.get("current_ms", -1)
         live = st.get("live", False)
         has_latency = st.get("latency_available", cur >= 0)
+        probe_dead = self._probe_fault(st)
 
-        if not live:
+        # 探针自身没在采样时，「无信号」是误导：它只是最后一个样本被冻住了。
+        # 必须先判这一层，否则线程崩掉会被 forever 读成「K230 没在推流」。
+        if probe_dead:
+            self._num_var.set("—")
+            self._num_label.config(fg=theme.BAD)
+            self._dot.config(fg=theme.BAD)
+            self._state_var.set("探针中断")
+        elif not live:
             self._num_var.set("—")
             self._num_label.config(fg=theme.FAINT)
             self._dot.config(fg=theme.FAINT)
@@ -247,12 +262,21 @@ class LatencyPanel(BasePanel):
         self._cells["stale"].set(_fmt_ms(st.get("staleness_ms", -1)))
         self._cells["local"].set(_fmt_ms(st.get("local_ms", -1)))
         self._cells["jitter"].set(
-            _fmt_ms(st.get("jitter_ms", -1)) if live else "—")
+            _fmt_ms(st.get("jitter_ms", -1)) if live and not probe_dead else "—")
 
         fps = st.get("fps", 0) or 0
-        self._fps_var.set(f"fps {fps:.1f}" if live else "fps —")
+        self._fps_var.set(
+            f"fps {fps:.1f}" if live and not probe_dead else "fps —")
         src = st.get("source") or ""
-        self._foot_var.set(f"{FOOTNOTE}" + (f" · {src}" if src else ""))
+        foot = FOOTNOTE + (f" · {src}" if src else "")
+        if probe_dead:
+            # 把「为什么没有数据」写进界面，而不是让人猜。
+            err = (st.get("probe_last_error") or "").strip()
+            err = err.splitlines()[0][:80] if err else ""
+            n = st.get("probe_error_count", 0)
+            tail = f"探针异常 {n} 次" if n else "采样线程未运行"
+            foot = f"! {tail}{('：' + err) if err else ''}"
+        self._foot_var.set(foot)
 
     def _render_loss(self, win: dict) -> None:
         """丢包段渲染。主数字用**最终**口径（打到画面上的损伤）。

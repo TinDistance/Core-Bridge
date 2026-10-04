@@ -17,6 +17,7 @@ swscale `frame.reformat`），UI 线程每帧只剩 `ImageTk.PhotoImage` + `crea
 """
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import time
@@ -54,6 +55,8 @@ DEFAULT_SRC_SIZE = (1280, 720)
 # 源比例修正死区。等比缩放会引入 < 0.2% 的取整误差（偶数向下取整），
 # 1% 以下的偏差一律不修正，避免每帧微调目标尺寸形成抖动。
 RATIO_TOLERANCE = 0.01
+
+logger = logging.getLogger(__name__)
 
 
 def ratio_changed(new_w: int, new_h: int,
@@ -166,8 +169,11 @@ class StreamPanel(BasePanel):
             try:
                 self._monitor.set_stream_stats_provider(
                     lambda: self._h264.stats() if self._h264 is not None else {})
+                self._monitor.set_base_url(self._server_var.get())
             except Exception:
-                pass
+                # 接线失败必须是响的：provider 没挂上时 render_age 恒 -1，
+                # 面板永远停在「无 render_age」，而画面完全正常。
+                logger.exception("failed to wire telemetry provider")
         self._poll_after = self.after(POLL_INTERVAL_MS, self._poll)
 
     def destroy(self) -> None:  # type: ignore[override]
@@ -190,6 +196,13 @@ class StreamPanel(BasePanel):
 
     def _on_server_changed(self) -> None:
         """地址编辑后重建 viewer（防抖：由下次 _poll 实际执行）。"""
+        # 遥测探针必须跟着一起换目标：否则视频连新地址、探针还在打旧地址，
+        # 面板会永久停在「无信号」，而画面看起来完全正常。
+        if self._monitor is not None:
+            try:
+                self._monitor.set_base_url(self._server_var.get())
+            except Exception:
+                pass
         # 标记强制重建：停掉旧对象，下轮 _ensure 会用新地址创建
         try:
             if self._h264 is not None:

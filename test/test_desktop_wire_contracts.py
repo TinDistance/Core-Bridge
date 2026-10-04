@@ -23,6 +23,7 @@ import os
 import socket
 import struct
 import sys
+import threading
 import time
 
 import pytest
@@ -477,3 +478,128 @@ def test_seq_reset_guards_were_dead_code():
         assert (max_seq - 40000) & 0xFFFF < 0x8000
         assert (max_seq - 40001) & 0xFFFF < 0x8000
     assert HV.SEQ_RESET_MIN_DISTANCE < HV.SEQ_RESET_DISTANCE
+
+
+# ==================================================== 遥测探针的存活契约
+def _probe(base="http://127.0.0.1:1", interval=0.01):
+    m = importlib.import_module("desktop.telemetry.latency_monitor")
+    return m, m.LatencyMonitor(get_base_url=lambda: base, interval=interval)
+
+
+def test_sample_failure_never_kills_the_probe_thread():
+    """回归：`_sample_once` 抛出的任何异常都不得带走探针线程。
+
+    原来的 `_loop` 直接 `self._sample_once(client)` 且不接异常，一次坏样本
+    就让线程永久消失 —— 而 UI 上只表现为「无信号」，图传（裸 UDP）却照常，
+    于是整个右侧遥测再也不会恢复。
+    """
+    m, mon = _probe()
+    calls = {"n": 0}
+
+    def flaky(client):
+        calls["n"] += 1
+        raise RuntimeError("server restarted mid-request")
+
+    mon._sample_once = flaky
+    mon.start()
+    try:
+        deadline = time.monotonic() + 2.0
+        while calls["n"] < 5 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert calls["n"] >= 5, "探针在第一次异常后就退出了"
+        assert mon.probe_alive(), "探针线程已死"
+        assert mon._error_count >= 5
+    finally:
+        mon.stop()
+
+
+def test_stats_flags_a_dead_probe_separately_from_a_dead_stream():
+    """线程死了 + 样本冻结，必须能和「服务器真的没推流」区分开。"""
+    lp = importlib.import_module("desktop.modules.latency_panel")
+    m, mon = _probe()
+    mon._append(m.LatencySample(t=time.time(), live=False))
+    assert mon.sample_age_s() >= 0.0
+
+    # 假装线程已退出（不真的起线程，避免测试依赖网络）
+    mon._thread = None
+    st = mon.stats()
+    assert st["probe_alive"] is False
+    # live=False 依旧成立 —— 正是这一点过去让面板误报「无信号」
+    assert st["live"] is False
+    for key in ("probe_alive", "sample_age_s", "sample_stale",
+                "probe_error_count", "probe_last_error"):
+        assert key in st, f"stats() 缺 {key}"
+    # 线程一死就必须报故障，哪怕样本本身还很新
+    assert lp.LatencyPanel._probe_fault(st) is True
+
+
+def test_stats_flags_a_stalled_probe_via_sample_age():
+    """线程还活着但样本不再更新（卡在 provider/IO）也要报故障。"""
+    lp = importlib.import_module("desktop.modules.latency_panel")
+    m, mon = _probe()
+    mon._thread = threading.current_thread()      # 假装线程活着
+    mon._append(m.LatencySample(t=time.time(), live=True))
+    assert lp.LatencyPanel._probe_fault(mon.stats()) is False
+
+    # 把最后样本的时间戳推到很久以前 = 采样停摆
+    with mon._lock:
+        mon._last_sample_at = time.monotonic() - 999.0
+    st = mon.stats()
+    assert st["probe_alive"] is True
+    assert st["sample_stale"] is True
+    assert lp.LatencyPanel._probe_fault(st) is True
+
+
+def test_latency_panel_reports_probe_fault_instead_of_no_signal():
+    """面板必须先判探针故障，再判无信号。"""
+    lp = importlib.import_module("desktop.modules.latency_panel")
+    dead = {"probe_alive": False, "sample_stale": True,
+            "live": False, "current_ms": -1, "latency_available": False,
+            "probe_error_count": 7, "probe_last_error": "boom"}
+    assert lp.LatencyPanel._probe_fault(dead) is True
+
+    alive = {"probe_alive": True, "sample_stale": False, "live": False}
+    assert lp.LatencyPanel._probe_fault(alive) is False
+
+
+def test_set_base_url_redirects_the_probe():
+    """改图传面板的 Server 地址后，探针必须跟着换目标。"""
+    m, mon = _probe(base="http://old:8000")
+    assert mon._resolve_base() == "http://old:8000"
+    mon.set_base_url("http://new:9000/")
+    assert mon._resolve_base() == "http://new:9000"
+    mon.set_base_url("")
+    assert mon._resolve_base() == "http://old:8000", "空值应回落到构造时的回调"
+
+
+def test_server_manager_start_is_idempotent_for_a_healthy_child(monkeypatch):
+    """重复 start() 不得把正在服务的子进程换掉（换的瞬间所有 HTTP 客户端断链）。"""
+    sm = importlib.import_module("desktop.server_manager")
+
+    class _FakeProc:
+        # 绝不能填一个可能真实存在的 pid：atexit 的 _shutdown_all 会遍历
+        # _LIVE_MANAGERS 并对「活着的」子进程跑 taskkill /T /F。
+        pid = 0
+
+        def poll(self):
+            return None
+
+    killed = []
+    monkeypatch.setattr(sm.ServerManager, "_kill_tree",
+                        lambda self, proc, graceful=False: killed.append(proc.pid))
+    monkeypatch.setattr(sm.ServerManager, "_healthy", lambda self: True)
+
+    mgr = sm.ServerManager(port=8000)
+    mgr._proc = _FakeProc()
+    spawned = []
+    monkeypatch.setattr(mgr, "_spawn", lambda *a, **k: spawned.append(1))
+
+    assert mgr.start() is True
+    assert mgr.start() is True
+    assert not spawned, "健康的子进程被重复拉起了"
+    assert mgr._proc is not None
+
+    # 收尾：别把假进程留在 _LIVE_MANAGERS 里
+    mgr._proc = None
+    mgr.stop()
+    assert not killed

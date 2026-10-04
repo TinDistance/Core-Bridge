@@ -41,7 +41,16 @@ CLIENT_TIMING_KEYS = (
     "drops",
     "loop_us_avg",
     "loop_us_max",
+    "wire_lost",
+    "final_lost",
+    "wire_loss_pct",
+    "final_loss_pct",
 )
+# 计数型（整包）与比率型（%）分开存：`_coerce_ms` 保留 1 位小数，把 `wire_lost`
+# 变成 1234.0 会让 /video/timing 的输出对读数的人产生误导（看着像带小数的量）。
+# 集合必须与 desktop/telemetry/latency_monitor.py 的 STREAM_METRIC_KEYS 一致。
+CLIENT_TIMING_COUNT_KEYS = ("backlog_packets", "backlog_bytes", "drops",
+                            "wire_lost", "final_lost")
 _client_timing: dict[str, float | None] = {k: None for k in CLIENT_TIMING_KEYS}
 _client_timing_at: float = 0.0
 _client_timing_recv: int = 0
@@ -58,6 +67,19 @@ def _coerce_ms(v: object) -> float | None:
     if x != x or x < 0:
         return None
     return round(x, 1)
+
+
+def _coerce_count(v: object) -> float | None:
+    """上报的计数（包数/字节数）→ 非负整数。同样拒绝 NaN/负数/bool。"""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        x = float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if x != x or x < 0:
+        return None
+    return float(int(x))
 
 
 def _client_timing_payload() -> dict[str, float | None]:
@@ -209,7 +231,8 @@ async def timing_client_report(request: Request) -> JSONResponse:
         return JSONResponse({"ok": False, "error": "body must be object"}, status_code=422)
     clean: dict[str, float | None] = {}
     for key in CLIENT_TIMING_KEYS:
-        clean[key] = _coerce_ms(payload.get(key))
+        coerce = _coerce_count if key in CLIENT_TIMING_COUNT_KEYS else _coerce_ms
+        clean[key] = coerce(payload.get(key))
     global _client_timing, _client_timing_at, _client_timing_recv
     _client_timing = clean
     _client_timing_at = time.time()
@@ -237,6 +260,13 @@ async def timing(n: int = Query(default=60, ge=5, le=120)) -> JSONResponse:
         "rtp_live": rs.get("live", False),
         "upstream": rs.get("upstream"),
         "downstreams": rs.get("downstreams", 0),
+        # 上游段（K230→server）丢包：server 自己的数，与客户端上报的下游两级
+        # 分开摆放，别混成一个「丢包率」。只有线上口径（relay 不做重排）。
+        "up_rx": rs.get("up_rx", -1),
+        "up_lost": rs.get("up_lost", 0),
+        "up_gaps": rs.get("up_gaps", 0),
+        "up_resets": rs.get("up_resets", 0),
+        "up_loss_pct": rs.get("up_loss_pct", -1.0),
         "server_time": st["server_time"],
         "client_reported_at": _client_timing_at or None,
         "client_report_age_ms": round((now - _client_timing_at) * 1000.0, 1)

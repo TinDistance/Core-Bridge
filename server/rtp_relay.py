@@ -27,6 +27,7 @@ import logging
 import os
 import select
 import socket
+import struct
 import threading
 import time
 from collections import deque
@@ -71,6 +72,20 @@ DOWNSTREAM_GC_INTERVAL_S = 1.0
 
 SO_RCVBUF_BYTES = 256 << 10
 
+# 上游（K230→server）序号缺口统计用。与 desktop/streaming/h264_viewer.py 的
+# SEQ_RESET_DISTANCE / SEQ_RESET_MIN_DISTANCE 同值同义，故是不复用桌面端的常量：
+# server 不该 import desktop，两侧靠测试钉死同值。
+#
+#   SEQ_RESET_DISTANCE（半个序号空间 32768）= 「取不准」与「真回退」的分界。
+#   SEQ_RESET_MIN_DISTANCE（1/4 空间 8192）= 「缺口」与「上游重启」的分界：
+#     K230 重传环只有 128 个槽，所以**任何真实链路都不可能连续丢 8192 个包**。
+#     这一条不是理论洁癖，是必需的：seq 是 16 位会回绕，从 45000「前进」到 0
+#     在模运算里就是一次 +20536 的合法前进，不加这条判据，一次 K230 重启会被
+#     记成 20536 个假丢失（桌面端当初踩的就是这个坑，见 h264_viewer 的
+#     SEQ_RESET_NOTE）。
+SEQ_RESET_DISTANCE = 0x8000
+SEQ_RESET_MIN_DISTANCE = SEQ_RESET_DISTANCE // 4
+
 
 class RtpRelay:
     def __init__(self, ports: list[int] | tuple[int, ...] = RTP_PORTS) -> None:
@@ -93,6 +108,15 @@ class RtpRelay:
         self._pkts_tx = 0
         self._bytes_rx = 0
         self._ctrl_rx = 0
+        # 上游 RTP 序号跟踪（K230→server 段的丢包口径）。按**入口端口**分桶：
+        # K230 同一 seq 同一包会发往多个入口，用一个共享 max_seq 会把「另一个
+        # 端口的包」判成巨大缺口。
+        self._up_seq: dict[int, int] = {}
+        self._rtp_rx = 0
+        self._up_lost = 0
+        self._up_gaps = 0
+        self._up_dup = 0
+        self._up_resets = 0
         self._frame_id = -1
         self._last_frame_at = 0.0
         self._marker_times: deque[float] = deque(maxlen=240)
@@ -162,6 +186,10 @@ class RtpRelay:
             self._upstreams.clear()
             self._upstream_at.clear()
             self._downstreams.clear()
+            # 序号基线也清：重启后第一个包的序号与停止前无因果关系，
+            # 留着会把中间的整段间隔记成缺口。计数器不清（与 pkts_rx 同语义，
+            # 都是「自进程启动以来」）。
+            self._up_seq.clear()
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -232,6 +260,51 @@ class RtpRelay:
         elif len(data) >= 12 and (data[0] & 0xC0) == 0x80:
             self._on_rtp(data, addr, sock, port)
 
+    def _note_upstream_seq_locked(self, port: int, seq: int) -> None:
+        """按入口端口跟踪上游 RTP 序号，累计缺口。调用方必须持有 ``self._lock``。
+
+        这一段是「线上」口径，且**只有线上口径** —— 中继不做重排：一个被 NACK
+        补回来的重传包在这里看起来只是「乱序」，与真正的重复拷贝无法区分。
+        所以最终损伤必须由下游（``h264_viewer``）的 ``declare_loss`` 来判，
+        面板上这一格也要标注成上游口径。
+
+        三种非前进情形分别记账，都不计入丢包：
+        - ``fwd == 0``：同序号重传（上游重复拷贝）→ dup
+        - 回退但 ``back <= SEQ_RESET_DISTANCE``：半个序号空间内的乱序 → dup，
+          且**不动基线**（否则一个迟到的旧包会把基线拉低，后面正常前进的包
+          全被算成缺口）
+        - 缺口 ``> SEQ_RESET_MIN_DISTANCE`` 或回退超过半个空间：上游重启
+          （seq 回绕 / 归零）→ reset，重新同步基线，**不**当成缺口
+
+        仅接收循环线程调用，且只在持锁时调用。
+        """
+        prev = self._up_seq.get(port)
+        self._rtp_rx += 1
+        if prev is None:
+            self._up_seq[port] = seq
+            return
+        fwd = (seq - prev) & 0xFFFF
+        if fwd == 0:
+            self._up_dup += 1
+        elif fwd < SEQ_RESET_DISTANCE:                 # 序号前进
+            if fwd > SEQ_RESET_MIN_DISTANCE:
+                # 缺口大到不可能是丢包（见常量处的说明）：按上游重启处理。
+                self._up_resets += 1
+                self._up_seq[port] = seq
+            else:
+                if fwd > 1:
+                    self._up_lost += fwd - 1
+                    self._up_gaps += 1
+                self._up_seq[port] = seq
+        else:                                          # 序号回退
+            back = (prev - seq) & 0xFFFF
+            if back > SEQ_RESET_DISTANCE:
+                self._up_resets += 1
+                self._up_seq[port] = seq
+            else:
+                # 乱序 / 迟到重传：基线保持 prev 不动。
+                self._up_dup += 1
+
     def _on_rtp(self, data: bytes, addr: tuple[str, int],
                 sock: socket.socket, port: int) -> None:
         host = addr[0]
@@ -244,6 +317,9 @@ class RtpRelay:
             self._upstream_at[port] = now
             self._gc_downstreams_locked(now)
             targets = list(self._downstreams)
+            # `_on_datagram` 已保证 len(data) >= 12，RTP 头前 4 字节必在。
+            self._note_upstream_seq_locked(
+                port, struct.unpack_from(">H", data, 2)[0])
         if upstream_new:
             logger.info("RTP upstream learned on port %d: %s:%d",
                         port, host, addr[1])
@@ -322,6 +398,10 @@ class RtpRelay:
             bytes_at = list(self._bytes_at)
             pkts_rx, pkts_tx, bytes_rx, ctrl_rx = (
                 self._pkts_rx, self._pkts_tx, self._bytes_rx, self._ctrl_rx)
+            up_seq_seen = len(self._up_seq)
+            rtp_rx, up_lost = self._rtp_rx, self._up_lost
+            up_gaps, up_dup, up_resets = (
+                self._up_gaps, self._up_dup, self._up_resets)
             frame_id, last_frame_at = self._frame_id, self._last_frame_at
             # status 里也 GC downstream，避免上游停流后计数永久 stale
             self._gc_downstreams_locked(now, force=True)
@@ -340,6 +420,10 @@ class RtpRelay:
                 win_span = span
         kbps = win_bytes * 8 / win_span / 1000.0 if bytes_at else 0.0
         primary = self._ports[0]
+        # 上游段丢包率：分母是「本该到达的 RTP 序号数」。没有序号基线（还没收到
+        # 第一个 RTP 包）时给 -1 而不是 0 —— 「没数据」和「没丢过」必须能分开。
+        up_total = rtp_rx + up_lost
+        up_pct = (round(100.0 * up_lost / up_total, 3) if up_total else -1.0)
         upstream, upstream_age = upstreams.get(primary, (None, -1))
         live = (
             upstream is not None
@@ -364,6 +448,16 @@ class RtpRelay:
             "pkts_rx": pkts_rx,
             "pkts_tx": pkts_tx,
             "bytes_rx": bytes_rx,
+            # 上游段（K230→server）丢包：只有线上口径，理由见
+            # _note_upstream_seq_locked。`up_seq_ports` = 已建立序号基线的入口数，
+            # 用来区分「还没收到包」和「收到但没丢」。
+            "up_rx": rtp_rx,
+            "up_lost": up_lost,
+            "up_gaps": up_gaps,
+            "up_dup": up_dup,
+            "up_resets": up_resets,
+            "up_loss_pct": up_pct,
+            "up_seq_ports": up_seq_seen,
             "kbps": round(kbps, 1),
             "ctrl_rx": ctrl_rx,
             "port": primary,

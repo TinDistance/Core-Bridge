@@ -296,13 +296,14 @@ def aus():
     return HV._encode_test_aus(320, 240, 40, noise=True)
 
 
-def test_seq_restart_resyncs_without_polluting_loss_pct(aus):
+def test_seq_restart_resyncs_without_polluting_final_loss(aus):
     """K230 脚本重启 -> seq 跳回 0。
 
-    这是现场真实场景。两件事必须成立：
+    这是现场真实场景。三件事必须成立：
       1. 能重新同步（帧数继续增长）；
-      2. `pkts_lost` 不被伪空洞灌水（旧实现一次就 +2 万，`loss_pct` 永久失真），
-         且 `seq_resets` 计数器真的会涨 —— 原先那两处判据互斥 / 取不到，是死代码。
+      2. `final_lost` 不被伪空洞灌水（旧实现一次就 +2 万，`final_loss_pct`
+         永久失真），`wire_lost` 同样不能 —— 两者都在 seq 重置分支**之后**记账；
+      3. `seq_resets` 计数器真的会涨 —— 原先那两处判据互斥 / 取不到，是死代码。
     """
     src = _Source()
     v = HV.H264Viewer("127.0.0.1", src.sock.getsockname()[1])
@@ -337,8 +338,9 @@ def test_seq_restart_resyncs_without_polluting_loss_pct(aus):
             f"没有重新同步: {before['frames']} -> {after['frames']}"
         assert after["seq_resets"] > before["seq_resets"], \
             "seq 重置没有计数（死代码回归）"
-        assert after["pkts_lost"] - before["pkts_lost"] < 200, \
-            f"pkts_lost 被伪空洞灌水: +{after['pkts_lost']-before['pkts_lost']}"
+        for key in ("final_lost", "wire_lost"):
+            assert after[key] - before[key] < 200, \
+                f"{key} 被伪空洞灌水: +{after[key]-before[key]}"
         assert time.monotonic() - t0 < 1.5, "重同步太慢"
     finally:
         v.stop()

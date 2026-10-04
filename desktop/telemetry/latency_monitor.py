@@ -9,11 +9,19 @@ from typing import Callable
 
 import httpx
 
+from desktop.telemetry.loss_window import WINDOW_S
+from desktop.telemetry.loss_window import window as loss_window_of
+from desktop.telemetry.loss_window import totals as loss_totals_of
+
 WARN_MS = 500.0
 HISTORY = 120
 
 CLIENT_REPORT_MIN_S = 5.0
 
+# 推给 server 的客户端指标。丢包只推**下游**两级（viewer 自己算得出），
+# 上游段（K230→server）由 server 的 relay 自己数，不该让客户端代报 ——
+# 否则两个数据源会打架。集合必须与 server/routers/video.py 的
+# CLIENT_TIMING_KEYS 完全一致（test_desktop_wire_contracts.py 有断言）。
 STREAM_METRIC_KEYS = (
     "render_age_ms",
     "queue_ms",
@@ -22,6 +30,10 @@ STREAM_METRIC_KEYS = (
     "drops",
     "loop_us_avg",
     "loop_us_max",
+    "wire_lost",
+    "final_lost",
+    "wire_loss_pct",
+    "final_loss_pct",
 )
 
 STREAM_PRIMARY_KEY = "render_age_ms"
@@ -60,6 +72,15 @@ class LatencySample:
     drops: float = -1.0
     loop_us_avg: float = -1.0
     loop_us_max: float = -1.0
+
+    # ---- 丢包（下游 = server→桌面，viewer 自己数）----
+    pkts_rx: float = -1.0
+    wire_lost: float = -1.0
+    final_lost: float = -1.0
+
+    # ---- 丢包（上游 = K230→server，server relay 数）----
+    up_rx: float = -1.0
+    up_lost: float = -1.0
 
     fps: float = 0.0
     jitter_ms: float = 0.0
@@ -163,17 +184,21 @@ class LatencyMonitor:
             return
         src = "rtp:8002"
         jpeg_live = bool(data.get("live"))
-        if not jpeg_live:
-            try:
-                t1 = time.monotonic()
-                resp = client.get(f"{base}/video/rtp_status")
-                rtp = resp.json()
-                if rtp.get("live"):
-                    data = rtp
-            except Exception:
-                pass
-            if not data.get("live"):
-                src = "无信号"
+        # 上游段（K230→server）丢包只有 /video/rtp_status 里有，所以**总是**拉一次。
+        # JPEG 链路默认关闭（server/routers/video.py 的 JPEG_ENABLED），实际请求数
+        # 与改造前一致；这里只是把「按需拉」放宽成「都拉」，换来上游口径可用。
+        rtp: dict = {}
+        try:
+            resp = client.get(f"{base}/video/rtp_status")
+            got = resp.json()
+            if isinstance(got, dict):
+                rtp = got
+        except Exception:
+            pass
+        if not jpeg_live and rtp.get("live"):
+            data = rtp
+        if not jpeg_live and not data.get("live"):
+            src = "无信号"
         rtt = (time.monotonic() - t0) * 1000.0
         self.last_error = ""
         live = bool(data.get("live", False))
@@ -194,6 +219,11 @@ class LatencyMonitor:
             drops=_num(ss.get("drops"), lo=0.0),
             loop_us_avg=_num(ss.get("loop_us_avg"), lo=0.0),
             loop_us_max=_num(ss.get("loop_us_max"), lo=0.0),
+            pkts_rx=_num(ss.get("pkts_rx"), lo=0.0),
+            wire_lost=_num(ss.get("wire_lost"), lo=0.0),
+            final_lost=_num(ss.get("final_lost"), lo=0.0),
+            up_rx=_num(rtp.get("up_rx"), lo=0.0),
+            up_lost=_num(rtp.get("up_lost"), lo=0.0),
             fps=_num(data.get("fps"), lo=0.0),
             jitter_ms=_num(data.get("jitter_ms"), lo=0.0),
             frame_id=int(data.get("frame_id", -1) or -1),
@@ -221,7 +251,18 @@ class LatencyMonitor:
             "drops": s.drops,
             "loop_us_avg": s.loop_us_avg,
             "loop_us_max": s.loop_us_max,
+            "wire_lost": s.wire_lost,
+            "final_lost": s.final_lost,
         }
+        # 丢包率由 server 侧按自己收到的时间戳算？还是本端算好送过去？
+        # ——本端算。这里送的是**累计原始计数**，由 server 的 /video/timing 展示；
+        # 百分比由两端各自的窗口函数从计数推出，避免两个地方四舍五入出两个值。
+        if s.wire_lost >= 0 and s.pkts_rx >= 0:
+            body["wire_loss_pct"] = round(
+                100.0 * s.wire_lost / (s.wire_lost + s.pkts_rx), 3)
+        if s.final_lost >= 0 and s.pkts_rx >= 0:
+            body["final_loss_pct"] = round(
+                100.0 * s.final_lost / (s.final_lost + s.pkts_rx), 3)
         body = {k: v for k, v in body.items() if v >= 0}
         try:
             client.post(f"{base}/video/timing/client", json=body)
@@ -247,6 +288,10 @@ class LatencyMonitor:
         queue_vals = [s.queue_ms for s in samples if s.queue_ms >= 0]
         stale_vals = [s.staleness_ms for s in samples if s.staleness_ms >= 0]
         has_render = bool(vals)
+        # 丢包两套口径：窗口值给实时判断（面板主数字/告警色），累计值给长时间
+        # 统计（日志/底栏）。窗口值不够一个窗口时 covered=False，由面板决定标注。
+        win = loss_window_of(samples, span_s=WINDOW_S)
+        tot = loss_totals_of(samples)
         return {
             "current_ms": cur.render_age_ms if cur else -1,
             "render_age_ms": cur.render_age_ms if cur else -1,
@@ -276,6 +321,9 @@ class LatencyMonitor:
             "p50_ms": round(_percentile(vals, 0.5), 1) if vals else -1,
             "p95_ms": round(_percentile(vals, 0.95), 1) if vals else -1,
             "count": len(vals),
+
+            "loss_window": win,
+            "loss_totals": tot,
         }
 
 

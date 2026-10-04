@@ -96,7 +96,7 @@ SEQ_RESET_DISTANCE = 0x8000
 #      —— 两条件互斥（若 seq 落在 max_seq 后方 ≥ 半空间，则反向差值 ≤ 半空间）；
 #   2) `backlog_packets() > SEQ_RESET_DISTANCE` —— 由上面同一条不变量推出。
 # 实测（真实 server.app 子进程 + 假 K230）：seq 从 45000 跳回 0 时
-# seq_resets 始终为 0，而 pkts_lost 一次就 +20536。
+# seq_resets 始终为 0，而 final_lost（当时的 pkts_lost）一次就 +20536。
 # SEQ_RESET_MIN_DISTANCE 取半个序号空间的 1/4：任何真实链路都不可能连续丢
 # 16384 个包（K230 重传环只有 128 个槽），所以 nmiss 达到这个量级只可能是
 # 上游重启 / seq 空间回绕，与「真丢包」在语义上也可区分。
@@ -421,6 +421,12 @@ class H264Viewer:
         self._dropped = 0
         self._pkts_rx = 0
         self._lost_pkts = 0
+        self._wire_lost = 0
+        # 当前空洞已计入「线上丢包」的序号数（不含被 NACK 补回的部分判定）。
+        # 不变量：`playhead_at != 0` ⟺ 有活跃空洞 ⟺ 本值属于那个空洞。
+        # 每个结束空洞的分支都必须 `_end_hole()`，否则下一个空洞会拿上一个的
+        # 基线去比，把新空洞短记成「没有新丢失」。
+        self._hole_nmiss = 0
         self._dup = 0
         self._loss_events = 0
         self._gaps = 0
@@ -617,6 +623,7 @@ class H264Viewer:
             pending_bytes = 0
             # 队列被整体清空（信号中断 / seq 重置）后，NACK 空洞状态不再有意义
             planner.reset()
+            self._end_hole()
             return n
 
         def trim_backlog() -> int:
@@ -660,6 +667,7 @@ class H264Viewer:
             self._drop_events += 1
             playhead = start
             playhead_at = 0.0
+            self._end_hole()
             # 队列被丢过一轮，NACK 空洞记录不再有对应关系（否则被丢掉的空洞
             # 会在下一次 resolve_below 时被误计成 recovered，污染 §8.1 的命中率）
             planner.reset()
@@ -706,6 +714,7 @@ class H264Viewer:
             depack.reset()
             self._lost_pkts += nmiss
             self._loss_events += 1
+            self._end_hole()
             planner.reset()
             request_idr()
 
@@ -860,6 +869,7 @@ class H264Viewer:
             if playhead is not None and playhead not in pending:
                 if not pending:
                     playhead_at = 0.0
+                    self._end_hole()
                     planner.resolve_below(playhead)
                 else:
                     ahead = [s for s in pending if _seq_after(s, playhead)]
@@ -874,8 +884,8 @@ class H264Viewer:
                         # 新流之间看起来是「一个 nmiss 巨大的空洞」。
                         #
                         # 这**不是**丢包，走 declare_loss 会把 nmiss 原样记进
-                        # pkts_lost（实测 ~20536），把 loss_pct 永久污染成一个
-                        # 无意义的数；而且 NACK 出去的 96 个 seq 永远补不回来，
+                        # final_lost（实测 ~20536），把 final_loss_pct 永久污染成
+                        # 一个无意义的数；而且 NACK 出去的 96 个 seq 永远补不回来，
                         # 白白占掉 60 seq/s 的限速额度、白等满 REORDER_S。
                         #
                         # 原先的 seq 重置分支（两条件互斥，见 SEQ_RESET_NOTE）
@@ -897,6 +907,10 @@ class H264Viewer:
                         depack.reset()
                         request_idr()
                     else:
+                        # 线上口径：NACK 请求出去的序号数（含后来补回的那些）。
+                        # 必须在 seq 重置分支**之后** —— 重置时 nmiss 是个巨大的
+                        # 假空洞（实测 ~2 万），记进去会把丢包率永久污染。
+                        self._note_hole(nmiss)
                         # 空洞请求前 NACK_MAX_SEQS_PER_PLAN(96) 个 seq：再深的空洞在
                         # REORDER_S 内也补不回来（K230 环形缓冲只有 128 包），而且总量
                         # 本来就被 60 seq/s 限速卡住。
@@ -914,6 +928,7 @@ class H264Viewer:
                 # 空洞被填上：结算 NACK，命中过的空洞算一次恢复
                 planner.resolve_below(playhead)
                 playhead_at = 0.0
+                self._end_hole()
 
             with self._slock:
                 self._backlog_packets = backlog_packets()
@@ -927,6 +942,7 @@ class H264Viewer:
                 playhead = None
                 max_seq = None
                 playhead_at = 0.0
+                self._end_hole()
                 wait_idr = True
                 depack.reset()
             elif (backlog_packets() > BACKLOG_MIN_PKTS
@@ -1016,12 +1032,16 @@ class H264Viewer:
                 last_stat = now
                 st = self.stats()
                 logger.warning(
-                    "h264 rtp: rx=%d lost=%d(%.2f%%) gaps=%d fixed=%d "
+                    "h264 rtp: rx=%d lost=%d(%.2f%%) wire=%d(%.2f%%) 恢复=%s "
+                    "gaps=%d fixed=%d "
                     "frames=%d dropped=%d fails=%d dup=%d | backlog=%d pkt/"
                     "%dB drops=%d(%d 次) resets=%d | nack=%d pkt/%d seq "
                     "命中=%d 限速丢=%d | render_age=%.0fms "
                     "queue=%.0fms %dkbps loop=%.0f/%.0fus",
-                    st["pkts_rx"], st["pkts_lost"], st["loss_pct"],
+                    st["pkts_rx"], st["final_lost"], st["final_loss_pct"],
+                    st["wire_lost"], st["wire_loss_pct"],
+                    ("n/a" if st["recovery_pct"] < 0
+                     else "%.0f%%" % st["recovery_pct"]),
                     st["gaps_seen"], st["reorder_fixed"], st["frames"],
                     st["dropped_wait_idr"], st["decode_fails"],
                     st["pkts_dup"], st["backlog_packets"], st["backlog_bytes"],
@@ -1030,6 +1050,28 @@ class H264Viewer:
                     st["nack_recovered"], st["nack_rounds_dropped"],
                     st["render_age_ms"], st["queue_ms"], st["bitrate_kbps"],
                     st["loop_us_avg"], st["loop_us_max"])
+
+    def _note_hole(self, nmiss: int) -> None:
+        """把当前空洞缺失的序号数记入「线上丢包」（D3 第一级口径）。
+
+        同一个空洞在 ``REORDER_S`` 窗口内会被**反复**观测到 —— 每轮 select 循环
+        一次，且 ``nmiss`` 随新包到达而变深（后面又丢了几个）。所以按「比上次
+        记过的多出来的部分」累加，一个序号只会被记一次丢失；空洞结束时由
+        ``_end_hole()`` 清零。
+
+        与 ``_lost_pkts``（``declare_loss``，D3 第二级）的区别就是**恢复层**：
+        本计数含后来被 NACK 补回的那些，所以 ``wire - final`` 就是重传救回的量。
+        没有这一层，丢包率只能反映「损伤」，看不到「链路其实丢了多少」。
+
+        仅接收循环线程写入。
+        """
+        if nmiss > self._hole_nmiss:
+            self._wire_lost += nmiss - self._hole_nmiss
+            self._hole_nmiss = nmiss
+
+    def _end_hole(self) -> None:
+        """结束当前空洞（补上 / 判丢 / 队列被清 / seq 重置）。仅接收循环线程写入。"""
+        self._hole_nmiss = 0
 
     @property
     def render_age_ms(self) -> float:
@@ -1084,6 +1126,7 @@ class H264Viewer:
             frames, streaming = self._frames, self._streaming
             decode_fails, dropped = self._decode_fails, self._dropped
             pkts_rx, lost, dup = self._pkts_rx, self._lost_pkts, self._dup
+            wire = self._wire_lost
             loss_events, gaps = self._loss_events, self._gaps
             fixed, drops, drop_ev = self._reorder_fixed, self._drops, self._drop_events
             resets = self._seq_resets
@@ -1092,15 +1135,29 @@ class H264Viewer:
             bitrate, lavg, lmax = self._bitrate_kbps, self._loop_us_avg, self._loop_us_max
         planner = self._nack
         total = pkts_rx + lost
+        wire_total = pkts_rx + wire
+        # 恢复率 = 两级恢复（NACK 重传）实际救回的占比。无线上丢包时 -1，
+        # 不是 0 ——「没丢过」和「丢了一个都没救回」在显示上必须能分开。
+        recovery = -1.0
+        if wire > 0:
+            recovery = round(100.0 * (wire - lost) / wire, 1)
         return {"mode": "h264", "frames": frames,
                 "streaming": streaming,
                 "decode_fails": decode_fails,
                 "dropped_wait_idr": dropped,
                 "pkts_rx": pkts_rx,
-                "pkts_lost": lost,
+                # 最终口径的命名与 `wire_*` 成对（`final_lost` / `wire_lost`），
+                # 三层（viewer / 探针 / 面板）只用这一套词汇。原来叫 `pkts_lost`
+                # 与 `loss_pct`，含义得读完注释才知道，是三个名字说两件事。
+                "final_lost": lost,
+                # 线上口径：链路真实丢过的序号数（含被 NACK 补回的）。
+                "wire_lost": wire,
                 "pkts_dup": dup,
-                "loss_pct": round(100.0 * lost / total, 3)
+                "final_loss_pct": round(100.0 * lost / total, 3)
                 if total else 0.0,
+                "wire_loss_pct": round(100.0 * wire / wire_total, 3)
+                if wire_total else 0.0,
+                "recovery_pct": recovery,
                 "loss_events": loss_events,
                 "gaps_seen": gaps,
                 "reorder_fixed": fixed,
@@ -1136,7 +1193,8 @@ class H264Viewer:
 
 STATS_KEYS = (
     "mode", "frames", "streaming", "decode_fails", "dropped_wait_idr",
-    "pkts_rx", "pkts_lost", "pkts_dup", "loss_pct", "loss_events",
+    "pkts_rx", "final_lost", "wire_lost", "pkts_dup", "final_loss_pct",
+    "wire_loss_pct", "recovery_pct", "loss_events",
     "gaps_seen", "reorder_fixed", "backlog_packets", "backlog_bytes",
     "drops", "drop_events", "seq_resets", "render_age_ms", "queue_ms",
     "bitrate_kbps", "loop_us_avg", "loop_us_max",

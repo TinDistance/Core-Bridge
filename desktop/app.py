@@ -1,6 +1,7 @@
 """主窗口：pit-wall 三段式 —— 顶栏 / 左图传右遥测 / 手柄条 / 底状态条。"""
 from __future__ import annotations
 
+import sys
 import tkinter as tk
 
 from desktop import theme
@@ -191,8 +192,30 @@ class DesktopApp(tk.Tk):
 
 def main() -> None:
     theme.enable_dpi_awareness()
-    app = DesktopApp()
-    app.mainloop()
+    # D5/S6 的桌面侧对应：把 Windows 系统定时器粒度从默认的 ~15.6 ms 降到 1 ms。
+    # Tk 的 after()（StreamPanel 的 8 ms 轮询）与 time.sleep(2 ms)（GamepadPusher
+    # 的发送线程节拍）都受这个粒度限制 —— 见 docs/video-latency-optimization.md
+    # 附录 A.1 与 §2.1 S5/S6。服务端进程入口有同样的接线（不属本文件）。
+    # 未实测：1 ms 是否真的把 Tk after 降到 8 ms 量级，需要实机确认。
+    _high_precision_timer(True)
+    try:
+        app = DesktopApp()
+        app.mainloop()
+    finally:
+        _high_precision_timer(False)
+
+
+def _high_precision_timer(on: bool) -> bool:
+    """启用/撤销 1 ms 系统定时器精度。非 Windows 或调用失败都静默忽略。"""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        fn = ctypes.windll.winmm.timeBeginPeriod if on \
+            else ctypes.windll.winmm.timeEndPeriod
+        return int(fn(1)) == 0
+    except Exception:
+        return False
 
 
 if __name__ == "__main__":

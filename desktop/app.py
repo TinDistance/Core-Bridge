@@ -146,8 +146,14 @@ class DesktopApp(tk.Tk):
                     extra = ""
                     if queue >= 0:
                         extra += f" · 队列 {queue:.0f}ms"
+                    # 「溢出」= 本机积压超预算主动丢弃的包；「丢包」= 链路没送到的
+                    # 包。两者成因完全不同，同一个「丢」字会让人查错方向。
                     if drops >= 0:
-                        extra += f" · 丢 {int(drops)}"
+                        extra += f" · 溢出丢 {int(drops)}"
+                    lw = st.get("loss_window") or {}
+                    fpct = lw.get("final_pct", -1)
+                    if fpct >= 0:
+                        extra += f" · 丢包 {fpct:.3f}%"
                     src = st.get("source") or "rtp:8002"
                     base = (f"{src} · K230→server · fps {st['fps']:.1f}"
                             f" · 帧 #{st['frame_id']}")

@@ -3,6 +3,23 @@
 K230 同帧同 seq 同 SSRC 多拷贝发往多入口端口（8002/8003/8004），
 每条入口独立 socket/独立内核缓冲，互为备份；本中转不按内容去重
 （桌面端按 seq 去重、先到先用），任意入口的包都会扇出到所有下游。
+
+S1（WinError 10054）
+    Windows 上向已关闭端口 `sendto` 会收到 ICMP 端口不可达，同一 socket 的
+    下一次 `recvfrom` 抛 `ConnectionResetError`。旧代码把它当成致命错误直接
+    `return`，线程永久退出；桌面端关闭/重启窗口内必然触发。现在它是**非致命**
+    的（`continue`，继续收），其他 `OSError` 也只 `break` 掉当前 drain 循环
+    而不再退出线程。
+
+S2（S1 的级联）与本模块的 supervision 边界
+    `command_udp.note_video_sender()` 的唯一调用点在 `_on_rtp` 里，也就是
+    「端点学习」和「视频扇出」共用这一个线程。线程一旦异常退出，端点 2.5 s
+    后过期，控制链路随之静默停止——机器人在丢视频的同时丢控制。修好 S1 之后，
+    端点会随下一个 RTP 包自动重新学习，所以 S2 不需要额外代码。
+    但这条不变式依赖于「线程不会死」：任何未预料的新异常都可能重新同时打掉
+    视频和控制。因此 `server/relay_supervisor.py` 的 supervisor 是最后一道保险
+    ——它周期检查线程存活，发现已死就 `start_relay()` 重启并记 error 日志，
+    而不是让链路静默消失。
 """
 from __future__ import annotations
 
@@ -40,10 +57,17 @@ CONTROL_MAGIC = b"CBR"
 CTRL_PING = 0x00
 CTRL_IDR = 0x01
 CTRL_BITRATE = 0x02
+CTRL_NACK = 0x03
 CTRL_PONG = 0x10
 
 UPSTREAM_STALE_S = 5.0
-DOWNSTREAM_STALE_S = 10.0
+# S7: 原 10.0。桌面端每 1 s ping 一次，10 s 只是把 S1 的触发窗口放大 10 倍；
+# 收到新包才会重新注册，缩短到 3 s 不影响扇出连续性（ping 周期仍是阈值的 1/3）。
+DOWNSTREAM_STALE_S = 3.0
+
+# S4: downstream GC 的最小间隔。每包全表扫 + 重建列表是 O(n) 分配，
+# 没必要在每包路径上做；下游集合是慢变量，1 Hz 足够。
+DOWNSTREAM_GC_INTERVAL_S = 1.0
 
 SO_RCVBUF_BYTES = 256 << 10
 
@@ -56,6 +80,10 @@ class RtpRelay:
         self._thread: threading.Thread | None = None
 
         self._lock = threading.Lock()
+        # S4: 端口在 start() 时一次性记录，避免每包 getsockname() 系统调用
+        self._port_of: dict[socket.socket, int] = {}
+        # S4: downstream GC 的上次执行时刻（monotonic）
+        self._last_gc_at: float = 0.0
         # 上游按端口学习：RTP 包来自哪个入口端口，就更新哪个端口的上游
         self._upstreams: dict[int, tuple[str, int]] = {}
         self._upstream_at: dict[int, float] = {}
@@ -77,6 +105,7 @@ class RtpRelay:
         # 旧线程已死但对象残留：先清理再重建，支持重启
         self._thread = None
         self._socks.clear()
+        self._port_of.clear()
         try:
             for port in self._ports:
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -92,6 +121,7 @@ class RtpRelay:
                 s.bind(("0.0.0.0", port))
                 s.settimeout(0)
                 self._socks[port] = s
+                self._port_of[s] = port
         except OSError as e:
             logger.error("RTP relay bind %s failed: %s", self._ports, e)
             for s in self._socks.values():
@@ -100,6 +130,7 @@ class RtpRelay:
                 except Exception:
                     pass
             self._socks.clear()
+            self._port_of.clear()
             return False
         self._stop.clear()
         self._thread = threading.Thread(
@@ -126,6 +157,7 @@ class RtpRelay:
             except Exception:
                 pass
         self._socks.clear()
+        self._port_of.clear()
         with self._lock:
             self._upstreams.clear()
             self._upstream_at.clear()
@@ -138,28 +170,57 @@ class RtpRelay:
                 break
             try:
                 readable, _, _ = select.select(socks, [], [], 0.5)
-            except (OSError, ValueError):
+            except (OSError, ValueError) as e:
+                # 线程在这里退出，交给 relay_supervisor 重启。**必须打出异常本身**：
+                # 只写 "select stopped" 的话，运维只能看到 supervisor 每 2s 刷一条
+                # "thread died"，完全不知道根因（fd 被关？socket 被替换？select 被
+                # monkeypatch？）。supervisor 兜得住存活，但兜不住可观测性。
                 if not self._stop.is_set():
-                    logger.warning("RTP relay select stopped")
+                    logger.warning("RTP relay select stopped (%d ports): %r",
+                                   len(socks), e)
                 break
             for sock in readable:
+                port = self._port_of.get(sock)
+                if port is None:
+                    continue
                 # 非 blocking drain：清空该 socket 后立即轮转，多链同发不互相拖
                 while True:
                     try:
                         data, addr = sock.recvfrom(2048)
+                    except ConnectionResetError:
+                        # S1 Windows: 上一次 sendto 的 ICMP 端口不可达，非致命。
+                        # 必须先于 OSError 判（它是子类）。continue 而不是
+                        # break/return：丢包还在内核缓冲里，继续收。
+                        continue
                     except BlockingIOError:
                         break
                     except OSError as e:
-                        if not self._stop.is_set():
-                            logger.warning("RTP relay recv stopped: %s", e)
-                        return
+                        if self._stop.is_set():
+                            return
+                        logger.warning("RTP relay recv error: %s", e)
+                        break
                     try:
-                        self._on_datagram(data, addr, sock)
+                        self._on_datagram(data, addr, sock, port)
                     except Exception as e:
                         logger.warning("RTP packet handling failed: %s", e)
 
+    def _gc_downstreams_locked(self, now: float, force: bool = False,
+                               keep: tuple[str, int] | None = None) -> None:
+        """丢弃过期的下游。调用方必须持有 self._lock。
+
+        S4: 非 force 时按 DOWNSTREAM_GC_INTERVAL_S 节流，避免每包一次
+        全表扫 + 列表重建（O(n) 分配）。
+        """
+        if not force and now - self._last_gc_at < DOWNSTREAM_GC_INTERVAL_S:
+            return
+        self._last_gc_at = now
+        for a in [a for a, t in self._downstreams.items()
+                  if now - t > DOWNSTREAM_STALE_S]:
+            if a != keep:
+                del self._downstreams[a]
+
     def _on_datagram(self, data: bytes, addr: tuple[str, int],
-                     sock: socket.socket) -> None:
+                     sock: socket.socket, port: int) -> None:
         if len(data) < 4:
             return
         with self._lock:
@@ -169,11 +230,10 @@ class RtpRelay:
         if data[:3] == CONTROL_MAGIC:
             self._on_control(data, addr)
         elif len(data) >= 12 and (data[0] & 0xC0) == 0x80:
-            self._on_rtp(data, addr, sock)
+            self._on_rtp(data, addr, sock, port)
 
     def _on_rtp(self, data: bytes, addr: tuple[str, int],
-                sock: socket.socket) -> None:
-        port = sock.getsockname()[1]
+                sock: socket.socket, port: int) -> None:
         host = addr[0]
         upstream_new = False
         now = time.monotonic()
@@ -182,9 +242,7 @@ class RtpRelay:
                 self._upstreams[port] = (host, addr[1])
                 upstream_new = True
             self._upstream_at[port] = now
-            for a in [a for a, t in self._downstreams.items()
-                      if now - t > DOWNSTREAM_STALE_S]:
-                del self._downstreams[a]
+            self._gc_downstreams_locked(now)
             targets = list(self._downstreams)
         if upstream_new:
             logger.info("RTP upstream learned on port %d: %s:%d",
@@ -219,11 +277,9 @@ class RtpRelay:
         upstreams: dict[tuple[str, int], float] = {}
         with self._lock:
             self._downstreams[addr] = now
-            # 顺手 GC：上游停流后 downstream 不再永久 stale
-            for a in [a for a, t in self._downstreams.items()
-                      if now - t > DOWNSTREAM_STALE_S]:
-                if a != addr:
-                    del self._downstreams[a]
+            # 顺手 GC：上游停流后 downstream 不再永久 stale（NACK 让这条
+            # 路径的包率不再可忽略，所以同样走节流 GC）
+            self._gc_downstreams_locked(now, keep=addr)
             for port, up in self._upstreams.items():
                 age = now - self._upstream_at.get(port, 0.0)
                 if age <= UPSTREAM_STALE_S:
@@ -234,9 +290,11 @@ class RtpRelay:
                 self._send_from_lock(data[:3] + bytes([CTRL_PONG]), addr)
             except OSError:
                 pass
-        elif kind in (CTRL_IDR, CTRL_BITRATE):
+        elif kind in (CTRL_IDR, CTRL_BITRATE, CTRL_NACK):
             # CBR 指令转发给所有活跃上游（通常同一 K230 源 socket，
-            # 重复无害：IdrGate 在 K230 侧限频合并）
+            # 重复无害：IdrGate 在 K230 侧限频合并）。
+            # NACK(0x03) 走同一条路：接收端发往服务端 RTP 端口，被当作
+            # CBR 包注册为下游后原样上行（整个 data，不截断）。
             for up in upstreams:
                 try:
                     self._send_from_lock(data, up)
@@ -266,9 +324,7 @@ class RtpRelay:
                 self._pkts_rx, self._pkts_tx, self._bytes_rx, self._ctrl_rx)
             frame_id, last_frame_at = self._frame_id, self._last_frame_at
             # status 里也 GC downstream，避免上游停流后计数永久 stale
-            for a in [a for a, t in self._downstreams.items()
-                      if now - t > DOWNSTREAM_STALE_S]:
-                del self._downstreams[a]
+            self._gc_downstreams_locked(now, force=True)
             upstreams = {
                 p: (self._upstreams.get(p),
                     round(now - self._upstream_at.get(p, 0.0), 2)

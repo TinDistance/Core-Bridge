@@ -11,6 +11,7 @@ from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from server import command_udp
+from server import command_udp_in
 from server.rtp_relay import relay_status
 from server.rtp_relay import SO_RCVBUF_BYTES
 from server.video_hub import hub
@@ -21,6 +22,13 @@ router = APIRouter(prefix="/video", tags=["video"])
 
 UDP_PORT = int(os.environ.get("CORE_BRIDGE_VIDEO_UDP_PORT", "8001"))
 UDP_HOST = os.environ.get("CORE_BRIDGE_VIDEO_UDP_HOST", "0.0.0.0")
+
+# S8: JPEG 链路（video_hub、UDP 8001、/video/latest.jpg、/video/mjpeg）默认关闭。
+# K230 只推 H.264 裸 RTP（JPEG 已不再发送），留着这条链只占一个 UDP 端口、
+# 一个 asyncio transport 和两个永远返回 404/空流的路由。
+# 需要临时抓图调试时：CORE_BRIDGE_ENABLE_JPEG=1
+JPEG_ENABLED = os.environ.get("CORE_BRIDGE_ENABLE_JPEG", "0") not in (
+    "0", "", "false", "False")
 
 
 _transport: asyncio.DatagramTransport | None = None
@@ -80,8 +88,25 @@ class _VideoProtocol(asyncio.DatagramProtocol):
 
 
 async def start_udp_listener(host: str = UDP_HOST, port: int = UDP_PORT) -> bool:
-    """在 server lifespan 中调用；端口被占则记错但不让 HTTP 挂掉。返回是否成功。"""
+    """JPEG 链路的 UDP 监听（UDP 8001）。
+
+    在 server lifespan 中调用；端口被占则记错但不让 HTTP 挂掉。返回是否成功。
+
+    S8：JPEG 链路默认关闭，此时直接返回 True 而不绑定端口——注意
+    `command_udp.start_command_udp()` 已从这里移出（S8 前它挂在监听成功
+    之后，JPEG 一禁用推送线程就跟着死了），改由 `start_command_pusher()`
+    独立拉起。
+
+    接线约定（A2）：`start_command_pusher()` / `stop_command_pusher()`
+    需要接到 `server/app.py` 的 lifespan 里，由主控 agent 完成，本模块不
+    自行启动任何东西。启停顺序应为
+    `start_command_pusher()` → `start_udp_listener()`，
+    停止时 `stop_udp_listener()`（内部已含 `stop_command_pusher()`）。
+    """
     global _transport
+    if not JPEG_ENABLED:
+        logger.info("JPEG chain disabled (CORE_BRIDGE_ENABLE_JPEG=1 to enable)")
+        return True
     if _transport is not None:
         return True
     loop = asyncio.get_running_loop()
@@ -101,17 +126,51 @@ async def start_udp_listener(host: str = UDP_HOST, port: int = UDP_PORT) -> bool
             sock_obj = None
         _transport = transport
         logger.info("video UDP listening on %s:%d", host, port)
-        # 命令推送使用独立 socket，不再跨线程复用 asyncio transport 的底层 socket
-        command_udp.start_command_udp()
         return True
     except Exception as e:
         logger.error("video UDP bind %s:%d failed: %s", host, port, e)
         return False
 
 
+def start_command_pusher() -> bool:
+    """启动 K230 命令推送线程（薄封装 `command_udp.start_command_udp()`）。
+
+    目标端点仍由 `command_udp.note_video_sender()` 学习——H264 路径由
+    `rtp_relay._on_rtp` 调用，JPEG 路径由 `_VideoProtocol` 调用；JPEG 关闭
+    不影响 H264 路径继续学习。
+
+    接线约定（A2）：必须在 lifespan 中显式调用，本模块不自动拉起（否则
+    「是否启用」与「谁负责启停」两件事耦合在一起，很容易再次出现
+    「监听失败 => 推送线程也没了」这种级联）。返回是否成功启动。
+    """
+    try:
+        command_udp.start_command_udp()
+        return True
+    except Exception as e:
+        logger.error("command pusher start failed: %s", e)
+        return False
+
+
+def stop_command_pusher() -> None:
+    """停止命令推送线程（薄封装 `command_udp.stop_command_udp()`）。
+
+    接线约定（A2）：由 lifespan 的 finally 调用。`stop_udp_listener()` 也会
+    调用它，两者都调用是幂等的（A1 的「JPEG 关闭时仍要停干净」依赖这一点）。
+    """
+    try:
+        command_udp.stop_command_udp()
+    except Exception as e:
+        logger.warning("command pusher stop failed: %s", e)
+
+
 async def stop_udp_listener() -> None:
+    """停止 JPEG UDP 监听，并顺带停掉命令推送线程。
+
+    接线约定（A2）：lifespan 的 finally 里调用即可，无需再单独调用
+    `stop_command_pusher()`（幂等）。
+    """
     global _transport
-    command_udp.stop_command_udp()
+    stop_command_pusher()
     t, _transport = _transport, None
     if t is not None:
         t.close()
@@ -124,8 +183,19 @@ async def status() -> JSONResponse:
 
 @router.get("/rtp_status")
 async def rtp_status() -> JSONResponse:
-    """H264 裸 RTP 中转状态（server/rtp_relay.py，udp:8002）。"""
-    return JSONResponse(relay_status())
+    """H264 裸 RTP 中转状态（server/rtp_relay.py，udp:8002）。
+
+    同时带上 `command_udp_in` 的诊断（§4.4 方案 A 的主控制通道）。桌面端
+    `telemetry/latency_monitor.py` 只读自己关心的键，新增字段是纯附加的。
+    没有这块可观测性时，UDP 命令通道是「静默降级」：面板看不出
+    `CORE_BRIDGE_CMD_UDP=0`、端口被占、还是客户端包全被判坏。
+    """
+    payload = dict(relay_status())
+    try:
+        payload["command_udp_in"] = command_udp_in.command_udp_in_status()
+    except Exception as e:      # 诊断绝不能把 /rtp_status 变成 500
+        payload["command_udp_in"] = {"error": str(e)}
+    return JSONResponse(payload)
 
 
 @router.post("/timing/client")

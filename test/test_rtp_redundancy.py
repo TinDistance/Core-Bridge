@@ -97,24 +97,32 @@ class FakePacer:
 
 def test_frame_admission_copies_adaptive():
     rp = _load_k230()
-    # T1 单链路口径：BIT_RATE=3000kbps/30fps -> 每帧 payload 12500B，
-    # MAX_PAYLOAD=1400 -> npkts = ceil(12500/1400) = 9 包。
-    # 单拷 airtime = (12500 + 9*40)*8 / WIFI_LINK_KBPS(8000kbps)
-    #               = 12860*8/8000 = 12.86ms
+    # 拷贝阶梯要能在**默认档位**上同时验到 2 拷和 1 拷两条分支，所以第一个用例
+    # 刻意用比标称帧小的 payload：默认档是 T3/10 Mbps（见
+    # test_bandwidth_budget_math），标称帧 25000B 的单拷 airtime 已经是 20.6ms，
+    # 2 拷 41.2ms 直接超 31.35ms 预算 —— 拿它验「能发 2 拷」会失败，但那不代表
+    # 阶梯坏了，只代表这个档位下 2 拷本来就贵。
+    #
+    # 13000B/10 包：单拷 = (13000 + 10*40)*8/10000 = 10.72ms
     # 预算 = FRAME_INTERVAL_MS(33) * MAX_PFRAME_DUTY(0.95) = 31.35ms
-    # 2 拷 = 25.72ms <= 31.35 -> 发 2 拷；3 拷 = 38.58ms 超预算。
+    # 2 拷 = 21.44ms <= 31.35 -> 发 2 拷；3 拷 = 32.16ms 超预算。
     action, copies, air = rp.frame_admission(
-        12500, 9, False, rp.WIFI_LINK_KBPS, rp.FRAME_INTERVAL_MS,
+        13000, 10, False, rp.WIFI_LINK_KBPS, rp.FRAME_INTERVAL_MS,
         rp.MAX_PFRAME_DUTY, None, max_copies=3, idr_copies=2)
     assert action == rp.FRAME_SEND
     assert copies == 2
-    # airtime_ms 的单位就是 ms：wire*8/link_kbps = 12860*8/8000 = 12.86ms
-    assert abs(air - 2 * (12500 + 9 * 40) * 8.0 / 8000) < 0.01
+    # airtime_ms 的单位就是 ms，返回值是**所有拷贝之和**：
+    # 13400*8/10000 = 10.72ms/拷，2 拷 = 21.44ms
+    assert abs(air - 2 * (13000 + 10 * 40) * 8.0 / 10000) < 0.01
 
-    # 大 P 帧 20000B/16 包：单拷 = (20000+16*40)*8/8000 = 20.64ms，
-    # 2 拷 41.3ms 超预算 -> 只发 1 拷
+    # 默认档（T3）的标称帧：25000B/18 包 -> 单拷 = (25000+18*40)*8/10000
+    # = 20.58ms，2 拷 41.2ms 超预算 -> 只发 1 拷。
+    # 这条是 T3 默认档的**预期行为**，不是回归：它说明 1080p 在 10 Mbps 上已经
+    # 没有多拷贝冗余的余量，一次丢包就是一整个 1080p 帧。
+    nominal = rp.BIT_RATE * 1000 // 8 // rp.FPS
+    nominal_pkts = -(-nominal // rp.MAX_PAYLOAD)
     action, copies, air = rp.frame_admission(
-        20000, 16, False, rp.WIFI_LINK_KBPS, rp.FRAME_INTERVAL_MS,
+        nominal, nominal_pkts, False, rp.WIFI_LINK_KBPS, rp.FRAME_INTERVAL_MS,
         rp.MAX_PFRAME_DUTY, None, max_copies=3, idr_copies=2)
     assert action == rp.FRAME_SEND and copies == 1
 
@@ -132,7 +140,7 @@ def test_frame_admission_copies_adaptive():
 
     # 生产默认：单链路单拷贝（K1）—— 拷贝数不再 >1
     action, copies, _ = rp.frame_admission(
-        12500, 9, False, rp.WIFI_LINK_KBPS, rp.FRAME_INTERVAL_MS,
+        13000, 10, False, rp.WIFI_LINK_KBPS, rp.FRAME_INTERVAL_MS,
         rp.MAX_PFRAME_DUTY, None,
         max_copies=rp.LINK_COPIES, idr_copies=rp.IDR_COPIES)
     assert rp.LINK_COPIES == 1 and rp.IDR_COPIES == 1
@@ -221,20 +229,24 @@ def test_bandwidth_budget_math():
     # 单链路预算：节流池 = 实测可用带宽 × duty（K6，不再是硬编码 15Mbps）
     wire_kbps = rp.PACER_WIRE_KBPS
     assert wire_kbps == int(rp.WIFI_LINK_KBPS * rp.PACER_DUTY)
-    assert (rp.WIFI_LINK_KBPS, rp.PACER_DUTY, wire_kbps) == (8000, 0.9, 7200)
+    assert (rp.WIFI_LINK_KBPS, rp.PACER_DUTY, wire_kbps) == (10000, 0.9, 9000)
     assert rp.PACER_SPAN_MAX_MS == 80          # K5：原 300ms
     assert rp.GOP_LEN == 60                    # K5：长 GOP
-    assert rp.BIT_RATE == 3000                 # T1
+    assert rp.BIT_RATE == 6000                 # 默认档 T3
 
-    p_payload = rp.BIT_RATE * 1000 / 8 // rp.FPS   # 12500B
-    npkts = -(-p_payload // rp.MAX_PAYLOAD)        # 9
+    p_payload = rp.BIT_RATE * 1000 / 8 // rp.FPS   # 25000B
+    npkts = -(-p_payload // rp.MAX_PAYLOAD)        # 18
     single_air = rp.airtime_ms(p_payload, npkts, rp.WIFI_LINK_KBPS)
-    assert abs(single_air - 12.86) < 0.01
+    assert abs(single_air - 20.58) < 0.01
     assert single_air * rp.LINK_COPIES <= rp.FRAME_INTERVAL_MS * rp.MAX_PFRAME_DUTY
 
     # 文档 §1.1 的线上速率公式：码率 ×(1 + 40/载荷)× 1.1 ≤ 可用带宽的 70%
     online = rp.BIT_RATE * (1 + 40.0 / rp.MAX_PAYLOAD) * 1.1
     assert online <= 0.7 * rp.WIFI_LINK_KBPS
+    # 默认档 T3 在默认 10 Mbps 上只剩 3% 余量（6788.6 / 7000）。把这条钉住是
+    # 为了让「改 BIT_RATE / payload / WIFI_LINK_KBPS 任一个」时余量被吃掉这件事
+    # 必须显式改测试，而不是悄悄把 §1.1 的预算表撑破。
+    assert online > 0.9 * 0.7 * rp.WIFI_LINK_KBPS, "默认档带宽余量已不足 10%"
 
 
 # ---------- K2：按时钟丢帧的闸门必须不存在 ----------
@@ -641,11 +653,17 @@ def test_tier_table_maps_to_resolution_and_bitrate():
     for tier, (w, h, br) in rp.TIERS.items():
         s = rp.resolve_settings({"ssid": "a", "password": "b", "tier": tier})
         assert (s["width"], s["height"], s["bit_rate"]) == (w, h, br)
-    # 缺 tier -> 默认 T1（1280x720 / 3000kbps）
+    # 缺 tier -> 落到 DEFAULT_TIER（当前 T3 = 1920x1080 / 6000kbps）。
+    # 这里刻意跟 DEFAULT_TIER / DEFAULT_WIFI_LINK_KBPS 走而不是写死字面量：
+    # 换默认档是产品决定，不该被测试挡下；但「默认值必须能解析成一个真档位」
+    # 和「默认带宽必须 >= 该档的最低要求」是硬约束，继续断言。
     s = rp.resolve_settings({"ssid": "a", "password": "b"})
-    assert (s["tier"], s["width"], s["height"], s["bit_rate"]) == (
-        "T1", 1280, 720, 3000)
-    assert s["link_kbps"] == 8000
+    assert s["tier"] == rp.DEFAULT_TIER
+    w, h, br = rp.TIERS[rp.DEFAULT_TIER]
+    assert (s["width"], s["height"], s["bit_rate"]) == (w, h, br)
+    assert s["link_kbps"] == rp.DEFAULT_WIFI_LINK_KBPS
+    assert not s["warnings"], "默认档 + 默认带宽不该触发带宽不足告警"
+    assert rp.DEFAULT_WIFI_LINK_KBPS >= rp.TIER_MIN_LINK_KBPS[rp.DEFAULT_TIER]
     # 未知档位 -> RuntimeError
     try:
         rp.resolve_settings({"ssid": "a", "password": "b", "tier": "T9"})

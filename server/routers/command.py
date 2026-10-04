@@ -12,6 +12,24 @@ router = APIRouter(prefix="/command", tags=["command"])
 
 _NEUTRAL_HEX = "00800080008000800000000000000000"
 
+# 命令快照过期阈值。与 `server/command_udp.py:COMMAND_STALE_S` 和
+# `server/command_udp_in.py:CMD_SILENCE_S` 必须同值（S3）。
+#
+# 之前这里是硬编码的 1.0 s，与实际下发用的 0.3 s 不一致：客户端在 0.3–1.0 s
+# 之间停止推送时，**服务端早已停发**（K230 侧保持上一条），但 `connected` 仍
+# 报 True —— 面板会把「实际已无控制」显示成「已连接」。这条判据必须和真正
+# 决定「还发不发」的那个阈值同源。
+#
+# 导入 command_udp 会在模块级起循环引用（command_udp 顶层 import 本模块的
+# `snapshot`），所以用延迟 import 取常量，避免 import 顺序依赖。
+def _stale_s() -> float:
+    try:
+        from server import command_udp
+
+        return float(command_udp.COMMAND_STALE_S)
+    except Exception:
+        return 0.3
+
 _VALID_CMD_NAMES = ("MOVE", "TURRET")
 
 _lock = threading.Lock()
@@ -181,7 +199,10 @@ async def get_command() -> JSONResponse:
     out = _decoded(raw_hex)
     cmds = _resolve_cmds(raw_hex, cmds)
     age_ms = round((now - updated_at) * 1000.0, 1) if updated_at else -1.0
-    connected = bool(updated_at and (now - updated_at) < 1.0)
+    # S3：与真正决定「还发不发」的阈值同源（COMMAND_STALE_S = 0.3）。
+    # 桌面端 UDP 保活 50 ms，0.3 s 有 6 倍余量；旧客户端 0.5 s 心跳在这个阈值下
+    # 会被判失联（见 docs/video-latency-optimization.md §4.4 的上线风险）。
+    connected = bool(updated_at and (now - updated_at) < _stale_s())
     out.update({
         "cmds": cmds,
         "slot": slot,

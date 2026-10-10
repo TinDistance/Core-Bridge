@@ -282,7 +282,7 @@ def send_packet(sock, packet, stats):
     while True:
         attempts += 1
         try:
-            sock.send(packet)
+            sock.sendto(packet, (SERVER_IP, RTP_PORT))
         except TypeError:
             if attempts >= SEND_RETRY_LIMIT:
                 raise SendAborted("Socket rejected packet type")
@@ -357,7 +357,7 @@ def retransmit_nack(sequences, packet_ring, limiter, sock, now_ms, stats, comman
             budget_drops += 1
             continue
         try:
-            sock.send(packet)
+            sock.sendto(packet, (SERVER_IP, RTP_PORT))
         except OSError:
             errors += 1
             continue
@@ -775,7 +775,6 @@ def create_socket():
         sock.bind(("0.0.0.0", 0))
     except Exception:
         pass
-    sock.connect((SERVER_IP, RTP_PORT))
     return sock
 
 

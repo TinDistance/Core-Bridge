@@ -217,6 +217,10 @@ async def rtp_status() -> JSONResponse:
         payload["command_udp_in"] = command_udp_in.command_udp_in_status()
     except Exception as e:      # 诊断绝不能把 /rtp_status 变成 500
         payload["command_udp_in"] = {"error": str(e)}
+    try:
+        payload["command_udp"] = command_udp.command_udp_status()
+    except Exception as e:
+        payload["command_udp"] = {"error": str(e)}
     return JSONResponse(payload)
 
 

@@ -97,7 +97,8 @@ class DesktopApp(tk.Tk):
         self.log_panel = LogPanel(side, default_server=base_url)
         self.log_panel.grid(row=1, column=0, sticky="nsew")
 
-        self.gamepad_panel = GamepadPanel(main, pusher=self._gamepad)
+        self.gamepad_panel = GamepadPanel(main, pusher=self._gamepad,
+                                          get_base_url=lambda: base_url)
         self.gamepad_panel.grid(row=1, column=0, columnspan=2,
                                 sticky="ew", pady=(10, 0))
 

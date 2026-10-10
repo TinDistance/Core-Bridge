@@ -360,6 +360,23 @@ def _current_endpoint() -> tuple[str, int] | None:
         return _endpoint
 
 
+def command_udp_status() -> dict:
+    """K230 下行推送诊断（供 /video/rtp_status 透出，面板看执行状态用）。"""
+    with _lock:
+        endpoint = _endpoint
+        endpoint_age_ms = round(
+            (time.monotonic() - _endpoint_at) * 1000.0, 1) \
+            if _endpoint is not None else -1.0
+    thread_alive = bool(_thread is not None and _thread.is_alive())
+    return {
+        "thread_alive": thread_alive,
+        "hz": DEFAULT_HZ,
+        "endpoint": f"{endpoint[0]}:{endpoint[1]}" if endpoint else None,
+        "endpoint_age_ms": endpoint_age_ms,
+        "stale_s": COMMAND_STALE_S,
+    }
+
+
 def _snapshot_fresh(max_age_s: float = COMMAND_STALE_S) -> dict | None:
     """返回新鲜快照；过期返回 None（调用方该周期不发送，触发 K230 自停）。"""
     try:

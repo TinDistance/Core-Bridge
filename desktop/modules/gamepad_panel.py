@@ -1,20 +1,93 @@
 """手柄面板：xinput_gui.py 的 pit-wall 版 —— 操作手的另一只眼睛。"""
 from __future__ import annotations
 
+import threading
+import time
 import tkinter as tk
+
+import httpx
 
 from desktop import theme
 from desktop.gamepad import xinput as xi
 from desktop.modules.base_panel import BasePanel
 
 _HAT = xi.HAT_NAMES
-# 按键灯统一复用 xi.LAMPS_13，避免双定义漂移
+
+SERVER_POLL_S = 0.5
+
+_YAW_TEXT = {0: "停", 1: "右转", 2: "左转"}
+_PITCH_TEXT = {0: "停", 1: "上仰", 2: "下俯"}
+_REAR_TEXT = {0: "停", 1: "顺时针", 2: "逆时针"}
+
+
+def format_server_line(state: dict) -> tuple[str, str]:
+    if not state or not state.get("base_url"):
+        return "服务端 -- 等待地址", "mute"
+    if not state.get("ok"):
+        err = (state.get("error") or "连接失败")[:60]
+        return f"服务端 ✕ {err}", "bad"
+    cmd = state.get("command") or {}
+    udp_in = state.get("udp_in") or {}
+    udp_out = state.get("udp_out") or {}
+    if cmd:
+        if cmd.get("connected"):
+            cmd_text = (f"服务端● seq={cmd.get('seq', 0)} "
+                        f"count={cmd.get('count', 0)} "
+                        f"age={cmd.get('age_ms', -1)}ms")
+            level = "ok"
+        else:
+            cmd_text = f"服务端○ 失联 age={cmd.get('age_ms', -1)}ms"
+            level = "warn"
+    else:
+        cmd_text = "服务端○ 无 /command"
+        level = "warn"
+    rx = udp_in.get("rx", -1)
+    tx = udp_in.get("tx", -1)
+    endpoint = udp_out.get("endpoint")
+    if rx >= 0 or tx >= 0:
+        link_text = f"UDP入 rx={rx} tx={tx}"
+        bad = int(udp_in.get("dropped_bad", 0) or 0)
+        stale = int(udp_in.get("dropped_stale", 0) or 0)
+        if bad or stale:
+            link_text += f" 丢坏={bad}/乱序={stale}"
+    else:
+        link_text = "UDP入 --"
+    exec_text = f"K230→{endpoint}" if endpoint else "K230端点未学习"
+    if not udp_out.get("thread_alive", True):
+        exec_text += "（推送线程停）"
+        level = "bad" if level == "ok" else level
+    return f"{cmd_text} · {link_text} · {exec_text}", level
+
+
+def fetch_server_state(client: httpx.Client, base_url: str) -> dict:
+    state: dict = {"base_url": base_url, "ok": False, "at": time.time()}
+    try:
+        resp = client.get(f"{base_url}/command", timeout=2.0)
+        state["command"] = resp.json() if resp.status_code == 200 else None
+    except Exception as e:
+        state["error"] = str(e)[:80]
+        return state
+    try:
+        resp = client.get(f"{base_url}/video/rtp_status", timeout=2.0)
+        if resp.status_code == 200:
+            body = resp.json()
+            state["udp_in"] = body.get("command_udp_in")
+            state["udp_out"] = body.get("command_udp")
+    except Exception:
+        pass
+    state["ok"] = True
+    return state
 
 
 class GamepadPanel(BasePanel):
-    def __init__(self, master, pusher=None, **kwargs) -> None:
+    def __init__(self, master, pusher=None, get_base_url=None, **kwargs) -> None:
         self._pusher = pusher
+        self._get_base_url = get_base_url
         self._closed = False
+        self._server_lock = threading.Lock()
+        self._server_state: dict = {}
+        self._server_stop = threading.Event()
+        self._server_thread: threading.Thread | None = None
         super().__init__(master, title="GAMEPAD · 手柄", **kwargs)
 
     def build(self) -> None:
@@ -101,6 +174,11 @@ class GamepadPanel(BasePanel):
                                   bg="#0B0F16", fg=theme.MUTE,
                                   font=("Consolas", 10, "bold"))
         self._link_lbl.pack(anchor="w", padx=8, pady=(2, 0))
+        self._server_var = tk.StringVar(value="服务端 -- 等待地址")
+        self._server_lbl = tk.Label(prof, textvariable=self._server_var,
+                                    bg="#0B0F16", fg=theme.MUTE,
+                                    font=("Consolas", 10, "bold"))
+        self._server_lbl.pack(anchor="w", padx=8, pady=(2, 0))
         self._detail_var = tk.StringVar(value="")
         tk.Label(prof, textvariable=self._detail_var, bg="#0B0F16",
                  fg=theme.MUTE, font=("Consolas", 8)).pack(
@@ -111,7 +189,50 @@ class GamepadPanel(BasePanel):
             self._pill_var.set("无 XInput")
             self._pill.config(fg=theme.MUTE, bg="#232E42")
 
+        self._start_server_poll()
         self.after(50, self._tick)
+
+    def _base_url(self) -> str:
+        try:
+            return (self._get_base_url() or "").rstrip("/") if self._get_base_url else ""
+        except Exception:
+            return ""
+
+    def _start_server_poll(self) -> None:
+        if self._server_thread is not None and self._server_thread.is_alive():
+            return
+        self._server_stop.clear()
+        self._server_thread = threading.Thread(
+            target=self._server_loop, daemon=True, name="gamepad-server-poll")
+        self._server_thread.start()
+
+    def _server_loop(self) -> None:
+        try:
+            with httpx.Client(trust_env=False) as client:
+                while not self._server_stop.is_set():
+                    base = self._base_url()
+                    if base:
+                        try:
+                            state = fetch_server_state(client, base)
+                        except Exception as e:
+                            state = {"base_url": base, "ok": False,
+                                     "error": str(e)[:80], "at": time.time()}
+                        with self._server_lock:
+                            self._server_state = state
+                    if self._server_stop.wait(SERVER_POLL_S):
+                        break
+        finally:
+            self._server_thread = None
+
+    def server_snapshot(self) -> dict:
+        with self._server_lock:
+            return dict(self._server_state)
+
+    def stop(self) -> None:
+        try:
+            self._server_stop.set()
+        except Exception:
+            pass
 
     def _tick(self) -> None:
         if getattr(self, "_closed", False):
@@ -119,6 +240,7 @@ class GamepadPanel(BasePanel):
         try:
             if self._pusher is not None:
                 self._render(self._pusher.snapshot())
+            self._render_server()
         except tk.TclError:
             return
         finally:
@@ -129,14 +251,11 @@ class GamepadPanel(BasePanel):
 
     def destroy(self) -> None:  # type: ignore[override]
         self._closed = True
+        try:
+            self.stop()
+        except Exception:
+            pass
         super().destroy()
-
-_YAW_TEXT = {0: "停", 1: "右转", 2: "左转"}
-_PITCH_TEXT = {0: "停", 1: "上仰", 2: "下俯"}
-_REAR_TEXT = {0: "停", 1: "顺时针", 2: "逆时针"}
-
-
-class GamepadPanel(BasePanel):
 
     def _set_lamp(self, name: str, on: bool) -> None:
         lbl = self._lamps.get(name)
@@ -210,6 +329,23 @@ class GamepadPanel(BasePanel):
             self._conn_var.set("未连接手柄 · 零帧常发中 · 已自动重连等待中")
             self._pill_var.set("无手柄 · 发零帧")
             self._pill.config(fg=theme.BAD, bg="#3A1E1E")
+
+    def _render_server(self) -> None:
+        with self._server_lock:
+            state = dict(self._server_state)
+        if not state and not self._base_url():
+            text, level = "服务端 -- 等待地址", "mute"
+        elif not state:
+            text, level = f"服务端 … 连接 {self._base_url()}", "mute"
+        else:
+            text, level = format_server_line(state)
+        self._server_var.set(text)
+        color = {"ok": "#7FD4A8", "warn": "#FFB020",
+                 "bad": "#FF5D5D"}.get(level, theme.MUTE)
+        try:
+            self._server_lbl.config(fg=color, bg="#0B0F16")
+        except Exception:
+            pass
 
     def _render_link(self, snap, parsed) -> None:
         transport = (getattr(snap, "transport", "") or "").lower()

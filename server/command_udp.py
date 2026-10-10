@@ -63,22 +63,17 @@ def _env_hz(name: str, default: int) -> int:
 
 # 兜底推送速率（HTTP `POST /command` 路径），可用 CORE_BRIDGE_CMD_FALLBACK_HZ 覆盖。
 #
-# 原 150 Hz 是在「HTTP 轮询是唯一命令通道」的前提下定的：服务端必须靠轮询
-# 才能看到最新指令。§4.4 方案 A 的 UDP 通道（server/command_udp_in.py）上线后
-# 主通道变成「到达即转发」，此线程退化为两件事：
-#   1. HTTP `POST /command` 兼容路径的推送器（面板/旧客户端调试）；
-#   2. K230 侧的保活重发器——即使某个 UDP 包丢了，下一周期仍会把最新帧补上。
-# 此时 150 Hz 只会与「到达即转发」重复下发同一帧（150 + 桌面 ~20 pps ≈ 170 pps
-# 的 40 B 小包，对空口约 0.6%），而 30 Hz 已经足够：周期 33 ms，在
-# COMMAND_STALE_S = 0.3 s 窗口内可发约 9 次。K230 每 ≤4 ms 泵一次控制 socket
+# 与桌面端 50 Hz 常发 / K230 侧 50 Hz UART3 透传同节拍：只要语义可解析就每
+# 20 ms 编一帧往 K230 发（含静止零帧），不断流。桌面 50 ms（旧保活）/ 服务端
+# 300 ms 静默过期窗口内可发约 15 次。K230 每 ≤4 ms 泵一次控制 socket
 # 且每次只把**最后一条**有效帧写 UART，所以 UART 写入频率由 pump 决定、不由
-# 本线程决定；115200 baud 下即使 30 Hz + 50 Hz 双路也只占约 10% 带宽。
+# 本线程决定；115200 baud 下即使 50 Hz + 50 Hz 双路也只占约 13% 带宽。
 #
 # 代价（本机实测 150 Hz vs 30 Hz，各 25 次随机相位注入，见报告）：
 # HTTP 兼容路径的「store 变化→发帧」p50 3.6 → 24.2 ms、p95 6.0 → 28.8 ms
 # （这就是半个周期）。主 UDP 通道完全不受影响（到达即转发，轮询延迟 0）。
 # 要旧行为就设 CORE_BRIDGE_CMD_FALLBACK_HZ=150。
-DEFAULT_HZ = max(MIN_HZ, min(MAX_HZ, _env_hz("CORE_BRIDGE_CMD_FALLBACK_HZ", 30)))
+DEFAULT_HZ = max(MIN_HZ, min(MAX_HZ, _env_hz("CORE_BRIDGE_CMD_FALLBACK_HZ", 50)))
 # 命令快照过期阈值：超过则视为失联，该周期不发送。
 #
 # 这就是**服务端侧的停车超时**（见模块 docstring：K230 的 CMD_STALE_MS=200 只是
@@ -460,8 +455,9 @@ def _make_sendto(fallback_sendto=None):
 def start_command_udp(sendto=None, push_hz: int = DEFAULT_HZ) -> None:
     """启动兜底推送线程。sendto 为空则自建独立 UDP socket。
 
-    `push_hz` 默认 DEFAULT_HZ = 30：UDP 通道（`command_udp_in`）上线后本线程
-    不是主通道，30 Hz 只做 HTTP 兼容路径 + 保活重发，理由见 DEFAULT_HZ 注释。
+    `push_hz` 默认 DEFAULT_HZ = 50：与桌面 50 Hz 常发 / K230 50 Hz UART3 透传
+    同节拍。UDP 通道（`command_udp_in`）上线后本线程不是主通道，50 Hz 只做
+    HTTP 兼容路径 + 保活重发，理由见 DEFAULT_HZ 注释。
     需要 150 Hz 行为时显式传 `push_hz=150`（仍受 MIN_HZ/MAX_HZ 夹取）。
     """
     global _thread

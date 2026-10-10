@@ -41,6 +41,11 @@ RETRANSMIT_WINDOW_MS = 1000
 IDR_REQUEST_INTERVAL_MS = 400
 IDR_SETTLE_MS = 500
 COMMAND_STALE_MS = 200
+UART_TX_PERIOD_MS = 20
+UART_TX_IDLE_FRAME = bytes((
+    0xAA, 0x55, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xD1, 0x1E, 0x0D, 0x0A,
+))
 
 RTP_CLOCK_HZ = 90000
 RTP_TICKS_PER_MS = RTP_CLOCK_HZ // 1000
@@ -528,12 +533,44 @@ class CommandLink:
         self.last_receive_ms = 0
         self.on_control = on_control
         self.on_nack = on_nack
+        self.cached_command = None
+        self.cached_at_ms = 0
+        self.last_uart_tx_ms = 0
+        self.uart_tx_frames = 0
         self.nack_packets = 0
         self.nack_sequences = 0
         self.nack_hits = 0
         self.nack_misses = 0
         self.nack_budget_drops = 0
         self.nack_invalid = 0
+
+    def _uart_write(self, frame):
+        try:
+            bytes_written, frame_length = uart_tx_frame(
+                self.serial_port, frame)
+        except Exception as error:
+            print("[CMD] UART write error: %s" % error)
+            self.active = False
+            return False
+        if bytes_written != frame_length:
+            print("[CMD] UART short write %s/%d" % (
+                bytes_written, frame_length))
+            self.active = False
+            return False
+        self.uart_tx_frames += 1
+        return True
+
+    def _uart_tick(self, now_ms):
+        if not self.last_uart_tx_ms:
+            self.last_uart_tx_ms = now_ms
+            return
+        if ticks_diff(now_ms, self.last_uart_tx_ms) < UART_TX_PERIOD_MS:
+            return
+        self.last_uart_tx_ms = now_ms
+        if self.cached_command is not None:
+            self._uart_write(self.cached_command)
+        else:
+            self._uart_write(UART_TX_IDLE_FRAME)
 
     def pump(self, sock):
         now_ms = ticks_ms()
@@ -580,19 +617,8 @@ class CommandLink:
                     print("[CMD] NACK handling error: %s" % error)
 
         if latest_command is not None:
-            try:
-                bytes_written, frame_length = uart_tx_frame(
-                    self.serial_port, latest_command)
-                if bytes_written != frame_length:
-                    print("[CMD] UART short write %s/%d" % (
-                        bytes_written, frame_length))
-                    self.active = False
-                    return
-            except Exception as error:
-                print("[CMD] UART write error: %s" % error)
-                self.active = False
-                return
-
+            self.cached_command = bytes(latest_command)
+            self.cached_at_ms = now_ms
             self.received_frames += 1
             self.last_receive_ms = now_ms
             if not self.active:
@@ -602,11 +628,17 @@ class CommandLink:
             if self.active:
                 print("[CMD] feed lost")
                 self.active = False
+            self.cached_command = None
+            self.cached_at_ms = 0
+
+        self._uart_tick(now_ms)
 
     def format_stats(self):
         return (
-            "[CMD] rx=%d active=%s nack=%d seq=%d hit=%d miss=%d budget=%d bad=%d" % (
-                self.received_frames, self.active, self.nack_packets,
+            "[CMD] rx=%d tx=%d cached=%s active=%s nack=%d seq=%d hit=%d miss=%d budget=%d bad=%d" % (
+                self.received_frames, self.uart_tx_frames,
+                "yes" if self.cached_command is not None else "no",
+                self.active, self.nack_packets,
                 self.nack_sequences, self.nack_hits, self.nack_misses,
                 self.nack_budget_drops, self.nack_invalid
             )

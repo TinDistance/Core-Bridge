@@ -14,8 +14,9 @@ D7 / doc §2.3、§4.4 方案 A
 
 - **轮询线程**（``gamepad-poll``，~100 Hz）：只读 XInput、只更新「最新状态」
   （``_latest``）。**不做任何 IO**。
-- **发送线程**（``gamepad-send``，~500 Hz tick）：按需发送 —— 输入变化时立即
-  发，无变化时每 ``HEARTBEAT_S``(50 ms) 保活一次。
+- **发送线程**（``gamepad-send``，~500 Hz tick）：50 Hz 固定节拍常发当前帧，
+  输入变化时立即发（不等节拍），无变化到 20 ms 节拍即发。断连也按 50 Hz
+  持续补中位零帧（不断流），让下游靠显式零速停车而不是靠静默超时。
 
 ⚠️ **上线耦合（兼容性红线）**：服务端同一批把 ``COMMAND_STALE_S`` 从 0.5 s 改成
 了 0.3 s（``server/command_udp.py``）。0.5 s 心跳的旧客户端会在服务端被一直判
@@ -233,10 +234,9 @@ class GamepadPusher:
     #: HTTP 降级路径的超时。D7 之前它也是主通道超时，卡住会拖垮轮询；
     #: 现在它只在 UDP 不可用时才走到，主通道（UDP）不受影响。
     POST_TIMEOUT = 0.3
-    #: 无变化时的保活周期。V1.3：0.05 -> 0.05（20Hz 固定下发，恰好 50ms）。
-    #: 20Hz 来自坦克串口要求（FIRE 上升沿 / 急停持续下发都依赖稳定节拍），
-    #: 与服务端 0.3s 过期阈值留 6 倍余量。变化即时发，不等节拍。
-    HEARTBEAT_S = 0.05
+    #: 固定下发节拍。50 Hz 常发当前帧（含空闲零帧 / 断连中位零帧），
+    #: 与 K230 侧 50 Hz UART3 透传同节拍。变化即时发，不等节拍。
+    HEARTBEAT_S = 0.02
     #: 发送线程的 tick（D6：不用 Event.wait）。~2 ms 决定了「输入变化到发出」
     #: 的额外延迟（附录 A.1：time.sleep(2 ms) → p50 2.17 ms）。
     SEND_TICK_S = 0.002
@@ -380,16 +380,14 @@ class GamepadPusher:
 
     # ---------------------------------------------------------------- 发送
     def _send_loop(self) -> None:
-        """发送线程：V1.3 固定 20Hz 下发，变化立即发，无变化到节拍保活。
+        """发送线程：50 Hz 固定节拍常发当前帧，变化立即发，无变化到节拍即发。
 
-        20Hz 来自坦克串口要求：FIRE 上升沿只认「0->1 边」，急停锁存后要
-        持续下发 EMERGENCY_STOP=1。节拍用 _tank_has_changed 比对语义，
+        断连 / 轮询卡死同样按节拍持续补中位零帧（不断流），下游靠显式零速
+        停车而不是靠静默超时。节拍用 _tank_has_changed 比对语义，
         而不是比 proto —— 松开按键但摇杆回中属于语义变化，必须立即发。
         """
         last_tank: dict | None = None
         last_sent_at = 0.0
-        neutral_done = False
-        neutral_retry_at = 0.0
         try:
             while not self._stop.is_set():
                 time.sleep(self.SEND_TICK_S)
@@ -401,14 +399,19 @@ class GamepadPusher:
                 if latest.at <= 0.0:
                     continue
                 if now - latest.at > self.POLL_STALE_S:
-                    self._mark(False, "手柄轮询线程无响应")
+                    if (now - last_sent_at) < self.HEARTBEAT_S:
+                        continue
+                    ok, err = self._send_frame(xi.neutral_protocol())
+                    if ok:
+                        last_tank = None
+                        last_sent_at = now
+                        self._mark(True, "手柄轮询线程无响应 · 零帧常发中")
+                    else:
+                        self._mark(False, err or "手柄轮询线程无响应")
                     continue
 
                 if not latest.connected:
-                    if neutral_done:
-                        self._mark(False, "等待手柄")
-                        continue
-                    if now < neutral_retry_at:
+                    if (now - last_sent_at) < self.HEARTBEAT_S:
                         continue
                     with self._lock:
                         self._tank_builder.estop.latched = False
@@ -417,17 +420,13 @@ class GamepadPusher:
                         self._latest_estop_progress = 0.0
                     ok, err = self._send_frame(xi.neutral_protocol())
                     if ok:
-                        neutral_done = True
                         last_tank = None
                         last_sent_at = now
-                        self._mark(False, "")
+                        self._mark(True, "等待手柄 · 零帧常发中")
                     else:
-                        neutral_retry_at = now + self.HEARTBEAT_S
                         self._mark(False, err or "等待手柄")
                     continue
 
-                neutral_done = False
-                neutral_retry_at = 0.0
                 changed = last_tank is None or tank != last_tank
                 if not changed and (now - last_sent_at) < self.HEARTBEAT_S:
                     continue
@@ -754,18 +753,18 @@ def test_command_host():
 
 
 def test_should_send_heartbeat():
-    """保活判定：变化立即发；无变化到 50 ms 才发。"""
+    """保活判定：变化立即发；无变化到 20 ms 节拍才发。"""
     proto = bytes(16)
     other = bytes(range(16))
     # 从没发过 -> 立即发
-    assert should_send(None, proto, 0.0, 100.0, 0.05)
-    # 无变化且不到 50 ms -> 不发（49 ms 不发 / 51 ms 发，避开浮点边界）
-    assert not should_send(proto, proto, 100.0, 100.049, 0.05)
-    assert should_send(proto, proto, 100.0, 100.051, 0.05)
-    assert should_send(proto, proto, 100.0, 100.9, 0.05)
+    assert should_send(None, proto, 0.0, 100.0, 0.02)
+    # 无变化且不到 20 ms -> 不发（19 ms 不发 / 21 ms 发，避开浮点边界）
+    assert not should_send(proto, proto, 100.0, 100.019, 0.02)
+    assert should_send(proto, proto, 100.0, 100.021, 0.02)
+    assert should_send(proto, proto, 100.0, 100.9, 0.02)
     # 有变化 -> 无论上次多久都立刻发
-    assert should_send(proto, other, 100.0, 100.001, 0.05)
-    assert should_send(proto, other, 100.0, 99.0, 0.05)
+    assert should_send(proto, other, 100.0, 100.001, 0.02)
+    assert should_send(proto, other, 100.0, 99.0, 0.02)
 
 
 def test_cmd_udp_env_switch():
@@ -823,10 +822,10 @@ def test_udp_end_to_end_packet_layout():
         assert 0 < ts_ms <= _U32
     assert seqs == sorted(seqs), seqs          # 严格递增
     assert len(set(seqs)) == len(seqs), seqs   # 无重复
-    # 0.30 s / 50 ms 保活 -> 至少 4 包（首包立即发）
-    assert len(pkts) >= 4, len(pkts)
+    # 0.30 s / 20 ms 节拍 -> 至少 10 包（首包立即发）
+    assert len(pkts) >= 10, len(pkts)
     gaps = [pkts[i + 1][0] - pkts[i][0] for i in range(len(pkts) - 1)]
-    assert max(gaps) < 0.20, gaps            # 没有出现「发送线程被卡住」
+    assert max(gaps) < 0.10, gaps            # 没有出现「发送线程被卡住」
 
 
 def test_slow_send_does_not_stall_poll_loop():
@@ -901,13 +900,11 @@ def test_slow_send_does_not_stall_poll_loop():
     assert snap.posted is True, snap.last_error
 
 
-def test_poll_stall_stops_sending():
-    """轮询线程停止产出状态 > POLL_STALE_S 时**停发**（fail-safe）。
+def test_poll_stall_sends_neutral_at_50hz():
+    """轮询线程停止产出状态 > POLL_STALE_S 时转中位零帧 50 Hz 常发。
 
-    这是刻意与「慢发送」相反的取舍：D7 要修的是「网络慢把轮询拖住」，但如果
-    **读取端**停了，我们已经不知道摇杆现在在哪，继续按最后已知状态下发就是往
-    机器人上送过期偏转。旧实现在这种情况下同样是什么都不发（整个线程阻塞），
-    所以这里只是把那个行为显式化，并给出可观测的错误文案。
+    读取端停了就不知道摇杆在哪：旧语义是停发靠静默超时停车；新语义是
+    按 20 ms 节拍持续补零帧，下游靠显式零速停车。
     """
     sink = _UdpSink(SELF_TEST_PORTS[1])
     reader = _FakeReader(block_on_call=3, block_for=1.0)  # 第 3 次 poll 卡 1 s
@@ -926,16 +923,25 @@ def test_poll_stall_stops_sending():
         sink.stop()
         resumed = pusher.snapshot()
 
-    # fail-safe 的判定点是「最后一次状态发布 + POLL_STALE_S」，也就是阻塞开始
-    # 之后 POLL_STALE_S(0.5 s)。给 5 个发送 tick 的余量。
+    # 阻塞期间仍在按节拍发中位零帧（不断流），且只能是零帧
     stale_at = reader.block_started_at + GamepadPusher.POLL_STALE_S + 0.05
-    during_stall = [t for t, _ in pkts if stale_at < t < reader.block_ended_at]
-    assert not during_stall, [round(t - pkts[0][0], 3) for t in during_stall]
+    during_stall = [(t, d) for t, d in pkts
+                    if stale_at < t < reader.block_ended_at]
+    assert during_stall, "阻塞期间零帧常发停了"
+    neutral = xi.neutral_protocol()
+    for _t, d in during_stall:
+        parsed = parse_cmd_packet(d)
+        assert parsed is not None, d.hex()
+        assert parsed[2] == neutral, parsed[2].hex()
+    gaps = [during_stall[i + 1][0] - during_stall[i][0]
+            for i in range(len(during_stall) - 1)]
+    if gaps:
+        assert max(gaps) < 0.10, gaps
     # 阻塞结束后自动恢复发送（轮询线程还活着，只是慢）
     resumed_pkts = [t for t, _ in pkts if t >= reader.block_ended_at]
     assert resumed_pkts, "阻塞结束后没有恢复发送"
-    assert stalled.posted is False
-    assert stalled.last_error == "手柄轮询线程无响应", stalled.last_error
+    assert stalled.posted is True, stalled.last_error
+    assert stalled.last_error == "手柄轮询线程无响应 · 零帧常发中", stalled.last_error
     assert resumed.posted is True, resumed.last_error
     assert resumed.packet > stalled.packet
 
@@ -987,8 +993,8 @@ def test_http_fallback_when_udp_disabled():
     assert names == ["MOVE", "TURRET", "TANK"], names
 
 
-def test_disconnect_sends_one_neutral_then_stops():
-    """断连 failsafe：补发**一次**中位帧后停止发送（保持原有语义）。"""
+def test_disconnect_keeps_sending_neutral_at_50hz():
+    """断连 failsafe：按 20 ms 节拍持续补中位零帧（不断流）。"""
     sink = _UdpSink(SELF_TEST_PORTS[0])
     reader = _FakeReader()
     pusher = GamepadPusher(get_base_url=lambda: "http://127.0.0.1:8000",
@@ -998,6 +1004,7 @@ def test_disconnect_sends_one_neutral_then_stops():
             pusher.start()
             time.sleep(0.20)
             reader.connected = False
+            disconnect_at = time.monotonic()
             time.sleep(0.30)
             snap = pusher.snapshot()
     finally:
@@ -1006,12 +1013,17 @@ def test_disconnect_sends_one_neutral_then_stops():
         sink.stop()
 
     neutral = xi.neutral_protocol()
-    neutrals = [parse_cmd_packet(d)[2] for _t, d in pkts
-                if parse_cmd_packet(d)[2] == neutral]
-    assert len(neutrals) == 1, f"断连后应只补发一次中位帧，实际 {len(neutrals)}"
+    after = [(t, d) for t, d in pkts if t >= disconnect_at]
+    assert len(after) >= 10, f"断连后零帧常发停了，实际 {len(after)}"
+    for _t, d in after:
+        parsed = parse_cmd_packet(d)
+        assert parsed is not None, d.hex()
+        assert parsed[2] == neutral, parsed[2].hex()
+    gaps = [after[i + 1][0] - after[i][0] for i in range(len(after) - 1)]
+    assert max(gaps) < 0.10, gaps
     assert snap.connected is False
-    assert snap.posted is False
-    assert snap.last_error == "等待手柄", snap.last_error
+    assert snap.posted is True, snap.last_error
+    assert snap.last_error == "等待手柄 · 零帧常发中", snap.last_error
 
 
 def main():

@@ -96,6 +96,11 @@ class GamepadPanel(BasePanel):
                                   bg="#0B0F16", fg="#7FD4FF",
                                   font=("Consolas", 11, "bold"))
         self._tank_lbl.pack(anchor="w", padx=8, pady=(2, 0))
+        self._link_var = tk.StringVar(value="链路 --")
+        self._link_lbl = tk.Label(prof, textvariable=self._link_var,
+                                  bg="#0B0F16", fg=theme.MUTE,
+                                  font=("Consolas", 10, "bold"))
+        self._link_lbl.pack(anchor="w", padx=8, pady=(2, 0))
         self._detail_var = tk.StringVar(value="")
         tk.Label(prof, textvariable=self._detail_var, bg="#0B0F16",
                  fg=theme.MUTE, font=("Consolas", 8)).pack(
@@ -179,10 +184,12 @@ class GamepadPanel(BasePanel):
         except Exception:
             self._hex_var.set("-- 协议帧异常 --")
             self._tank_var.set("TANK --")
+            self._link_var.set("链路 --")
             return
         self._hex_var.set(" ".join(
             parsed["raw_hex"][i:i + 2] for i in range(0, 32, 2)))
         self._render_tank(snap)
+        self._render_link(snap, parsed)
         prof = (
             f"LX={parsed['lx']:5d} LY={parsed['ly']:5d} "
             f"RX={parsed['rx']:5d} RY={parsed['ry']:5d}  "
@@ -200,9 +207,29 @@ class GamepadPanel(BasePanel):
             self._pill_var.set("● 手柄")
             self._pill.config(fg=theme.OK, bg="#14352B")
         elif xi.available():
-            self._conn_var.set("未连接手柄 · 已自动重连等待中")
-            self._pill_var.set("无手柄")
+            self._conn_var.set("未连接手柄 · 零帧常发中 · 已自动重连等待中")
+            self._pill_var.set("无手柄 · 发零帧")
             self._pill.config(fg=theme.BAD, bg="#3A1E1E")
+
+    def _render_link(self, snap, parsed) -> None:
+        transport = (getattr(snap, "transport", "") or "").lower()
+        via = {"udp": "UDP", "http": "HTTP"}.get(transport, "…")
+        sent = int(getattr(snap, "sent", 0) or 0)
+        err = str(getattr(snap, "last_error", "") or "")
+        if getattr(snap, "posted", False):
+            if "零帧" in err:
+                text = f"⇅ 50Hz常发 {via} · 第{sent}帧 · {err} · 原始已转零速"
+                self._link_lbl.config(fg="#FFB020", bg="#0B0F16")
+            else:
+                text = (f"⇅ 50Hz常发 {via} · 第{sent}帧 · LX={parsed['lx']:+d} "
+                        f"LY={parsed['ly']:+d} RX={parsed['rx']:+d} "
+                        f"RY={parsed['ry']:+d} hat={parsed['hat']} "
+                        f"btn=0x{parsed['btn']:02X}")
+                self._link_lbl.config(fg="#7FD4A8", bg="#0B0F16")
+        else:
+            text = f"✕ 发送停滞 {via} · 已发{sent}帧" + (f" · {err}" if err else "")
+            self._link_lbl.config(fg="#FF5D5D", bg="#0B0F16")
+        self._link_var.set(text)
 
     def _render_tank(self, snap) -> None:
         tank = getattr(snap, "tank", None) or {}

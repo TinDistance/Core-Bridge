@@ -188,7 +188,7 @@ def _forward(cleaned: str) -> None:
         return
     frame = command_udp.build_uart_frame(snap, active)
     if frame is None:
-        return          # 无激活条目 → 本次不发送（K230 侧保持上一条）
+        return          # 语义解析不出 -> 本次不发送（K230 侧保持上一条）
     endpoint = command_udp._current_endpoint()
     if endpoint is None:
         return          # 端点未学习（还没有视频包）→ 不崩、不发，等下一个包

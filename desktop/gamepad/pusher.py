@@ -197,9 +197,10 @@ class GamepadSnapshot:
     fps: float = 0.0
     posted: bool = False
     last_error: str = ""
-    # D7 附加诊断：发送线程的视角（面板可选显示，不影响既有字段语义）
     transport: str = ""
     sent: int = 0
+    tank: dict = field(default_factory=lambda: dict(cmd_builder.neutral_tank()))
+    estop_progress: float = 0.0
 
 
 @dataclass
@@ -232,7 +233,9 @@ class GamepadPusher:
     #: HTTP 降级路径的超时。D7 之前它也是主通道超时，卡住会拖垮轮询；
     #: 现在它只在 UDP 不可用时才走到，主通道（UDP）不受影响。
     POST_TIMEOUT = 0.3
-    #: 无变化时的保活周期。D7：0.5 → 0.05，与服务端 0.3 s 过期阈值留 6 倍余量。
+    #: 无变化时的保活周期。V1.3：0.05 -> 0.05（20Hz 固定下发，恰好 50ms）。
+    #: 20Hz 来自坦克串口要求（FIRE 上升沿 / 急停持续下发都依赖稳定节拍），
+    #: 与服务端 0.3s 过期阈值留 6 倍余量。变化即时发，不等节拍。
     HEARTBEAT_S = 0.05
     #: 发送线程的 tick（D6：不用 Event.wait）。~2 ms 决定了「输入变化到发出」
     #: 的额外延迟（附录 A.1：time.sleep(2 ms) → p50 2.17 ms）。
@@ -248,11 +251,14 @@ class GamepadPusher:
         self._interval = 1.0 / max(1.0, min(poll_hz, self.POLL_MAX_HZ))
         self._reader = reader if reader is not None else xi.XInputReader()
         self._lock = threading.Lock()
+        self._tank_builder = cmd_builder.TankCommandBuilder()
         self._snap = GamepadSnapshot(
             connected=getattr(self._reader, "slot", None) is not None,
             slot=getattr(self._reader, "slot", None),
         )
         self._latest = _Latest()
+        self._latest_tank: dict = dict(cmd_builder.neutral_tank())
+        self._latest_estop_progress: float = 0.0
         # 发送线程侧的状态量（同样在 _lock 下，但由发送线程独占写入）
         self._posted = False
         self._last_error = ""
@@ -316,12 +322,21 @@ class GamepadPusher:
                 proto=s.proto, buttons=s.buttons, lt8=s.lt8, rt8=s.rt8,
                 lx=s.lx, ly=s.ly, rx=s.rx, ry=s.ry,
                 fps=s.fps,
-                # posted / last_error 反映的是**发送线程**最近一次尝试的结果，
-                # 而不是「本轮 poll 有没有发过」——这是 D7 拆分线程后语义上
-                # 唯一必须说清楚的地方，面板文案不变即可。
                 posted=self._posted, last_error=self._last_error,
                 transport=self._transport, sent=self._sent,
+                tank=dict(s.tank), estop_progress=s.estop_progress,
             )
+
+    def _decode_tank(self, proto: bytes, now: float) -> tuple[dict, float]:
+        """proto -> V1.3 TankCmd（含急停锁存推进）。纯状态推进，由轮询线程调。"""
+        try:
+            parsed = xi.parse_protocol(proto)
+        except Exception:
+            return dict(cmd_builder.neutral_tank()), 0.0
+        tank = self._tank_builder.update(
+            parsed["lx"], parsed["ly"], parsed["rx"], parsed["ry"],
+            parsed["hat"], parsed["btn"], parsed["sys"], now)
+        return dict(tank), self._tank_builder.estop.progress(now)
 
     def _poll_loop(self) -> None:
         """轮询线程：只读 XInput、只更新状态，**一次 IO 都不做**（D7）。"""
@@ -340,6 +355,7 @@ class GamepadPusher:
                     self._t0 = t0
 
                 proto = bytes(st.proto)
+                tank, estop_progress = self._decode_tank(proto, t0)
                 with self._lock:
                     self._snap = GamepadSnapshot(
                         connected=st.connected, slot=st.slot,
@@ -347,10 +363,12 @@ class GamepadPusher:
                         buttons=st.buttons, lt8=st.lt8, rt8=st.rt8,
                         lx=st.lx, ly=st.ly, rx=st.rx, ry=st.ry,
                         fps=round(fps, 1),
+                        tank=tank, estop_progress=estop_progress,
                     )
-                    # 交接给发送线程的就是这一小块（整体替换，天然一致）
                     self._latest = _Latest(
                         connected=bool(st.connected), proto=proto, at=t0)
+                    self._latest_tank = dict(tank)
+                    self._latest_estop_progress = estop_progress
 
                 rest = self._interval - (time.monotonic() - t0)
                 if rest > 0:
@@ -362,42 +380,47 @@ class GamepadPusher:
 
     # ---------------------------------------------------------------- 发送
     def _send_loop(self) -> None:
-        """发送线程：输入变化立即发，无变化每 ``HEARTBEAT_S`` 保活一次。"""
-        last_proto: bytes | None = None
+        """发送线程：V1.3 固定 20Hz 下发，变化立即发，无变化到节拍保活。
+
+        20Hz 来自坦克串口要求：FIRE 上升沿只认「0->1 边」，急停锁存后要
+        持续下发 EMERGENCY_STOP=1。节拍用 _tank_has_changed 比对语义，
+        而不是比 proto —— 松开按键但摇杆回中属于语义变化，必须立即发。
+        """
+        last_tank: dict | None = None
         last_sent_at = 0.0
-        neutral_done = False        # 本次断连的中位帧是否已成功送达
-        neutral_retry_at = 0.0      # 补发失败时的重试时刻（防止 2 ms 级的重试风暴）
+        neutral_done = False
+        neutral_retry_at = 0.0
         try:
             while not self._stop.is_set():
-                # D6：2 ms tick（time.sleep 高精度定时器，附录 A.1）。
                 time.sleep(self.SEND_TICK_S)
                 with self._lock:
                     latest = self._latest
+                    tank = dict(self._latest_tank)
                 now = time.monotonic()
 
                 if latest.at <= 0.0:
-                    continue                      # 轮询线程还没产出任何状态
+                    continue
                 if now - latest.at > self.POLL_STALE_S:
-                    # 轮询线程卡死/已退出：宁可停下，也不要按过期状态继续下发。
                     self._mark(False, "手柄轮询线程无响应")
                     continue
 
                 if not latest.connected:
-                    # failsafe 时序：断连后**补发一次**中位帧让 server 回中，
-                    # 之后停止发送 —— 服务端 300 ms 静默即停车。持续发中位帧也
-                    # 是安全的（迟滞 active 恒为 False，build_uart_frame 返
-                    # None → 不发），但那只是白白占带宽，没有理由。
                     if neutral_done:
                         self._mark(False, "等待手柄")
                         continue
                     if now < neutral_retry_at:
                         continue
+                    with self._lock:
+                        self._tank_builder.estop.latched = False
+                        self._tank_builder.estop._hold_start = None
+                        self._latest_tank = dict(cmd_builder.neutral_tank())
+                        self._latest_estop_progress = 0.0
                     ok, err = self._send_frame(xi.neutral_protocol())
                     if ok:
                         neutral_done = True
-                        last_proto = None      # 重连后第一帧必发
+                        last_tank = None
                         last_sent_at = now
-                        self._mark(False, "")   # 断连：面板按「未发送」显示
+                        self._mark(False, "")
                     else:
                         neutral_retry_at = now + self.HEARTBEAT_S
                         self._mark(False, err or "等待手柄")
@@ -405,18 +428,32 @@ class GamepadPusher:
 
                 neutral_done = False
                 neutral_retry_at = 0.0
-                if not should_send(last_proto, latest.proto,
-                                   last_sent_at, now, self.HEARTBEAT_S):
+                changed = last_tank is None or tank != last_tank
+                if not changed and (now - last_sent_at) < self.HEARTBEAT_S:
                     continue
                 ok, err = self._send_frame(latest.proto)
                 if ok:
-                    last_proto = bytes(latest.proto)
+                    last_tank = dict(tank)
                     last_sent_at = now
                     self._mark(True, "")
                 else:
                     self._mark(False, err)
         finally:
             self._send_thread = None
+
+    def ping_tank(self) -> tuple[dict, float]:
+        """面板调试用：当前最新 V1.3 语义（不推进锁存计时）。"""
+        with self._lock:
+            return dict(self._latest_tank), self._latest_estop_progress
+
+    def last_tank(self) -> tuple[dict, float]:
+        with self._lock:
+            return dict(self._latest_tank), self._latest_estop_progress
+
+    def clear_estop(self) -> None:
+        with self._lock:
+            self._tank_builder.estop.latched = False
+            self._tank_builder.estop._hold_start = None
 
     def _mark(self, posted: bool, err: str) -> None:
         """记录发送线程最近一次结果。值没变就跳过（省掉断连时 500 Hz 的写锁）。"""
@@ -503,8 +540,12 @@ class GamepadPusher:
             if client is None:
                 return False, udp_err or "HTTP 客户端不可用"
             parsed = xi.parse_protocol(raw16)
+            tank, _progress = self.last_tank()
             cmds = cmd_builder.build_commands(
                 parsed["lx"], parsed["ly"], parsed["rx"], parsed["ry"])
+            cmds.append({"name": "TANK", **{k: int(v) for k, v in tank.items()
+                                            if k != "estop"},
+                         "estop": int(tank.get("estop", 0))})
             resp = client.post(f"{base}/command", json={
                 "raw_hex": parsed["raw_hex"],
                 "cmds": cmds,
@@ -943,7 +984,7 @@ def test_http_fallback_when_udp_disabled():
     # HTTP 通道仍然要带 raw_hex / cmds（面板 GET /command 依赖它）
     assert last["raw_hex"] == xi.parse_protocol(reader.proto)["raw_hex"]
     names = [c["name"] for c in last["cmds"]]
-    assert names == ["MOVE", "TURRET"], names
+    assert names == ["MOVE", "TURRET", "TANK"], names
 
 
 def test_disconnect_sends_one_neutral_then_stops():

@@ -91,6 +91,11 @@ class GamepadPanel(BasePanel):
         tk.Label(prof, textvariable=self._hex_var, bg="#0B0F16",
                  fg=theme.INK, font=("Consolas", 11, "bold")).pack(
             anchor="w", padx=8, pady=(4, 0))
+        self._tank_var = tk.StringVar(value="TANK --")
+        self._tank_lbl = tk.Label(prof, textvariable=self._tank_var,
+                                  bg="#0B0F16", fg="#7FD4FF",
+                                  font=("Consolas", 11, "bold"))
+        self._tank_lbl.pack(anchor="w", padx=8, pady=(2, 0))
         self._detail_var = tk.StringVar(value="")
         tk.Label(prof, textvariable=self._detail_var, bg="#0B0F16",
                  fg=theme.MUTE, font=("Consolas", 8)).pack(
@@ -120,6 +125,13 @@ class GamepadPanel(BasePanel):
     def destroy(self) -> None:  # type: ignore[override]
         self._closed = True
         super().destroy()
+
+_YAW_TEXT = {0: "停", 1: "右转", 2: "左转"}
+_PITCH_TEXT = {0: "停", 1: "上仰", 2: "下俯"}
+_REAR_TEXT = {0: "停", 1: "顺时针", 2: "逆时针"}
+
+
+class GamepadPanel(BasePanel):
 
     def _set_lamp(self, name: str, on: bool) -> None:
         lbl = self._lamps.get(name)
@@ -166,15 +178,16 @@ class GamepadPanel(BasePanel):
             parsed = xi.parse_protocol(snap.proto)
         except Exception:
             self._hex_var.set("-- 协议帧异常 --")
+            self._tank_var.set("TANK --")
             return
         self._hex_var.set(" ".join(
             parsed["raw_hex"][i:i + 2] for i in range(0, 32, 2)))
-        b13_names = "".join(n for n, m in xi.LAMPS_13 if parsed["btn"] & m) or "--"
+        self._render_tank(snap)
         prof = (
             f"LX={parsed['lx']:5d} LY={parsed['ly']:5d} "
             f"RX={parsed['rx']:5d} RY={parsed['ry']:5d}  "
             f"LT={parsed['lt']:4d} RT={parsed['rt']:4d}  "
-            f"hat={parsed['hat']} btn=0x{parsed['btn']:02X}({b13_names}) "
+            f"hat={parsed['hat']} btn=0x{parsed['btn']:02X} "
             f"sys=0x{parsed['sys']:02X} share=0x{parsed['share']:02X}  "
             f"{'已推送→/command' if snap.posted else '未推送'}")
         if getattr(snap, "last_error", ""):
@@ -190,3 +203,33 @@ class GamepadPanel(BasePanel):
             self._conn_var.set("未连接手柄 · 已自动重连等待中")
             self._pill_var.set("无手柄")
             self._pill.config(fg=theme.BAD, bg="#3A1E1E")
+
+    def _render_tank(self, snap) -> None:
+        tank = getattr(snap, "tank", None) or {}
+        progress = float(getattr(snap, "estop_progress", 0.0) or 0.0)
+        track_l = int(tank.get("track_l", 0) or 0)
+        track_r = int(tank.get("track_r", 0) or 0)
+        yaw = int(tank.get("yaw_rot", 0) or 0)
+        pitch = int(tank.get("pitch_rot", 0) or 0)
+        rear = int(tank.get("rear_rot", 0) or 0)
+        fire = int(tank.get("fire", 0) or 0)
+        estop = int(tank.get("estop", 0) or 0)
+        if estop:
+            text = "■ 急停锁存 ESTOP=1（左键/Start解除）"
+            self._tank_lbl.config(fg="white", bg="#C22F2F")
+        elif progress > 0.0:
+            text = ("… 急停 %d%%（右键保持2秒） L=%+d R=%+d 炮塔%s/%s 后臂%s %s"
+                    % (round(progress * 100), track_l, track_r,
+                       _YAW_TEXT.get(yaw, "?"), _PITCH_TEXT.get(pitch, "?"),
+                       _REAR_TEXT.get(rear, "?"),
+                       "开火!" if fire else ""))
+            self._tank_lbl.config(fg="#FFB020", bg="#0B0F16")
+        else:
+            firing = " 开火FIRE=1" if fire else ""
+            text = ("▶ L=%+d R=%+d 炮塔%s/%s 后臂%s%s"
+                    % (track_l, track_r, _YAW_TEXT.get(yaw, "?"),
+                       _PITCH_TEXT.get(pitch, "?"),
+                       _REAR_TEXT.get(rear, "?"), firing))
+            self._tank_lbl.config(
+                fg="#FF5D5D" if fire else "#7FD4FF", bg="#0B0F16")
+        self._tank_var.set(text)

@@ -441,30 +441,34 @@ class TxStats:
         )
 
 
+def crc16_ccitt_false(data):
+    crc = 0xFFFF
+    for byte in bytes(data):
+        crc ^= (byte & 0xFF) << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc & 0xFFFF
+
+
 def valid_uart_frame(data):
-    if data is None or len(data) < 4 or len(data) > 32:
+    if data is None or len(data) != 15:
         return False
     if data[0] != 0xAA or data[1] != 0x55:
         return False
-
-    item_count = data[2]
-    if item_count < 1 or item_count > 8:
+    if data[13] != 0x0D or data[14] != 0x0A:
         return False
-
-    offset = 3
-    for _ in range(item_count):
-        if offset + 2 > len(data) - 1:
+    for index in (6, 7, 8):
+        if data[index] not in (0, 1, 2):
             return False
-        offset += 2 + data[offset + 1]
-        if offset > len(data) - 1:
-            return False
-    if offset != len(data) - 1:
+    if data[9] not in (0, 1):
         return False
-
-    checksum = 0
-    for byte in data[:offset]:
-        checksum ^= byte
-    return checksum == data[offset]
+    if data[10] not in (0, 1):
+        return False
+    received = (data[11] << 8) | data[12]
+    return crc16_ccitt_false(data[:11]) == received
 
 
 def init_uart():
@@ -507,6 +511,7 @@ def parse_nack(data):
 class CommandLink:
     RECV_BUFFER_SIZE = 128
     SOCKET_TIMEOUT_SECONDS = 0.005
+    UART_FRAME_LEN = 15
 
     def __init__(self, serial_port, on_control=None, on_nack=None):
         self.serial_port = serial_port

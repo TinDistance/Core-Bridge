@@ -30,7 +30,7 @@ def _stale_s() -> float:
     except Exception:
         return 0.3
 
-_VALID_CMD_NAMES = ("MOVE", "TURRET")
+_VALID_CMD_NAMES = ("MOVE", "TURRET", "TANK")
 
 _lock = threading.Lock()
 _store: dict = {
@@ -95,7 +95,10 @@ def _pct(v: int) -> int:
 
 
 def _sanitize_cmds(cmds: list[dict] | None) -> list[dict] | None:
-    """校验桌面端 cmds 形状；非法返回 None 交由兜底解析，避免坏数据杀死推送线程。"""
+    """校验桌面端 cmds 形状；非法返回 None 交由兜底解析，避免坏数据杀死推送线程。
+
+    TANK 条目值域按 V1.3 校验：track ±100，rot 0/1/2，fire/estop 0/1。
+    """
     if cmds is None:
         return None
     if not isinstance(cmds, list) or len(cmds) > 8:
@@ -117,7 +120,19 @@ def _sanitize_cmds(cmds: list[dict] | None) -> list[dict] | None:
                 iv = int(v)
             except (TypeError, ValueError):
                 return None
-            if iv < -100 or iv > 100:
+            if name == "TANK":
+                if k in ("track_l", "track_r"):
+                    if iv < -100 or iv > 100:
+                        return None
+                elif k in ("yaw_rot", "pitch_rot", "rear_rot"):
+                    if iv not in (0, 1, 2):
+                        return None
+                elif k in ("fire", "estop"):
+                    if iv not in (0, 1):
+                        return None
+                else:
+                    return None
+            elif iv < -100 or iv > 100:
                 return None
             clean[k] = iv
         out.append(clean)

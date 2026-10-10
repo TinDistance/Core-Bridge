@@ -1,8 +1,16 @@
-"""K230 命令通道 UDP 反向推送服务（UART 帧 v2）。
+"""K230 命令通道 UDP 反向推送服务（UART 帧 V1.3 坦克串口）。
 
-职责：把 `server.routers.command` 里的最新快照编码成 v2 UART 帧，UDP 发给
+职责：把 `server.routers.command` 里的最新快照编码成 V1.3 UART 帧，UDP 发给
 K230（本进程就是那个 UDP socket 的对端）。目标端点由视频包学习
 （`note_video_sender()`）。
+
+V1.3 帧（坦克小车串口控制协议定义文档 V1.3，固定 15 字节）：
+    AA 55 | TRACK_L(i16 BE) | TRACK_R(i16 BE) | YAW(u8) | PITCH(u8)
+    | REAR(u8) | FIRE(u8) | ESTOP(u8) | CRC16-CCITT-FALSE(BE, 覆盖偏移0~10)
+    | 0D 0A
+语义由桌面端 `desktop/gamepad/commands.py` 的 TankCommandBuilder 产生，
+HTTP 降级走 `cmds` 里的 `TANK` 条目，UDP 主通道走 `raw_hex` 兜底重算
+（桌面端是唯一的语义来源，`FIRE` 上升沿由 STM32 检测）。
 
 本模块只负责「往 K230 发」。桌面 → 服务端方向现在有两条路：
 - `server/command_udp_in.py`（§4.4 方案 A）：桌面 UDP 直发，到达即转发，是主通道；
@@ -93,9 +101,12 @@ IDLE_WAIT_S = 0.05
 CMD_ACTIVE_ON = 30
 CMD_ACTIVE_OFF = 28
 
-_CMD_IDS = {"MOVE": 0x01, "TURRET": 0x02}
-_CMD_AXES = {"MOVE": ("speed", "turn"), "TURRET": ("yaw", "pitch")}
-_CMD_ORDER = ("MOVE", "TURRET")
+_CMD_IDS = {"MOVE": 0x01, "TURRET": 0x02, "TANK": 0x03}
+_CMD_AXES = {"MOVE": ("speed", "turn"), "TURRET": ("yaw", "pitch"),
+             "TANK": ("track_l", "track_r")}
+_CMD_ORDER = ("MOVE", "TURRET", "TANK")
+_TANK_AXES = ("track_l", "track_r")
+_TANK_ROTS = ("yaw_rot", "pitch_rot", "rear_rot")
 
 _stop = threading.Event()
 _thread: threading.Thread | None = None
@@ -104,6 +115,19 @@ _own_sock: socket.socket | None = None
 _lock = threading.Lock()
 _endpoint: tuple[str, int] | None = None
 _endpoint_at = 0.0
+
+
+def crc16_ccitt_false(data: bytes) -> int:
+    """CRC-16/CCITT-FALSE：poly 0x1021，init 0xFFFF（V1.3 §5 参考函数逐字）。"""
+    crc = 0xFFFF
+    for byte in bytes(data):
+        crc ^= (byte & 0xFF) << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc & 0xFFFF
 
 
 def xor_checksum(payload: bytes) -> int:
@@ -143,8 +167,105 @@ def _cmd_magnitude(cmd: dict, axes: tuple[str, ...]) -> int:
     return mag
 
 
+def _rot(v: object) -> int:
+    iv = _safe_int(v)
+    return iv if iv in (0, 1, 2) else 0
+
+
+def _flag(v: object) -> int:
+    return 1 if _safe_int(v) == 1 else 0
+
+
+def _tank_from_cmds(cmds_by_name: dict) -> dict | None:
+    """TANK 条目（HTTP 降级）-> 归一化坦克语义；无 TANK 返回 None。"""
+    cmd = cmds_by_name.get("TANK")
+    if not isinstance(cmd, dict):
+        return None
+    return {
+        "track_l": _clamp100(cmd.get("track_l", 0)),
+        "track_r": _clamp100(cmd.get("track_r", 0)),
+        "yaw_rot": _rot(cmd.get("yaw_rot", 0)),
+        "pitch_rot": _rot(cmd.get("pitch_rot", 0)),
+        "rear_rot": _rot(cmd.get("rear_rot", 0)),
+        "fire": _flag(cmd.get("fire", 0)),
+        "estop": _flag(cmd.get("estop", 0)),
+    }
+
+
+def _tank_from_raw(raw_hex: str) -> dict | None:
+    """raw16 -> V1.3 坦克语义：与桌面端 TankCommandBuilder 同语义的兜底重算。
+
+    raw16 字节布局见 desktop/gamepad/xinput.py：lx/ly/rx/ry u16 LE 偏移码，
+    hat=p[12]，btn13=p[13]，sys=p[14]。急停锁存是桌面端有状态行为，
+    服务端无状态：hat 右=立即急停（不等待 2s），hat 左/sys Start=释放。
+    """
+    try:
+        p = bytes.fromhex(str(raw_hex or ""))
+        if len(p) != 16:
+            return None
+    except Exception:
+        return None
+    lx = int.from_bytes(p[0:2], "little")
+    ly = int.from_bytes(p[2:4], "little")
+    rx = int.from_bytes(p[4:6], "little")
+    ry = int.from_bytes(p[6:8], "little")
+    hat, b13, sys = p[12], p[13], p[14]
+    if hat in (2, 3, 4):
+        return {"track_l": 0, "track_r": 0, "yaw_rot": 0, "pitch_rot": 0,
+                "rear_rot": 0, "fire": 0, "estop": 1}
+
+    def axis(v: int) -> int:
+        pct = int(round((int(v) - 32768) / 32767.0 * 100.0))
+        pct = max(-100, min(100, pct))
+        return 0 if -4 < pct < 4 else pct
+
+    def rot(pct: int) -> int:
+        return 1 if pct > 30 else (2 if pct < -30 else 0)
+
+    speed, turn = axis(ly), axis(lx)
+    cw = bool(b13 & 0x02)
+    ccw = bool(b13 & 0x10)
+    rear = 1 if cw and not ccw else (2 if ccw and not cw else 0)
+    track_l = max(-100, min(100, speed + turn))
+    track_r = max(-100, min(100, speed - turn))
+    return {"track_l": track_l, "track_r": track_r,
+            "yaw_rot": rot(axis(rx)), "pitch_rot": rot(axis(ry)),
+            "rear_rot": rear, "fire": 1 if b13 & 0x01 else 0, "estop": 0}
+
+
+def _tank_is_active(tank: dict) -> bool:
+    """任一履带超迟滞阈值 / 任一旋转非零 / 开火 / 急停 -> 本周期必须发帧。"""
+    if tank.get("estop"):
+        return True
+    if tank.get("fire"):
+        return True
+    for key in _TANK_AXES:
+        if abs(int(tank.get(key, 0) or 0)) > CMD_ACTIVE_ON:
+            return True
+    for key in _TANK_ROTS:
+        if int(tank.get(key, 0) or 0) in (1, 2):
+            return True
+    return False
+
+
+def build_tank_frame(tank: dict) -> bytes:
+    """归一化坦克语义 -> V1.3 15 字节 UART 帧（含 CRC16 + 帧尾）。"""
+    body = bytearray((0xAA, 0x55))
+    for key in ("track_l", "track_r"):
+        body += int(tank.get(key, 0) or 0).to_bytes(2, "big", signed=True)
+    for key in ("yaw_rot", "pitch_rot", "rear_rot", "fire", "estop"):
+        value = int(tank.get(key, 0) or 0)
+        if key in ("yaw_rot", "pitch_rot", "rear_rot"):
+            value = value if value in (0, 1, 2) else 0
+        else:
+            value = 1 if value == 1 else 0
+        body.append(value)
+    crc = crc16_ccitt_false(bytes(body))
+    return bytes(body) + crc.to_bytes(2, "big") + b"\x0D\x0A"
+
+
 def _known_cmds_by_name(snap: dict) -> dict[str, dict]:
-    """snap -> {MOVE: cmd, TURRET: cmd}，未知命令名/坏形状忽略。"""
+    """snap -> {MOVE/TURRET/TANK: cmd}，未知命令名/坏形状忽略。"""
     try:
         cmds = _resolve_cmds(snap.get("raw_hex", ""), snap.get("cmds"))
     except Exception:
@@ -162,9 +283,17 @@ def _known_cmds_by_name(snap: dict) -> dict[str, dict]:
 
 def update_active_state(prev: dict[str, bool],
                         cmds_by_name: dict[str, dict]) -> dict[str, bool]:
-    """迟滞更新激活状态（_run 每周期调用，纯函数便于测试）。"""
+    """迟滞更新激活状态（_run 每周期调用，纯函数便于测试）。
+
+    TANK 走自己的激活判据（旋转/开火/急停任一置位就发帧，否则 20Hz 保活
+    对于静止坦克只是重复零速帧）；MOVE/TURRET 保持旧迟滞语义。
+    """
     nxt: dict[str, bool] = {}
     for name in _CMD_ORDER:
+        if name == "TANK":
+            tank = cmds_by_name.get("TANK")
+            nxt[name] = bool(isinstance(tank, dict) and _tank_is_active(tank))
+            continue
         axes = _CMD_AXES[name]
         cmd = cmds_by_name.get(name, {})
         mag = _cmd_magnitude(cmd, axes)
@@ -176,40 +305,42 @@ def update_active_state(prev: dict[str, bool],
     return nxt
 
 
+def _resolve_tank(snap: dict, cmds_by_name: dict) -> dict | None:
+    """TANK 优先走 cmds（HTTP 降级自带语义），否则 raw_hex 兜底重算。"""
+    tank = _tank_from_cmds(cmds_by_name)
+    if tank is not None:
+        return tank
+    try:
+        return _tank_from_raw(snap.get("raw_hex", ""))
+    except Exception:
+        return None
+
+
+def snap_to_tank(snap: dict) -> dict | None:
+    """快照 -> 归一化坦克语义（面板调试 / 测试用）。"""
+    try:
+        return _resolve_tank(snap, _known_cmds_by_name(snap))
+    except Exception:
+        return None
+
+
 def build_uart_frame(snap: dict,
                      active: dict[str, bool] | None = None) -> bytes | None:
-    """最新状态 -> v2 UART 帧；无激活条目返回 None（该周期不发送）。"""
+    """最新状态 -> V1.3 15 字节 UART 帧；静止回中帧照发（不断流）。
+
+    V1.3 与旧 v2 的关键差异：旧帧「无激活条目就不发」，靠 MCU 超时停车；
+    V1.3 要求 20Hz 固定节拍（FIRE 上升沿 / 急停锁存 / 200ms 串口超时都依赖
+    持续帧流），所以只要语义可解析就发帧，解析不出才返回 None。
+    """
     try:
         cmds_by_name = _known_cmds_by_name(snap)
     except Exception:
         return None
     try:
-        if active is None:
-            active = {n: _cmd_magnitude(cmds_by_name.get(n, {}), _CMD_AXES[n])
-                      > CMD_ACTIVE_ON for n in _CMD_ORDER}
-
-        entries = bytearray()
-        count = 0
-        for name in _CMD_ORDER:
-            if not active.get(name, False):
-                continue
-            cmd = cmds_by_name.get(name, {})
-            if not isinstance(cmd, dict):
-                continue
-            cid = _CMD_IDS[name]
-            if name == "MOVE":
-                payload = bytes([_clamp100(cmd.get("speed", 0) or 0) & 0xFF,
-                                 _clamp100(cmd.get("turn", 0) or 0) & 0xFF])
-            else:
-                payload = bytes([_clamp100(cmd.get("yaw", 0) or 0) & 0xFF,
-                                 _clamp100(cmd.get("pitch", 0) or 0) & 0xFF])
-            entries += bytes([cid, len(payload)]) + payload
-            count += 1
-
-        if count == 0:
+        tank = _resolve_tank(snap, cmds_by_name)
+        if tank is None:
             return None
-        body = bytes([0xAA, 0x55, count]) + bytes(entries)
-        return body + bytes([xor_checksum(body)])
+        return build_tank_frame(tank)
     except Exception:
         return None
 

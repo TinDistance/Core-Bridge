@@ -75,7 +75,7 @@ Core-Bridge/
 | 8003/8004 | UDP | 备用 RTP 端口（服务端默认监听，`CORE_BRIDGE_RTP_PORTS` 可裁剪） |
 | 8002+ | UDP | RTP 扇出下行到桌面 H264Viewer（viewer 绑定 `0.0.0.0:0` 临时端口并上报），控制包走同链路 |
 | 8010 | UDP | 桌面 → 服务端命令通道：`CBC` + ver(u8) + seq(u32 BE) + ts_ms(u32 BE) + raw16 = 28 字节 |
-| 115200 | UART3 | K230 → 底盘 MCU：`AA 55 <count> [<cmd,len,payload>]...+XOR校验`（MOVE=0x01，TURRET=0x02） |
+| 115200 | UART3 | K230 → 底盘 MCU：V1.3 固定 15 字节 `AA 55 TRACK_L(i16BE) TRACK_R(i16BE) YAW PITCH REAR FIRE ESTOP CRC16-CCITT-FALSE(BE) 0D 0A` |
 
 `CBR` 控制包（K230 ↔ 中继/桌面共用）：`b"CBR" + type(u8)`，`0x00 PING` / `0x10 PONG` / `0x01 IDR 请求` / `0x02 BITRATE` / `0x03 NACK`（`+count(u8) + seq(u16 BE)*count`，count ∈ [1,32]，长度必须恰好 `5+2*count`）。
 
@@ -120,10 +120,10 @@ K230 JPEG 分块（header `>HBBHHHH`，块 ≤1200B）→ UDP 8001 → `video_hu
 ### 3. 指令链路（手柄 → 机器人）
 
 1. **采集**：`desktop/gamepad/xinput.py`（ctypes，4 槽位）→ 16 字节协议帧（lx/ly/rx/ry u16 偏移码，lt/rt 0–1023）。轮询线程 `gamepad-poll` ~100Hz **只读手柄、只更新最新状态，不做任何 IO**。
-2. **语义化**：`desktop/gamepad/commands.py` → MOVE speed/turn、TURRET yaw/pitch，−100..100，死区 ±4。
-3. **发送**：`GamepadPusher` 发送线程按需发 —— 输入变化时立即发，无变化时每 50ms 保活；封包 `CBC|ver|seq|ts_ms|raw16`（28B）走 UDP 8010。`ts_ms` 是客户端进程启动以来的毫秒数，**只用于面板调试，不参与新鲜度判断**，无需对时。语义 `cmds` 不进包，服务端故意 `cmds=None` 走 `_resolve_cmds` 兜底解析，桌面端是唯一语义来源。关掉 `CORE_BRIDGE_CMD_UDP` 时降级走 HTTP `POST /command`（30Hz 兜底）。
+2. **语义化**：`desktop/gamepad/commands.py` → V1.3 坦克语义：左摇杆差速混合出 TRACK_L/R（±100），右摇杆阈值 ±30 出炮塔持续旋转（0/1/2），A=开火（FIRE 上升沿），B=后臂顺时针(1)/Y=逆时针(2)，十字键右按住 2s 锁存急停（左键/Start 解除）。UI 在手柄面板显性展示当前命令（履带/炮塔/后臂/开火/急停进度）。
+3. **发送**：`GamepadPusher` 发送线程 **20Hz 固定节拍**（50ms）下发，变化立即发、无变化到节拍保活；封包 `CBC|ver|seq|ts_ms|raw16`（28B）走 UDP 8010。`ts_ms` 是客户端进程启动以来的毫秒数，**只用于面板调试，不参与新鲜度判断**，无需对时。语义 `TANK` 经 HTTP 降级进 `cmds`，UDP 主通道服务端走 raw 兜底重算，桌面端是唯一语义来源。关掉 `CORE_BRIDGE_CMD_UDP` 时降级走 HTTP `POST /command`（30Hz 兜底）。
    - 相比 HTTP 的收益：去掉服务端轮询等待（150Hz 平均也只省 6.7ms，Windows 上 `Event.wait` 还按 15.6ms 取整）和 TCP 队头阻塞（一次重传 200–300ms 会把后续指令一起排队，且恰好发生在 WiFi 抖动时刻）。控制路径稳态估算从 ≈40–80ms 降到 ≈15–25ms。
-4. **服务端 `command_udp_in.py` → `command_udp.py`**：8010 收包解析后**到达即转发**（上限 50Hz），写入 store 复用 `command_udp` 的迟滞/帧编码/端点学习；`command_udp` 把 buildup UART v2 帧 `AA 55 ...` 推给「从视频包学到的 K230 地址」。快照 >0.3s 不发（`COMMAND_STALE_S`），轴向幅值滞回 ON>30 / OFF<28 决定指令是否激活。
+4. **服务端 `command_udp_in.py` → `command_udp.py`**：8010 收包解析后**到达即转发**（上限 50Hz），写入 store；`command_udp` 编码 V1.3 固定 15 字节帧（含 CRC16-CCITT-FALSE + `0D 0A`）推给「从视频包学到的 K230 地址」。快照 >0.3s 不发（`COMMAND_STALE_S`），V1.3 固定 20Hz 节拍不断流（静止回中帧照发，靠 MCU 200ms 串口超时停车）。
    - ⚠️ **上线耦合**：桌面端 50ms 心跳与服务端 0.3s 过期阈值必须同批上线，否则旧客户端会被一直判过期而完全失去控制。
 5. **K230 `CommandLink.pump`** 校验帧格式 → 写 UART3 115200 → 底盘/云台 MCU 执行。
 

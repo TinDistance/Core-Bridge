@@ -27,6 +27,8 @@ FPS = 30
 GOP_LENGTH = 60
 MAX_NALU_CHUNK_SIZE = 1400
 UART_BAUDRATE = 115200
+UART_TX_APPEND_LF = True
+UART_TX_LF = b"\n"
 GC_COLLECT_EVERY = 100
 WIFI_WAIT_LOG_MS = 5000
 
@@ -471,6 +473,12 @@ def valid_uart_frame(data):
     return crc16_ccitt_false(data[:11]) == received
 
 
+def uart_tx_frame(serial_port, frame):
+    data = bytes(frame) + (UART_TX_LF if UART_TX_APPEND_LF else b"")
+    result = serial_port.write(data)
+    return len(data) if result is None else int(result), len(data)
+
+
 def init_uart():
     global uart
     from machine import UART, FPIOA
@@ -573,10 +581,11 @@ class CommandLink:
 
         if latest_command is not None:
             try:
-                result = self.serial_port.write(latest_command)
-                bytes_written = len(latest_command) if result is None else int(result)
-                if bytes_written != len(latest_command):
-                    print("[CMD] UART short write %s/%d" % (result, len(latest_command)))
+                bytes_written, frame_length = uart_tx_frame(
+                    self.serial_port, latest_command)
+                if bytes_written != frame_length:
+                    print("[CMD] UART short write %s/%d" % (
+                        bytes_written, frame_length))
                     self.active = False
                     return
             except Exception as error:

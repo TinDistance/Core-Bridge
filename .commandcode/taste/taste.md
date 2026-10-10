@@ -5,3 +5,4 @@
 - Expects code changes to be committed, not left uncommitted. Confidence: 0.75
 - Prefers communicating in Chinese. Confidence: 0.75
 - Prefers refactoring standards applied consistently across the entire system/repo rather than fixing a single file in isolation. Confidence: 0.8
+- Prefers simple direct data transmission over complex mechanisms; questions added complexity when plain sending previously worked. Confidence: 0.75

@@ -27,8 +27,6 @@ FPS = 30
 GOP_LENGTH = 60
 MAX_NALU_CHUNK_SIZE = 1400
 UART_BAUDRATE = 115200
-UART_TX_APPEND_LF = True
-UART_TX_LF = b"\n"
 GC_COLLECT_EVERY = 100
 WIFI_WAIT_LOG_MS = 5000
 
@@ -479,7 +477,7 @@ def valid_uart_frame(data):
 
 
 def uart_tx_frame(serial_port, frame):
-    data = bytes(frame) + (UART_TX_LF if UART_TX_APPEND_LF else b"")
+    data = bytes(frame)
     result = serial_port.write(data)
     return len(data) if result is None else int(result), len(data)
 

@@ -10,7 +10,7 @@ from media.sensor import *
 from media.media import *
 from media.vencoder import *
 
-SERVER_IP = "172.20.10.6"
+SERVER_IP = "192.168.137.1"
 RTP_PORT = 8002
 
 TIERS = {
@@ -509,11 +509,10 @@ def init_motor_pwm():
     global motor_pwm, motor_dir_pin, motor_en_pin
     try:
         from machine import PWM, Pin
-        # 对齐ZDT例程三线: 例程PA5=En恒低使能/PA6=PUL脉冲/PA7=Dir方向 -> K230: pin44=En, pin42=PWM0(PUL), pin43=GPIO(DIR)
-        motor_en_pin = Pin(44, Pin.OUT, pull=Pin.PULL_NONE, drive=7)
+        motor_en_pin = Pin(18, Pin.OUT, pull=Pin.PULL_NONE, drive=7)
         motor_en_pin.value(0)
         motor_pwm = PWM(42, freq=MOTOR_SPEED_HZ, duty=0)
-        motor_dir_pin = Pin(43, Pin.OUT, pull=Pin.PULL_NONE, drive=7)
+        motor_dir_pin = Pin(52, Pin.OUT, pull=Pin.PULL_NONE, drive=7)
         motor_dir_pin.value(0)
         print("[MOTOR] fire pulse ready: PUL=pin42(PWM0) DIR=pin43 EN=pin44(En低=使能) %dHz 50%%" % MOTOR_SPEED_HZ)
     except Exception as error:

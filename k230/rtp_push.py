@@ -27,6 +27,8 @@ FPS = 30
 GOP_LENGTH = 60
 MAX_NALU_CHUNK_SIZE = 1400
 UART_BAUDRATE = 115200
+MOTOR_SPEED_HZ = 20000  # X42S 默认16细分3200脉冲/圈(手册P16 MStep): RPM = HZ*60/3200, 20kHz=375RPM
+MOTOR_DIRECTION = 0  # DIR引脚电平, 驱动出厂默认(手册P100): 0=低电平=CW正转, 1=高电平=CCW
 GC_COLLECT_EVERY = 100
 WIFI_WAIT_LOG_MS = 5000
 
@@ -59,6 +61,9 @@ encoder = None
 media_link = None
 sta = None
 uart = None
+motor_pwm = None
+motor_dir_pin = None
+motor_running = False
 
 
 def ticks_ms():
@@ -499,6 +504,63 @@ def init_uart():
     return uart
 
 
+def init_motor_pwm():
+    global motor_pwm, motor_dir_pin
+    try:
+        from machine import PWM, Pin
+        # 硬件 PWM 生成 PUL 脉冲, 非阻塞; pin42=PWM0(手册 PWM 复用表), pin43=GPIO 方向
+        motor_pwm = PWM(42, freq=MOTOR_SPEED_HZ, duty=0)
+        motor_dir_pin = Pin(43, Pin.OUT, pull=Pin.PULL_NONE, drive=7)
+        motor_dir_pin.value(0)
+        print("[MOTOR] fire pulse ready: PUL=pin42(PWM0) DIR=pin43 %dHz 50%%" % MOTOR_SPEED_HZ)
+    except Exception as error:
+        motor_pwm = None
+        motor_dir_pin = None
+        print("[MOTOR] init failed: %s" % error)
+
+
+def set_motor_fire(fire):
+    global motor_running
+    if motor_pwm is None or motor_dir_pin is None:
+        return
+    wanted = bool(fire)
+    if wanted == motor_running:
+        return
+    try:
+        if wanted:
+            motor_dir_pin.value(MOTOR_DIRECTION)
+            motor_pwm.duty(50)
+        else:
+            motor_pwm.duty(0)
+            motor_dir_pin.value(0)
+        motor_running = wanted
+    except Exception as error:
+        motor_running = False
+        print("[MOTOR] fire error: %s" % error)
+        try:
+            motor_pwm.duty(0)
+        except Exception:
+            pass
+
+
+def stop_motor_pwm():
+    global motor_pwm, motor_dir_pin
+    if motor_pwm is not None:
+        try:
+            motor_pwm.duty(0)
+            motor_pwm.deinit()
+        except Exception:
+            pass
+        motor_pwm = None
+    if motor_dir_pin is not None:
+        try:
+            motor_dir_pin.value(0)
+            motor_dir_pin.deinit()
+        except Exception:
+            pass
+        motor_dir_pin = None
+
+
 def parse_nack(data):
     if data is None or len(data) < 5:
         return None, False
@@ -566,9 +628,11 @@ class CommandLink:
             return
         self.last_uart_tx_ms = now_ms
         if self.cached_command is not None:
-            self._uart_write(self.cached_command)
+            frame = self.cached_command
         else:
-            self._uart_write(UART_TX_IDLE_FRAME)
+            frame = UART_TX_IDLE_FRAME
+        self._uart_write(frame)
+        set_motor_fire(frame[9])
 
     def pump(self, sock):
         now_ms = ticks_ms()
@@ -666,6 +730,7 @@ def stream_loop(sock, wlan):
         )
 
     command_link = CommandLink(init_uart(), on_control=request_idr, on_nack=handle_nack)
+    init_motor_pwm()
 
     while True:
         os.exitpoint()
@@ -783,6 +848,7 @@ def stream_loop(sock, wlan):
 
 def cleanup():
     global sensor, media_link, encoder
+    stop_motor_pwm()
     if sensor is not None:
         try:
             sensor.stop()

@@ -1,8 +1,9 @@
 - Prefers human-readable, descriptive variable names over cryptic/abbreviated names. Confidence: 0.9
 - Prefers minimal comments that explain functionality only; wants verbose/redundant comments removed. Confidence: 0.9
 - Prefers lean code with unused telemetry/metrics removed, keeping only essential signals (e.g., latency and FPS). Confidence: 0.75
-- Prefers multi-part refactoring work split across parallel sub-agents working in batches. Confidence: 0.7
+- Prefers multi-part refactoring work split across parallel sub-agents working in batches; more broadly, explicitly delegates implementation tasks (even single-feature ones, e.g. referencing external docs/manuals) to an Agent rather than having the main assistant do them inline. Confidence: 0.75
 - Expects code changes to be committed, not left uncommitted. Confidence: 0.75
 - Prefers communicating in Chinese. Confidence: 0.75
 - Prefers refactoring standards applied consistently across the entire system/repo rather than fixing a single file in isolation. Confidence: 0.8
 - Prefers simple direct data transmission over complex mechanisms; questions added complexity when plain sending previously worked. Confidence: 0.75
+- Wants hardware-facing tunables (speed, direction, etc.) placed as named constants at the top of the file for easy adjustment. Confidence: 0.7

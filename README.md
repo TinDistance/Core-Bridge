@@ -11,7 +11,7 @@ Core-Bridge/
 ├── server/        # FastAPI 中继服务器（HTTP/WS + RTP/JPEG 中继 + 反向控制）
 ├── desktop/       # Tkinter 桌面操作台（视频墙、手柄、遥测、日志）
 ├── k230/          # K230 MicroPython 端（采集/编码/RTP 推流/指令接收）
-├── test/          # 单元与集成测试（133 passed）
+├── test/          # pytest 回归（线路契约、丢包窗口、V1.3 坦克串口）
 ├── docs/          # 设计文档（延迟优化方案、丢包遥测口径）
 ├── start_desktop.bat  # 一键启动桌面端（python -m desktop.app）
 └── requirements.txt

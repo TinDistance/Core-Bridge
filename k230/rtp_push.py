@@ -27,8 +27,8 @@ FPS = 30
 GOP_LENGTH = 60
 MAX_NALU_CHUNK_SIZE = 1400
 UART_BAUDRATE = 115200
-MOTOR_SPEED_HZ = 20000  # X42S 默认16细分3200脉冲/圈(手册P16 MStep): RPM = HZ*60/3200, 20kHz=375RPM
-MOTOR_DIRECTION = 0  # DIR引脚电平, 驱动出厂默认(手册P100): 0=低电平=CW正转, 1=高电平=CCW
+MOTOR_SPEED_HZ = 20000  # PUL脉冲频率; 对齐STM32F103例程(main.c): 6400边沿=3200脉冲/圈(16细分)=一圈; RPM = FREQ*60/3200
+MOTOR_DIRECTION = 0  # DIR电平(例程PA7, 翻转换向、起始为低): 0=低电平=CW正转, 1=高电平=CCW(与例程翻转方向对应的出厂默认含义)
 GC_COLLECT_EVERY = 100
 WIFI_WAIT_LOG_MS = 5000
 
@@ -63,6 +63,7 @@ sta = None
 uart = None
 motor_pwm = None
 motor_dir_pin = None
+motor_en_pin = None
 motor_running = False
 
 
@@ -505,17 +506,20 @@ def init_uart():
 
 
 def init_motor_pwm():
-    global motor_pwm, motor_dir_pin
+    global motor_pwm, motor_dir_pin, motor_en_pin
     try:
         from machine import PWM, Pin
-        # 硬件 PWM 生成 PUL 脉冲, 非阻塞; pin42=PWM0(手册 PWM 复用表), pin43=GPIO 方向
+        # 对齐ZDT例程三线: 例程PA5=En恒低使能/PA6=PUL脉冲/PA7=Dir方向 -> K230: pin44=En, pin42=PWM0(PUL), pin43=GPIO(DIR)
+        motor_en_pin = Pin(44, Pin.OUT, pull=Pin.PULL_NONE, drive=7)
+        motor_en_pin.value(0)
         motor_pwm = PWM(42, freq=MOTOR_SPEED_HZ, duty=0)
         motor_dir_pin = Pin(43, Pin.OUT, pull=Pin.PULL_NONE, drive=7)
         motor_dir_pin.value(0)
-        print("[MOTOR] fire pulse ready: PUL=pin42(PWM0) DIR=pin43 %dHz 50%%" % MOTOR_SPEED_HZ)
+        print("[MOTOR] fire pulse ready: PUL=pin42(PWM0) DIR=pin43 EN=pin44(En低=使能) %dHz 50%%" % MOTOR_SPEED_HZ)
     except Exception as error:
         motor_pwm = None
         motor_dir_pin = None
+        motor_en_pin = None
         print("[MOTOR] init failed: %s" % error)
 
 
@@ -544,7 +548,7 @@ def set_motor_fire(fire):
 
 
 def stop_motor_pwm():
-    global motor_pwm, motor_dir_pin
+    global motor_pwm, motor_dir_pin, motor_en_pin
     if motor_pwm is not None:
         try:
             motor_pwm.duty(0)
@@ -559,6 +563,12 @@ def stop_motor_pwm():
         except Exception:
             pass
         motor_dir_pin = None
+    if motor_en_pin is not None:
+        try:
+            motor_en_pin.deinit()
+        except Exception:
+            pass
+        motor_en_pin = None
 
 
 def parse_nack(data):

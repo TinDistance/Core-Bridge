@@ -7,3 +7,4 @@
 - Prefers refactoring standards applied consistently across the entire system/repo rather than fixing a single file in isolation. Confidence: 0.8
 - Prefers simple direct data transmission over complex mechanisms; questions added complexity when plain sending previously worked. Confidence: 0.75
 - Wants hardware-facing tunables (speed, direction, etc.) placed as named constants at the top of the file for easy adjustment. Confidence: 0.7
+- When controlling external hardware, prefers implementations aligned to the vendor's official example code / their own established reference approach (e.g. ZDT STM32 例程) rather than generic parameter guesses derived only from the manual. Confidence: 0.6

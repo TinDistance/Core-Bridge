@@ -22,7 +22,6 @@ import os
 import sys
 import time
 import tkinter as tk
-from tkinter import ttk
 
 from PIL import Image, ImageTk
 
@@ -35,11 +34,10 @@ if __package__ in (None, ""):  # pragma: no cover - 仅自检入口
 from desktop import theme
 from desktop.modules.base_panel import BasePanel
 from desktop.streaming.h264_viewer import H264Viewer, available as h264_available
-from desktop.streaming.viewer import Viewer
 
-NO_STREAM_TEXT = "没有设备在推流"
-NO_STREAM_HINT = "检查 K230 是否已上电，确认推流地址指向本机 UDP 8002"
+NO_STREAM_TEXT = "无画面"
 SIGNAL_LOSS_GRACE_S = 5.0
+RECONNECT_AFTER_S = 0.5
 
 # D5：33 → 8 ms。旧值在 Windows 上让帧在 Tk 事件队列里平均多等 16 ms
 # （Tk `after` 与 `Event.wait` 一样按 ~15.6 ms 定时器粒度取整，附录 A.1）。
@@ -97,11 +95,9 @@ class StreamPanel(BasePanel):
         self._default_server = default_server
         self._monitor = monitor
         self._h264: H264Viewer | None = None
-        self._jpeg: Viewer | None = None
         self._h264_last = 0.0
         self._last_frame_ts = 0.0
         self._last_status = ""
-        self._paused = False
         self._closed = False
         self._photo: ImageTk.PhotoImage | None = None
         self._streaming = False
@@ -122,59 +118,34 @@ class StreamPanel(BasePanel):
         super().__init__(master, title="VIDEO · 图传", **kwargs)
 
     def build(self) -> None:
-        head = tk.Frame(self, bg=theme.PANEL)
-        head.pack(fill=tk.X, padx=theme.PAD, pady=(theme.PAD, 6))
-        tk.Label(head, text="VIDEO · 图传", bg=theme.PANEL, fg=theme.FAINT,
-                 font=theme.FONT_EYEBROW).pack(side=tk.LEFT)
-        self._pill_var = tk.StringVar(value="无信号")
-        self._pill = tk.Label(head, textvariable=self._pill_var, bg="#232E42",
-                               fg=theme.MUTE, font=theme.FONT_EYEBROW,
-                               padx=8, pady=2)
-        self._pill.pack(side=tk.RIGHT)
-        self._meta_var = tk.StringVar(value="")
-        tk.Label(head, textvariable=self._meta_var, bg=theme.PANEL,
-                 fg=theme.FAINT, font=theme.FONT_MONO_SM).pack(side=tk.RIGHT, padx=(0, 8))
-
-        bar = tk.Frame(self, bg=theme.PANEL)
-        bar.pack(fill=tk.X, padx=theme.PAD, pady=(0, 6))
-        tk.Label(bar, text="Server", bg=theme.PANEL, fg=theme.MUTE,
-                 font=theme.FONT_SMALL).pack(side=tk.LEFT)
-        self._server_var = tk.StringVar(value=self._default_server)
-        ttk.Entry(bar, textvariable=self._server_var, width=26).pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 6))
-        self._toggle_btn = ttk.Button(bar, text="暂停", style="Accent.TButton",
-                                      command=self._toggle)
-        self._toggle_btn.pack(side=tk.LEFT)
-        try:
-            self._server_var.trace_add("write", lambda *_: self._on_server_changed())
-        except Exception:
-            pass
-
-        self._canvas = tk.Canvas(self, bg="#0B0F16", highlightthickness=1,
-                                 highlightbackground=theme.LINE)
-        self._canvas.pack(fill=tk.BOTH, expand=True, padx=theme.PAD, pady=0)
+        self._canvas = tk.Canvas(self, bg="#14120E", highlightthickness=0)
+        self._canvas.pack(fill=tk.BOTH, expand=True)
         self._canvas.bind("<Configure>", self._on_configure)
-
-        foot = tk.Frame(self, bg=theme.PANEL)
-        foot.pack(fill=tk.X, padx=theme.PAD, pady=(6, theme.PAD))
-        self._foot_var = tk.StringVar(value="等待首帧…")
-        tk.Label(foot, textvariable=self._foot_var, bg=theme.PANEL,
-                 fg=theme.MUTE, font=theme.FONT_MONO_SM).pack(side=tk.LEFT)
+        self._foot_var = tk.StringVar(value="")
         self._size_var = tk.StringVar(value="")
-        tk.Label(foot, textvariable=self._size_var, bg=theme.PANEL,
-                 fg=theme.FAINT, font=theme.FONT_MONO_SM).pack(side=tk.RIGHT)
-
-        # 接线延迟探针：provider 模式（单入口），render_age 不再恒 -1
         if self._monitor is not None:
             try:
                 self._monitor.set_stream_stats_provider(
                     lambda: self._h264.stats() if self._h264 is not None else {})
-                self._monitor.set_base_url(self._server_var.get())
+                self._monitor.set_base_url(self._default_server)
             except Exception:
-                # 接线失败必须是响的：provider 没挂上时 render_age 恒 -1，
-                # 面板永远停在「无 render_age」，而画面完全正常。
                 logger.exception("failed to wire telemetry provider")
         self._poll_after = self.after(POLL_INTERVAL_MS, self._poll)
+
+    def source_size(self) -> tuple[int, int]:
+        if self._src_known:
+            return self._src_size
+        return (0, 0)
+
+    def signal_state(self) -> str:
+        if self._last_frame_ts <= 0:
+            return "wait"
+        age = time.monotonic() - self._last_frame_ts
+        if age >= SIGNAL_LOSS_GRACE_S:
+            return "wait"
+        if age >= RECONNECT_AFTER_S:
+            return "reconnect"
+        return "live"
 
     def destroy(self) -> None:  # type: ignore[override]
         self._closed = True
@@ -188,95 +159,26 @@ class StreamPanel(BasePanel):
                 self._h264.stop()
         except Exception:
             pass
-        try:
-            self._stop_jpeg()
-        except Exception:
-            pass
         super().destroy()
 
-    def _on_server_changed(self) -> None:
-        """地址编辑后重建 viewer（防抖：由下次 _poll 实际执行）。"""
-        # 遥测探针必须跟着一起换目标：否则视频连新地址、探针还在打旧地址，
-        # 面板会永久停在「无信号」，而画面看起来完全正常。
-        if self._monitor is not None:
-            try:
-                self._monitor.set_base_url(self._server_var.get())
-            except Exception:
-                pass
-        # 标记强制重建：停掉旧对象，下轮 _ensure 会用新地址创建
-        try:
-            if self._h264 is not None:
-                self._h264.stop()
-                self._h264 = None
-            self._stop_jpeg()
-            self._h264_last = 0.0
-            # 新 viewer 的解码尺寸可能不同，重新学一次比例（D4）
-            self._src_size = DEFAULT_SRC_SIZE
-            self._src_known = False
-            self._render_size = (0, 0)
-            self._can_scale = True
-        except Exception:
-            pass
-
-    def _toggle(self) -> None:
-        self._paused = not self._paused
-        if self._paused:
-            if self._h264 is not None:
-                self._h264.stop()
-                self._h264 = None
-            self._stop_jpeg()
-            self._streaming = False
-            self._toggle_btn.config(text="继续看")
-            self._set_pill("已暂停", theme.MUTE, "#232E42")
-            self._render_size = (0, 0)
-            self._src_known = False
-            self._redraw()
-        else:
-            self._h264_last = time.monotonic()
-            self._toggle_btn.config(text="暂停")
-
     def _ensure_h264(self) -> None:
-        """H264 裸 RTP 是主链路，常驻。PyAV 缺失才退回 JPEG。"""
+        """K230 只推 H.264 RTP。没有 PyAV 时不另开图传。"""
         if self._h264 is not None or not h264_available():
             return
-        self._h264 = H264Viewer(self._server_var.get())
-        # D4：能力探测。没有 set_render_size 的 viewer（例如旧版本）会退回
-        # UI 线程 resize 路径。
+        self._h264 = H264Viewer(self._default_server)
         self._can_scale = hasattr(self._h264, "set_render_size")
         self._render_size = (0, 0)
         self._h264.start()
-        # 预热窗口：刚创建尚未完成 IDR 握手，避免下一轮误拉 JPEG 双耗
         self._h264_last = time.monotonic()
-
-    def _ensure_jpeg(self) -> None:
-        """JPEG 链路仅在本机无 PyAV（无法解码 H264）时兜底拉起。"""
-        if self._jpeg is None:
-            self._jpeg = Viewer(self._server_var.get())
-            self._jpeg.start()
-
-    def _stop_jpeg(self) -> None:
-        if self._jpeg is not None:
-            try:
-                self._jpeg.stop()
-            except Exception:
-                pass
-            self._jpeg = None
-
-    def _set_pill(self, text: str, fg: str, bg: str) -> None:
-        self._pill_var.set(text)
-        self._pill.config(fg=fg, bg=bg)
 
     def _poll(self) -> None:
         if self._closed:
             return
         try:
             now = time.monotonic()
-            if self._paused:
-                return
             self._ensure_h264()
-            # 无 PyAV：直接 JPEG（原 elif 逻辑导致黑屏）
             if not h264_available():
-                self._ensure_jpeg()
+                self._last_status = "本机没有 PyAV，无法解码 H.264"
 
             h264_img = None
             h264_status = None
@@ -291,7 +193,6 @@ class StreamPanel(BasePanel):
 
             if h264_img is not None:
                 self._last_frame_ts = now
-                self._streaming = True
                 t0 = time.monotonic()
                 self._draw_frame(h264_img)
                 self._draw_ms = (time.monotonic() - t0) * 1000.0
@@ -300,27 +201,36 @@ class StreamPanel(BasePanel):
                         self._monitor.report_draw(self._draw_ms)
                     except Exception:
                         pass
-                self._set_pill("● LIVE", theme.OK, "#14352B")
-                if self._last_status and self._last_status not in ("streaming",):
-                    self._foot_var.set(f"{self._last_status} · {self._size_var.get()}")
-            elif self._last_frame_ts and (now - self._last_frame_ts) < SIGNAL_LOSS_GRACE_S:
+            state = self.signal_state()
+            if state == "reconnect":
                 self._streaming = True
-                gap = now - self._last_frame_ts
-                self._set_pill(f"重连中 {gap:.1f}s", theme.WARN, "#3A2E14")
-                if self._last_status:
-                    self._foot_var.set(f"{self._last_status} · 重连中 {gap:.1f}s")
-            else:
+                if h264_img is None:
+                    self._reposition()
+                self._paint_reconnect(now)
+            elif state == "wait":
                 self._streaming = False
                 self._photo = None
                 self._size_var.set("")
-                self._set_pill("无信号", theme.MUTE, "#232E42")
-                self._redraw()
+                self._draw_placeholder()
+            else:
+                self._streaming = True
         finally:
             if not self._closed:
                 try:
                     self._poll_after = self.after(POLL_INTERVAL_MS, self._poll)
                 except Exception:
                     pass
+
+    def _paint_reconnect(self, now: float) -> None:
+        c = self._canvas_size()
+        if c is None or self._last_frame_ts <= 0:
+            return
+        age = now - self._last_frame_ts
+        self._canvas.delete("reconnect")
+        self._canvas.create_text(
+            c[0] // 2, 28, text=f"重连 {age:.1f}s",
+            fill=theme.WARN, font=theme.cjk_font(12), tags="reconnect",
+        )
 
     # ------------------------------------------------------------------ D4
     def _canvas_size(self) -> tuple[int, int] | None:
@@ -454,94 +364,6 @@ class StreamPanel(BasePanel):
         cw, ch = c
         self._canvas.delete("all")
         self._canvas.create_text(
-            cw // 2, ch // 2 - 12, text=NO_STREAM_TEXT,
+            cw // 2, ch // 2, text=NO_STREAM_TEXT,
             fill=theme.INK, font=theme.cjk_font(14),
         )
-        self._canvas.create_text(
-            cw // 2, ch // 2 + 14, text=NO_STREAM_HINT,
-            fill=theme.MUTE, font=theme.cjk_font(9),
-        )
-
-
-# ==================================================================== 自检
-# 纯逻辑检查，**不实例化 Tk**（headless 环境没有显示器，Tk() 会直接抛错）。
-# 这里能验的是 D4 里唯一有分支逻辑的部分：等比目标尺寸的计算与去抖判据。
-# 「<Configure> -> set_render_size -> 下一帧以新尺寸到达」这条链路本身需要
-# 显示器 + 真实 viewer，属于未经运行验证的部分。
-#
-#   python desktop/modules/stream_panel.py
-
-def _test_fit_render_size_even_and_contained():
-    """目标尺寸必须是偶数，且不能超出 canvas。"""
-    for cw, ch in ((1280, 720), (1279, 719), (801, 601), (400, 400), (100, 900)):
-        w, h = fit_render_size(1280, 720, cw, ch)
-        assert w % 2 == 0 and h % 2 == 0, (cw, ch, w, h)
-        assert w >= 2 and h >= 2, (cw, ch, w, h)
-        assert w <= cw and h <= ch, (cw, ch, w, h)
-
-
-def _test_fit_render_size_keeps_aspect():
-    """等比：结果比例必须贴着源比例。
-
-    容差是 ``2 * src_w``：``fit_render_size`` 两个方向都**向下**取偶数，
-    高度方向最多丢 2 px，交叉乘积的误差就等于 ``2 * src_w``。这比 < 0.5% 的
-    视觉差异，肉眼不可见。
-    """
-    for sw, sh in ((1280, 720), (1920, 1080), (640, 480), (720, 720)):
-        for cw, ch in ((1280, 720), (900, 700), (500, 500), (1919, 1079)):
-            w, h = fit_render_size(sw, sh, cw, ch)
-            err = abs(w * sh - h * sw)
-            assert err <= 2 * sw, (sw, sh, cw, ch, w, h, err)
-
-
-def _test_fit_render_size_invalid_input():
-    """任一输入 ≤ 0 -> (0, 0)，与 set_render_size(0,0) 的「不缩放」对齐。"""
-    assert fit_render_size(1280, 720, 0, 0) == (0, 0)
-    assert fit_render_size(0, 720, 800, 600) == (0, 0)
-    assert fit_render_size(1280, 720, -1, 600) == (0, 0)
-    # 极小 canvas 也不能返回 0（否则会误触发 viewer's「不缩放」分支）
-    assert fit_render_size(1280, 720, 2, 2) == (2, 2)
-    assert fit_render_size(1280, 720, 3, 3) == (2, 2)
-
-
-def _test_ratio_changed_tolerance():
-    """比例修正必须有死区：偶数取整误差不算变化，真变才算。"""
-    # 偶数向下取整造成的 ~0.1% 偏差 -> 不修正
-    assert not ratio_changed(1278, 718, 1280, 720)
-    assert not ratio_changed(1280, 720, 1280, 720)
-    # 1% 以内不修正（1280x710 vs 1280x720 = 1.4%）
-    assert not ratio_changed(1280, 710, 1280, 720, tol=0.02)
-    # 2.8%（1280x700）超过 2% 死区 -> 修正
-    assert ratio_changed(1280, 700, 1280, 720, tol=0.02)
-    # 明显变化（4:3 vs 16:9）-> 修正
-    assert ratio_changed(640, 480, 1280, 720)
-    # 同比例换分辨率（720p -> 1080p）不算变化
-    assert not ratio_changed(1920, 1080, 1280, 720)
-    assert not ratio_changed(0, 0, 1280, 720)
-
-
-def _test_poll_interval_is_8ms():
-    """D5：轮询周期必须是 8 ms（且只有一处常量，两处调度共用）。"""
-    assert POLL_INTERVAL_MS == 8
-
-
-def main():
-    fns = [v for k, v in sorted(globals().items())
-           if k.startswith("_test_") and callable(v)]
-    failed = 0
-    for fn in fns:
-        try:
-            fn()
-            print(f"PASS {fn.__name__}")
-        except Exception as e:
-            failed += 1
-            import traceback
-            traceback.print_exc()
-            print(f"FAIL {fn.__name__}: {e}")
-    print(f"{len(fns) - failed}/{len(fns)} passed")
-    import sys
-    sys.exit(1 if failed else 0)
-
-
-if __name__ == "__main__":
-    main()

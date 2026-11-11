@@ -17,10 +17,3 @@ class BasePanel(tk.Frame):
 
     def build(self) -> None:
         pass
-
-    def section_head(self, parent: tk.Widget, title: str) -> tk.Frame:
-        head = tk.Frame(parent, bg=theme.PANEL)
-        head.pack(fill=tk.X, padx=theme.PAD, pady=(theme.PAD, 0))
-        tk.Label(head, text=title, bg=theme.PANEL, fg=theme.FAINT,
-                 font=theme.FONT_EYEBROW).pack(side=tk.LEFT)
-        return head

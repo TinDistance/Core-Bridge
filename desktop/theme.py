@@ -4,20 +4,18 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk
 
-BG = "#0E131A"
-PANEL = "#161E29"
-PANEL_2 = "#1C2534"
-LINE = "#263144"
-INK = "#EAF0F6"
-MUTE = "#8A96AC"
-FAINT = "#7E8CA3"
-AMBER = "#FFB020"
-CYAN = "#4CC9FF"
-OK = "#34D399"
-BAD = "#FF5D5D"
-WARN = "#FFB020"
+BG = "#12110E"
+PANEL = "#1C1A16"
+PANEL_2 = "#26231C"
+LINE = "#3A3428"
+INK = "#F4EFE6"
+MUTE = "#B3A89A"
+FAINT = "#7A7166"
+AMBER = "#E2A23A"
+OK = "#7FBF9A"
+BAD = "#D4654F"
+WARN = "#E2A23A"
 
-FONT_DISPLAY = ("Segoe UI Semibold", 32)
 FONT_TITLE = ("Segoe UI Semibold", 11)
 FONT_BODY = ("Segoe UI", 9)
 FONT_SMALL = ("Segoe UI", 9)
@@ -53,7 +51,6 @@ def cjk_font(size: int = 9) -> tuple:
     return (cjk_family(), size)
 
 PAD = 10
-RADIUS_NOTE = "卡片统一用 1px LINE 描边 + 无圆角系统主题，靠间距分层，不用阴影。"
 
 
 def enable_dpi_awareness() -> None:
@@ -93,27 +90,8 @@ def apply_theme(root: tk.Tk | tk.Widget) -> None:
 
     style.configure(".", background=BG, foreground=INK, font=FONT_BODY)
     style.configure("TFrame", background=BG)
-    style.configure("Card.TFrame", background=PANEL)
-    style.configure("Header.TFrame", background=PANEL)
-    style.configure("Sidebar.TFrame", background=BG)
 
     style.configure("TLabel", background=BG, foreground=INK, font=FONT_BODY)
-    style.configure("Card.TLabel", background=PANEL, foreground=INK)
-    style.configure("Mute.TLabel", background=BG, foreground=MUTE, font=FONT_SMALL)
-    style.configure("CardMute.TLabel", background=PANEL, foreground=MUTE, font=FONT_SMALL)
-    style.configure(
-        "Eyebrow.TLabel",
-        background=PANEL,
-        foreground=FAINT,
-        font=FONT_EYEBROW,
-    )
-    style.configure(
-        "HeaderEyebrow.TLabel",
-        background=PANEL,
-        foreground=MUTE,
-        font=FONT_EYEBROW,
-    )
-    style.configure("Title.TLabel", background=BG, foreground=INK, font=FONT_TITLE)
 
     style.configure(
         "TButton",
@@ -127,7 +105,7 @@ def apply_theme(root: tk.Tk | tk.Widget) -> None:
     )
     style.map(
         "TButton",
-        background=[("active", "#243044"), ("disabled", PANEL)],
+        background=[("active", "#4A4034"), ("disabled", PANEL)],
         foreground=[("disabled", FAINT)],
     )
     style.configure(
@@ -141,7 +119,7 @@ def apply_theme(root: tk.Tk | tk.Widget) -> None:
     )
     style.map(
         "Accent.TButton",
-        background=[("active", "#FFC14D"), ("disabled", PANEL_2)],
+        background=[("active", "#F0B456"), ("disabled", PANEL_2)],
         foreground=[("disabled", FAINT)],
     )
 
@@ -156,4 +134,3 @@ def apply_theme(root: tk.Tk | tk.Widget) -> None:
         insertcolor=INK,
     )
     style.configure("TScrollbar", background=PANEL, troughcolor=BG, bordercolor=BG)
-    style.configure("Card.TScrollbar", background=PANEL, troughcolor=PANEL)

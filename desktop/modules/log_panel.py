@@ -1,4 +1,4 @@
-"""Server 日志：只回答“刚才发生了什么”，默认自动跟随，报错行标红。"""
+"""Server 日志：默认折叠，展开后自动跟随，报错行标红。"""
 from __future__ import annotations
 
 import queue
@@ -16,13 +16,10 @@ from desktop.modules.base_panel import BasePanel
 
 
 _TIME_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[,.]\d+)?\s*")
-_NUM = re.compile(r"\d+")
 
 _POLLING_PATHS = (
-    "/video/status",
-    "/video/latest.jpg",
+    "/video/rtp_status",
     "/video/timing",
-    "/video/mjpeg",
     "/ping",
     "/test",
     "/command",
@@ -59,8 +56,11 @@ def _classify_tag(line: str) -> str | None:
 
 
 class LogPanel(BasePanel):
-    def __init__(self, master, default_server: str = "ws://127.0.0.1:8000", **kwargs) -> None:
+    def __init__(self, master, default_server: str = "http://127.0.0.1:8000",
+                 on_fold=None, **kwargs) -> None:
         self._default_server = default_server
+        self._on_fold = on_fold
+        self._folded = True
         self._client: LogClient | None = None
         self._queue: queue.Queue = queue.Queue()
         self._follow = True
@@ -72,48 +72,49 @@ class LogPanel(BasePanel):
         self._pending_since: float = 0.0
         self._dedup_hidden: int = 0
         self._polling_hidden: int = 0
-        super().__init__(master, title="LOGS · 日志", **kwargs)
+        super().__init__(master, title="日志", **kwargs)
+
+    @property
+    def folded(self) -> bool:
+        return self._folded
+
+    def set_folded(self, folded: bool) -> None:
+        folded = bool(folded)
+        changed = folded != self._folded
+        self._folded = folded
+        self._apply_fold()
+        if changed and self._on_fold is not None:
+            self._on_fold(self._folded)
 
     def build(self) -> None:
-        head = tk.Frame(self, bg=theme.PANEL)
-        head.pack(fill=tk.X, padx=theme.PAD, pady=(theme.PAD, 6))
-        tk.Label(head, text="LOGS · 日志", bg=theme.PANEL, fg=theme.FAINT,
-                 font=theme.FONT_EYEBROW).pack(side=tk.LEFT)
-        self._toggle_btn = ttk.Button(head, text="连接", command=self._toggle)
-        self._toggle_btn.pack(side=tk.RIGHT)
-        ttk.Button(head, text="清空远端", command=self._clear_history).pack(side=tk.RIGHT, padx=(0, 6))
-        self._follow_var = tk.StringVar(value="跟随开")
-        ttk.Button(head, textvariable=self._follow_var,
-                   command=self._flip_follow).pack(side=tk.RIGHT, padx=(0, 6))
+        self._head = tk.Frame(self, bg=theme.PANEL)
+        self._head.pack(fill=tk.X, padx=theme.PAD, pady=(theme.PAD, 6))
+        self._fold_btn = ttk.Button(self._head, text="日志", command=self._on_fold_click)
+        self._fold_btn.pack(side=tk.LEFT)
+        self._connect_btn = ttk.Button(self._head, text="连接", command=self._toggle)
+        self._clear_btn = ttk.Button(self._head, text="清空", command=self._clear_history)
+        self._follow_btn = ttk.Button(self._head, text="跟随", command=self._flip_follow)
 
-        opts = tk.Frame(self, bg=theme.PANEL)
-        opts.pack(fill=tk.X, padx=theme.PAD, pady=(0, 6))
+        self._opts = tk.Frame(self, bg=theme.PANEL)
         self._dedup_var = tk.BooleanVar(value=self._dedup)
-        ttk.Checkbutton(opts, text="折叠重复", variable=self._dedup_var,
+        ttk.Checkbutton(self._opts, text="折叠重复", variable=self._dedup_var,
                         command=self._flip_dedup).pack(side=tk.LEFT)
         self._hide_poll_var = tk.BooleanVar(value=self._hide_polling)
-        ttk.Checkbutton(opts, text="隐藏轮询", variable=self._hide_poll_var,
+        ttk.Checkbutton(self._opts, text="隐藏轮询", variable=self._hide_poll_var,
                         command=self._flip_hide_poll).pack(side=tk.LEFT, padx=(8, 0))
         self._fold_var = tk.StringVar(value="")
-        tk.Label(opts, textvariable=self._fold_var, bg=theme.PANEL, fg=theme.FAINT,
-                 font=theme.FONT_SMALL).pack(side=tk.RIGHT)
+        tk.Label(self._opts, textvariable=self._fold_var, bg=theme.PANEL, fg=theme.FAINT,
+                 font=theme.cjk_font(9)).pack(side=tk.RIGHT)
 
-        self._server_var = tk.StringVar(value=self._default_server)
-        addr = tk.Frame(self, bg=theme.PANEL)
-        addr.pack(fill=tk.X, padx=theme.PAD, pady=(0, 6))
-        tk.Label(addr, text="Server", bg=theme.PANEL, fg=theme.MUTE,
-                 font=theme.FONT_SMALL).pack(side=tk.LEFT)
-        ttk.Entry(addr, textvariable=self._server_var).pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
-
-        frame = tk.Frame(self, bg=theme.PANEL)
-        frame.pack(fill=tk.BOTH, expand=True, padx=theme.PAD, pady=(0, theme.PAD))
-        self._text = tk.Text(frame, wrap=tk.WORD, state=tk.DISABLED,
-                             bg="#0B0F16", fg="#C7D2E2", insertbackground=theme.INK,
-                             relief=tk.FLAT, highlightthickness=1,
-                             highlightbackground=theme.LINE,
-                             font=theme.cjk_font(9))
-        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self._text.yview)
+        self._body = tk.Frame(self, bg=theme.PANEL)
+        self._text = tk.Text(
+            self._body, wrap=tk.WORD, state=tk.DISABLED,
+            bg=theme.BG, fg=theme.INK, insertbackground=theme.INK,
+            relief=tk.FLAT, highlightthickness=1,
+            highlightbackground=theme.LINE,
+            font=theme.cjk_font(9),
+        )
+        scrollbar = ttk.Scrollbar(self._body, orient=tk.VERTICAL, command=self._text.yview)
         self._text.configure(yscrollcommand=scrollbar.set)
         self._text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -122,12 +123,31 @@ class LogPanel(BasePanel):
         self._text.tag_config("ok", foreground=theme.OK)
         self._text.tag_config("fold", foreground=theme.FAINT)
 
+        self._apply_fold()
         self.after(200, self._poll)
         # 默认自动连接（与 Monitor/Pusher 一致），失败仅打行日志不断裂
         try:
             self.after(500, self._auto_connect)
         except Exception:
             pass
+
+    def _on_fold_click(self) -> None:
+        self.set_folded(not self._folded)
+
+    def _apply_fold(self) -> None:
+        self._fold_btn.config(text="日志" if self._folded else "收起")
+        if self._folded:
+            self._follow_btn.pack_forget()
+            self._clear_btn.pack_forget()
+            self._connect_btn.pack_forget()
+            self._opts.pack_forget()
+            self._body.pack_forget()
+            return
+        self._connect_btn.pack(side=tk.RIGHT)
+        self._clear_btn.pack(side=tk.RIGHT, padx=(0, 4))
+        self._follow_btn.pack(side=tk.RIGHT, padx=(0, 4))
+        self._opts.pack(fill=tk.X, padx=theme.PAD, pady=(0, 6))
+        self._body.pack(fill=tk.BOTH, expand=True, padx=theme.PAD, pady=(0, theme.PAD))
 
     def _auto_connect(self) -> None:
         if self._client is None:
@@ -138,7 +158,7 @@ class LogPanel(BasePanel):
 
     def _clear_history(self) -> None:
         """显式清服务端历史（按钮触发，不再初始化自动清）。"""
-        url = self._server_var.get().rstrip("/")
+        url = self._default_server.rstrip("/")
         threading.Thread(target=self._clear_worker, args=(url,), daemon=True).start()
 
     def _clear_worker(self, url: str) -> None:
@@ -151,22 +171,22 @@ class LogPanel(BasePanel):
         if self._client is None:
             self._queue = queue.Queue()
             self._reset_text()
-            url = self._server_var.get().rstrip("/")
+            url = self._default_server.rstrip("/")
             if url.startswith("http://"):
                 url = "ws://" + url[len("http://"):]
             elif url.startswith("https://"):
                 url = "wss://" + url[len("https://"):]
             self._client = LogClient(url + "/ws/logs", self._queue)
             self._client.start()
-            self._toggle_btn.config(text="断开")
+            self._connect_btn.config(text="断开")
         else:
             self._client.stop()
             self._client = None
-            self._toggle_btn.config(text="连接")
+            self._connect_btn.config(text="连接")
 
     def _flip_follow(self) -> None:
         self._follow = not self._follow
-        self._follow_var.set("跟随开" if self._follow else "跟随关")
+        self._follow_btn.config(text="跟随" if self._follow else "不跟")
 
     def _flip_dedup(self) -> None:
         self._dedup = bool(self._dedup_var.get())

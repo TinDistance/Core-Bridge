@@ -1,4 +1,4 @@
-"""手柄面板：xinput_gui.py 的 pit-wall 版 —— 操作手的另一只眼睛。"""
+"""控制卡：摇杆、按键灯、扳机、履带读数和指令链路。"""
 from __future__ import annotations
 
 import threading
@@ -11,13 +11,49 @@ from desktop import theme
 from desktop.gamepad import xinput as xi
 from desktop.modules.base_panel import BasePanel
 
-_HAT = xi.HAT_NAMES
-
+UI_TICK_MS = 50
 SERVER_POLL_S = 0.5
+_STICK_PX = 88
 
 _YAW_TEXT = {0: "停", 1: "右转", 2: "左转"}
 _PITCH_TEXT = {0: "停", 1: "上仰", 2: "下俯"}
 _REAR_TEXT = {0: "停", 1: "顺时针", 2: "逆时针"}
+_OK = "#7FBF9A"
+_LEVEL_FG = {"ok": _OK, "warn": theme.WARN, "bad": theme.BAD, "mute": theme.MUTE}
+
+# LAMPS_13 在上，LAMPS_14 在下。掩码只在 buttons 仍是整型位图时使用。
+_LAMPS = tuple(xi.LAMPS_13) + tuple(xi.LAMPS_14)
+
+
+def _axis_u16(v: int) -> int:
+    """收成 0..65535，中位 32768。
+
+    规格按这段无符号轴取点。当前快照存的是 XInput 有符号 SHORT
+    （中位 0，-32768..32767），先加 32768。已经大于 32767 的值视为
+    无符号轴，不再平移。
+    """
+    v = int(v)
+    if v <= 32767:
+        v += 32768
+    if v < 0:
+        return 0
+    if v > 65535:
+        return 65535
+    return v
+
+
+def _axis_unit(v: int) -> float:
+    return max(-1.0, min(1.0, (_axis_u16(v) - 32768) / 32767.0))
+
+
+def _lamp_on(buttons, name: str, mask: int) -> bool:
+    """灯名来自 LAMPS。dict 按灯名；整型位图按同名掩码。"""
+    if isinstance(buttons, dict):
+        return bool(buttons.get(name))
+    try:
+        return bool(int(buttons) & int(mask))
+    except (TypeError, ValueError):
+        return False
 
 
 def format_server_line(state: dict) -> tuple[str, str]:
@@ -88,109 +124,137 @@ class GamepadPanel(BasePanel):
         self._server_state: dict = {}
         self._server_stop = threading.Event()
         self._server_thread: threading.Thread | None = None
-        super().__init__(master, title="GAMEPAD · 手柄", **kwargs)
+        self._lt_val = 0
+        self._rt_val = 0
+        super().__init__(master, title="控制", **kwargs)
 
     def build(self) -> None:
         head = tk.Frame(self, bg=theme.PANEL)
-        head.pack(fill=tk.X, padx=theme.PAD, pady=(theme.PAD, 2))
-        tk.Label(head, text="GAMEPAD · 手柄", bg=theme.PANEL,
-                 fg=theme.FAINT, font=theme.FONT_EYEBROW).pack(side=tk.LEFT)
-        self._pill_var = tk.StringVar(value="启动中")
-        self._pill = tk.Label(head, textvariable=self._pill_var,
-                              bg="#232E42", fg=theme.MUTE,
-                              font=theme.FONT_EYEBROW, padx=8, pady=2)
-        self._pill.pack(side=tk.RIGHT)
-        self._conn_var = tk.StringVar(value="正在尝试连接手柄…")
-        tk.Label(head, textvariable=self._conn_var, bg=theme.PANEL,
-                 fg=theme.MUTE, font=theme.FONT_MONO_SM).pack(
-            side=tk.RIGHT, padx=(0, 8))
+        head.pack(fill=tk.X, padx=theme.PAD, pady=(theme.PAD, 4))
+        tk.Label(head, text="控制", bg=theme.PANEL, fg=theme.FAINT,
+                 font=theme.cjk_font(9)).pack(side=tk.LEFT)
+        self._status = tk.Label(head, text="—", bg=theme.PANEL, fg=theme.MUTE,
+                                font=theme.cjk_font(9))
+        self._status.pack(side=tk.RIGHT)
 
-        body = tk.Frame(self, bg=theme.PANEL)
-        body.pack(fill=tk.BOTH, expand=True, padx=theme.PAD, pady=(0, 2))
-        for i, w in enumerate((1, 1, 0, 0)):
-            body.columnconfigure(i, weight=w)
+        sticks = tk.Frame(self, bg=theme.PANEL)
+        sticks.pack(fill=tk.X, padx=theme.PAD, pady=(0, 4))
+        sticks.columnconfigure(0, weight=1)
+        sticks.columnconfigure(1, weight=1)
+        self._lx_canvas, self._lx_dot = self._make_stick(sticks)
+        self._rx_canvas, self._rx_dot = self._make_stick(sticks)
+        self._lx_canvas.grid(row=0, column=0, padx=(0, 4))
+        self._rx_canvas.grid(row=0, column=1, padx=(4, 0))
 
-        btnf = tk.Frame(body, bg=theme.PANEL)
-        btnf.grid(row=0, column=0, sticky="nw", padx=(0, 10))
-        self._lamps: dict[str, tk.Label] = {}
-        names = [n for n, _ in xi.LAMPS_13 + xi.LAMPS_14] + ["Share"]
-        for i, n in enumerate(names):
-            lamp = tk.Label(btnf, text=n, width=6, relief="groove",
-                            bg="#232E42", fg=theme.MUTE,
-                            font=("Segoe UI", 8, "bold"))
-            lamp.grid(row=i // 6, column=i % 6, padx=2, pady=2, sticky="nsew")
-            self._lamps[n] = lamp
-        self._dp_var = tk.StringVar(value="十字键: --")
-        tk.Label(btnf, textvariable=self._dp_var, bg=theme.PANEL,
-                 fg=theme.MUTE, font=theme.FONT_MONO_SM).grid(
-            row=3, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        bars = tk.Frame(self, bg=theme.PANEL)
+        bars.pack(fill=tk.X, padx=theme.PAD, pady=(0, 4))
+        self._lt_bar = self._make_bar(bars, "LT")
+        self._rt_bar = self._make_bar(bars, "RT")
+        self._lt_bar.bind("<Configure>", lambda _e: self._paint_bar(self._lt_bar, self._lt_val))
+        self._rt_bar.bind("<Configure>", lambda _e: self._paint_bar(self._rt_bar, self._rt_val))
 
-        self._sticks: dict[str, tuple] = {}
-        for j, name in enumerate(("左摇杆", "右摇杆")):
-            f = tk.Frame(body, bg=theme.PANEL)
-            f.grid(row=0, column=1 + j, sticky="n", padx=4)
-            tk.Label(f, text=name, bg=theme.PANEL, fg=theme.FAINT,
-                     font=theme.FONT_EYEBROW).pack()
-            cv = tk.Canvas(f, width=120, height=120, bg="#0B0F16",
-                           highlightthickness=1, highlightbackground=theme.LINE)
-            cv.pack()
-            cv.create_line(8, 60, 112, 60, fill="#1B2432")
-            cv.create_line(60, 8, 60, 112, fill="#1B2432")
-            dot = cv.create_oval(0, 0, 0, 0, fill="#FF5D5D", outline="")
-            self._sticks[name] = (cv, dot)
+        lamps = tk.Frame(self, bg=theme.PANEL)
+        lamps.pack(fill=tk.X, padx=theme.PAD, pady=(0, 4))
+        self._lamps: dict[str, tuple[tk.Label, int]] = {}
+        cols = 6
+        for i, (name, mask) in enumerate(_LAMPS):
+            lbl = tk.Label(lamps, text=name, bg=theme.PANEL_2, fg=theme.FAINT,
+                           font=theme.cjk_font(8), padx=2, pady=1)
+            lbl.grid(row=i // cols, column=i % cols, padx=1, pady=1, sticky="ew")
+            self._lamps[name] = (lbl, mask)
+        for col in range(cols):
+            lamps.columnconfigure(col, weight=1)
 
-        trigf = tk.Frame(body, bg=theme.PANEL)
-        trigf.grid(row=0, column=3, sticky="n", padx=(10, 0))
-        tk.Label(trigf, text="扳机 0~255", bg=theme.PANEL, fg=theme.FAINT,
-                 font=theme.FONT_EYEBROW).grid(row=0, column=0, columnspan=2)
-        self._trigs: dict[str, tuple] = {}
-        for j, name in enumerate(("LT", "RT")):
-            c = tk.Frame(trigf, bg=theme.PANEL)
-            c.grid(row=1, column=j, padx=4)
-            tk.Label(c, text=name, bg=theme.PANEL, fg=theme.MUTE,
-                     font=theme.FONT_SMALL).pack()
-            cv = tk.Canvas(c, width=34, height=120, bg="#0B0F16",
-                           highlightthickness=1, highlightbackground=theme.LINE)
-            cv.pack()
-            bar = cv.create_rectangle(4, 120, 30, 120, fill="#2a7f2a", outline="")
-            txt = cv.create_text(17, 10, text="0", fill=theme.MUTE,
-                                 font=("Consolas", 8))
-            self._trigs[name] = (cv, bar, txt)
+        metrics = tk.Frame(self, bg=theme.PANEL)
+        metrics.pack(fill=tk.X, padx=theme.PAD, pady=(2, 2))
+        self._metric: dict[str, tk.Label] = {}
+        captions = ("左履带", "右履带", "炮塔", "后臂", "开火", "急停")
+        weights = (1, 1, 2, 1, 1, 1)
+        for col, (key, weight) in enumerate(zip(captions, weights)):
+            metrics.columnconfigure(col, weight=weight)
+            cell = tk.Frame(metrics, bg=theme.PANEL)
+            cell.grid(row=0, column=col, sticky="ew", padx=1)
+            tk.Label(cell, text=key, bg=theme.PANEL, fg=theme.FAINT,
+                     font=theme.cjk_font(8)).pack(anchor="w")
+            value = tk.Label(cell, text="—", bg=theme.PANEL, fg=theme.INK,
+                             font=theme.cjk_font(9))
+            value.pack(anchor="w")
+            self._metric[key] = value
 
-        prof = tk.Frame(self, bg="#0B0F16", highlightthickness=1,
-                        highlightbackground=theme.LINE)
-        prof.pack(fill=tk.X, padx=theme.PAD, pady=(2, theme.PAD))
-        self._hex_var = tk.StringVar(value="-- 等待手柄数据 --")
-        tk.Label(prof, textvariable=self._hex_var, bg="#0B0F16",
-                 fg=theme.INK, font=("Consolas", 11, "bold")).pack(
-            anchor="w", padx=8, pady=(4, 0))
-        self._tank_var = tk.StringVar(value="TANK --")
-        self._tank_lbl = tk.Label(prof, textvariable=self._tank_var,
-                                  bg="#0B0F16", fg="#7FD4FF",
-                                  font=("Consolas", 11, "bold"))
-        self._tank_lbl.pack(anchor="w", padx=8, pady=(2, 0))
-        self._link_var = tk.StringVar(value="链路 --")
-        self._link_lbl = tk.Label(prof, textvariable=self._link_var,
-                                  bg="#0B0F16", fg=theme.MUTE,
-                                  font=("Consolas", 10, "bold"))
-        self._link_lbl.pack(anchor="w", padx=8, pady=(2, 0))
-        self._server_var = tk.StringVar(value="服务端 -- 等待地址")
-        self._server_lbl = tk.Label(prof, textvariable=self._server_var,
-                                    bg="#0B0F16", fg=theme.MUTE,
-                                    font=("Consolas", 10, "bold"))
-        self._server_lbl.pack(anchor="w", padx=8, pady=(2, 0))
-        self._detail_var = tk.StringVar(value="")
-        tk.Label(prof, textvariable=self._detail_var, bg="#0B0F16",
-                 fg=theme.MUTE, font=("Consolas", 8)).pack(
-            anchor="w", padx=8, pady=(0, 4))
+        send = tk.Frame(self, bg=theme.PANEL)
+        send.pack(fill=tk.X, padx=theme.PAD, pady=(4, 0))
+        tk.Label(send, text="发送", bg=theme.PANEL, fg=theme.FAINT,
+                 font=theme.cjk_font(8)).pack(side=tk.LEFT, padx=(0, 6))
+        self._send_value = tk.Label(send, text="—", anchor="w", bg=theme.PANEL,
+                                    fg=theme.MUTE, font=theme.FONT_MONO)
+        self._send_value.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        if not xi.available():
-            self._conn_var.set("本机无 XInput（非 Windows / 缺 DLL），仅显示中位报文")
-            self._pill_var.set("无 XInput")
-            self._pill.config(fg=theme.MUTE, bg="#232E42")
+        cmd = tk.Frame(self, bg=theme.PANEL)
+        cmd.pack(fill=tk.X, padx=theme.PAD, pady=(1, theme.PAD))
+        tk.Label(cmd, text="指令", bg=theme.PANEL, fg=theme.FAINT,
+                 font=theme.cjk_font(8)).pack(side=tk.LEFT, anchor="n", padx=(0, 6))
+        self._cmd_value = tk.Label(cmd, text="—", anchor="w", justify=tk.LEFT,
+                                   bg=theme.PANEL, fg=theme.MUTE,
+                                   font=theme.FONT_MONO, wraplength=220)
+        self._cmd_value.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.bind("<Configure>", self._on_configure)
 
         self._start_server_poll()
-        self.after(50, self._tick)
+        self.after(UI_TICK_MS, self._tick)
+
+    def _make_stick(self, parent: tk.Frame) -> tuple[tk.Canvas, int]:
+        size = _STICK_PX
+        canvas = tk.Canvas(parent, width=size, height=size, bg=theme.PANEL_2,
+                           highlightthickness=1, highlightbackground=theme.LINE,
+                           bd=0)
+        mid = size / 2
+        pad = 6
+        canvas.create_oval(pad, pad, size - pad, size - pad, outline=theme.LINE)
+        canvas.create_line(mid, pad, mid, size - pad, fill=theme.FAINT)
+        canvas.create_line(pad, mid, size - pad, mid, fill=theme.FAINT)
+        dot = canvas.create_oval(mid - 4, mid - 4, mid + 4, mid + 4,
+                                 fill=theme.INK, outline="")
+        return canvas, dot
+
+    def _make_bar(self, parent: tk.Frame, title: str) -> tk.Canvas:
+        row = tk.Frame(parent, bg=theme.PANEL)
+        row.pack(fill=tk.X, pady=1)
+        tk.Label(row, text=title, width=2, anchor="w", bg=theme.PANEL,
+                 fg=theme.FAINT, font=theme.FONT_MONO).pack(side=tk.LEFT)
+        bar = tk.Canvas(row, height=8, bg=theme.PANEL_2, highlightthickness=0, bd=0)
+        bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+        return bar
+
+    def _on_configure(self, event) -> None:
+        if event.widget is not self or event.width < 40:
+            return
+        self._cmd_value.configure(wraplength=max(120, event.width - 56))
+
+    def _place_dot(self, canvas: tk.Canvas, dot: int, x: int, y: int) -> None:
+        size = _STICK_PX
+        mid = size / 2
+        radius = size / 2 - 12
+        u = _axis_unit(x)
+        v = _axis_unit(y)
+        px = mid + u * radius
+        py = mid - v * radius
+        canvas.coords(dot, px - 4, py - 4, px + 4, py + 4)
+        canvas.itemconfig(dot, fill=theme.AMBER if abs(u) > 0.08 or abs(v) > 0.08 else theme.INK)
+
+    def _paint_bar(self, canvas: tk.Canvas, value: int) -> None:
+        canvas.delete("fill")
+        width = canvas.winfo_width()
+        height = canvas.winfo_height()
+        if width < 2 or height < 2:
+            return
+        frac = max(0.0, min(1.0, int(value) / 255.0))
+        if frac <= 0:
+            return
+        canvas.create_rectangle(0, 0, max(1, width * frac), height,
+                                fill=theme.AMBER, width=0, tags="fill")
+
+    def _set_metric(self, key: str, text: str, color: str) -> None:
+        self._metric[key].config(text=text, fg=color)
 
     def _base_url(self) -> str:
         try:
@@ -214,9 +278,9 @@ class GamepadPanel(BasePanel):
                     if base:
                         try:
                             state = fetch_server_state(client, base)
-                        except Exception as e:
+                        except Exception as exc:
                             state = {"base_url": base, "ok": False,
-                                     "error": str(e)[:80], "at": time.time()}
+                                     "error": str(exc)[:80], "at": time.time()}
                         with self._server_lock:
                             self._server_state = state
                     if self._server_stop.wait(SERVER_POLL_S):
@@ -229,170 +293,92 @@ class GamepadPanel(BasePanel):
             return dict(self._server_state)
 
     def stop(self) -> None:
-        try:
-            self._server_stop.set()
-        except Exception:
-            pass
+        self._server_stop.set()
 
     def _tick(self) -> None:
-        if getattr(self, "_closed", False):
+        if self._closed:
             return
         try:
-            if self._pusher is not None:
-                self._render(self._pusher.snapshot())
-            self._render_server()
+            snap = self._pusher.snapshot() if self._pusher is not None else None
+            self._render(snap)
         except tk.TclError:
             return
         finally:
-            try:
-                self.after(50, self._tick)
-            except tk.TclError:
-                pass
-
-    def destroy(self) -> None:  # type: ignore[override]
-        self._closed = True
-        try:
-            self.stop()
-        except Exception:
-            pass
-        super().destroy()
-
-    def _set_lamp(self, name: str, on: bool) -> None:
-        lbl = self._lamps.get(name)
-        if lbl is None:
-            return
-        if on:
-            lbl.config(bg="#C22F2F", fg="white")
-        else:
-            lbl.config(bg="#232E42", fg=theme.MUTE)
+            if not self._closed:
+                try:
+                    self.after(UI_TICK_MS, self._tick)
+                except tk.TclError:
+                    pass
 
     def _render(self, snap) -> None:
-        w = snap.buttons
-        for n, _ in xi.LAMPS_13 + xi.LAMPS_14:
-            self._set_lamp(n, False)
-        self._set_lamp("Share", False)
-        for n, m in xi.LAMPS_13:
-            if w & m:
-                self._set_lamp(n, True)
-        for n, m in xi.LAMPS_14:
-            if w & m:
-                self._set_lamp(n, True)
-
-        for name, x, y in (("左摇杆", snap.lx, -snap.ly),
-                           ("右摇杆", snap.rx, -snap.ry)):
-            cv, dot = self._sticks[name]
-            cx, cy = 60, 60
-            dx = x / 32768 * 50
-            dy = y / 32768 * 50
-            cv.coords(dot, cx + dx - 5, cy + dy - 5, cx + dx + 5, cy + dy + 5)
-
-        for tname, val in (("LT", snap.lt8), ("RT", snap.rt8)):
-            cv, bar, txt = self._trigs[tname]
-            h = int(val / 255 * 116)
-            cv.coords(bar, 4, 120 - h, 30, 120)
-            cv.itemconfig(txt, text=str(val))
-
-        hat = xi.hat_from_buttons(w)
-        l3 = bool(w & xi.XINPUT_GAMEPAD_LEFT_THUMB)
-        r3 = bool(w & xi.XINPUT_GAMEPAD_RIGHT_THUMB)
-        self._dp_var.set(
-            f"十字键帽子值: {hat} {_HAT.get(hat, '?')}    L3={l3} R3={r3}")
-
-        try:
-            parsed = xi.parse_protocol(snap.proto)
-        except Exception:
-            self._hex_var.set("-- 协议帧异常 --")
-            self._tank_var.set("TANK --")
-            self._link_var.set("链路 --")
-            return
-        self._hex_var.set(" ".join(
-            parsed["raw_hex"][i:i + 2] for i in range(0, 32, 2)))
-        self._render_tank(snap)
-        self._render_link(snap, parsed)
-        prof = (
-            f"LX={parsed['lx']:5d} LY={parsed['ly']:5d} "
-            f"RX={parsed['rx']:5d} RY={parsed['ry']:5d}  "
-            f"LT={parsed['lt']:4d} RT={parsed['rt']:4d}  "
-            f"hat={parsed['hat']} btn=0x{parsed['btn']:02X} "
-            f"sys=0x{parsed['sys']:02X} share=0x{parsed['share']:02X}  "
-            f"{'已推送→/command' if snap.posted else '未推送'}")
-        if getattr(snap, "last_error", ""):
-            prof += f" · {snap.last_error}"
-        self._detail_var.set(prof)
-
-        if snap.connected:
-            self._conn_var.set(
-                f"手柄已连接 (slot {snap.slot}) · 包号 {snap.packet} · {snap.fps:.0f}Hz")
-            self._pill_var.set("● 手柄")
-            self._pill.config(fg=theme.OK, bg="#14352B")
-        elif xi.available():
-            self._conn_var.set("未连接手柄 · 零帧常发中 · 已自动重连等待中")
-            self._pill_var.set("无手柄 · 发零帧")
-            self._pill.config(fg=theme.BAD, bg="#3A1E1E")
-
-    def _render_server(self) -> None:
-        with self._server_lock:
-            state = dict(self._server_state)
-        if not state and not self._base_url():
-            text, level = "服务端 -- 等待地址", "mute"
-        elif not state:
-            text, level = f"服务端 … 连接 {self._base_url()}", "mute"
+        if not xi.available():
+            self._status.config(text="无 XInput", fg=theme.MUTE)
+        elif snap is None or not snap.connected:
+            self._status.config(text="无手柄", fg=theme.MUTE)
         else:
-            text, level = format_server_line(state)
-        self._server_var.set(text)
-        color = {"ok": "#7FD4A8", "warn": "#FFB020",
-                 "bad": "#FF5D5D"}.get(level, theme.MUTE)
-        try:
-            self._server_lbl.config(fg=color, bg="#0B0F16")
-        except Exception:
-            pass
+            slot = "—" if snap.slot is None else str(snap.slot)
+            self._status.config(text=f"{slot} {snap.fps:.0f}Hz", fg=theme.OK)
 
-    def _render_link(self, snap, parsed) -> None:
-        transport = (getattr(snap, "transport", "") or "").lower()
-        via = {"udp": "UDP", "http": "HTTP"}.get(transport, "…")
-        sent = int(getattr(snap, "sent", 0) or 0)
-        err = str(getattr(snap, "last_error", "") or "")
-        if getattr(snap, "posted", False):
-            if "零帧" in err:
-                text = f"⇅ 50Hz常发 {via} · 第{sent}帧 · {err} · 原始已转零速"
-                self._link_lbl.config(fg="#FFB020", bg="#0B0F16")
-            else:
-                text = (f"⇅ 50Hz常发 {via} · 第{sent}帧 · LX={parsed['lx']:+d} "
-                        f"LY={parsed['ly']:+d} RX={parsed['rx']:+d} "
-                        f"RY={parsed['ry']:+d} hat={parsed['hat']} "
-                        f"btn=0x{parsed['btn']:02X}")
-                self._link_lbl.config(fg="#7FD4A8", bg="#0B0F16")
-        else:
-            text = f"✕ 发送停滞 {via} · 已发{sent}帧" + (f" · {err}" if err else "")
-            self._link_lbl.config(fg="#FF5D5D", bg="#0B0F16")
-        self._link_var.set(text)
+        lx = ly = rx = ry = 0
+        if snap is not None:
+            lx, ly, rx, ry = snap.lx, snap.ly, snap.rx, snap.ry
+        self._place_dot(self._lx_canvas, self._lx_dot, lx, ly)
+        self._place_dot(self._rx_canvas, self._rx_dot, rx, ry)
 
-    def _render_tank(self, snap) -> None:
-        tank = getattr(snap, "tank", None) or {}
-        progress = float(getattr(snap, "estop_progress", 0.0) or 0.0)
-        track_l = int(tank.get("track_l", 0) or 0)
-        track_r = int(tank.get("track_r", 0) or 0)
-        yaw = int(tank.get("yaw_rot", 0) or 0)
-        pitch = int(tank.get("pitch_rot", 0) or 0)
-        rear = int(tank.get("rear_rot", 0) or 0)
-        fire = int(tank.get("fire", 0) or 0)
+        buttons = getattr(snap, "buttons", 0) if snap is not None else 0
+        for name, (lbl, mask) in self._lamps.items():
+            on = _lamp_on(buttons, name, mask)
+            lbl.config(bg=theme.AMBER if on else theme.PANEL_2,
+                       fg=theme.BG if on else theme.FAINT)
+
+        self._lt_val = int(snap.lt8) if snap is not None else 0
+        self._rt_val = int(snap.rt8) if snap is not None else 0
+        self._paint_bar(self._lt_bar, self._lt_val)
+        self._paint_bar(self._rt_bar, self._rt_val)
+
+        tank = (snap.tank if snap is not None else None) or {}
         estop = int(tank.get("estop", 0) or 0)
+        progress = float(snap.estop_progress or 0) if snap is not None else 0.0
+        self._set_metric("左履带", f"{int(tank.get('track_l', 0) or 0):+d}", theme.INK)
+        self._set_metric("右履带", f"{int(tank.get('track_r', 0) or 0):+d}", theme.INK)
+        yaw = _YAW_TEXT.get(int(tank.get("yaw_rot", 0) or 0), "?")
+        pitch = _PITCH_TEXT.get(int(tank.get("pitch_rot", 0) or 0), "?")
+        self._set_metric("炮塔", f"{yaw}/{pitch}", theme.INK)
+        rear = _REAR_TEXT.get(int(tank.get("rear_rot", 0) or 0), "?")
+        self._set_metric("后臂", rear, theme.INK)
         if estop:
-            text = "■ 急停锁存 ESTOP=1（左键/Start解除）"
-            self._tank_lbl.config(fg="white", bg="#C22F2F")
-        elif progress > 0.0:
-            text = ("… 急停 %d%%（右键保持2秒） L=%+d R=%+d 炮塔%s/%s 后臂%s %s"
-                    % (round(progress * 100), track_l, track_r,
-                       _YAW_TEXT.get(yaw, "?"), _PITCH_TEXT.get(pitch, "?"),
-                       _REAR_TEXT.get(rear, "?"),
-                       "开火!" if fire else ""))
-            self._tank_lbl.config(fg="#FFB020", bg="#0B0F16")
+            self._set_metric("开火", "停", theme.MUTE)
+            self._set_metric("急停", "锁", theme.BAD)
         else:
-            firing = " 开火FIRE=1" if fire else ""
-            text = ("▶ L=%+d R=%+d 炮塔%s/%s 后臂%s%s"
-                    % (track_l, track_r, _YAW_TEXT.get(yaw, "?"),
-                       _PITCH_TEXT.get(pitch, "?"),
-                       _REAR_TEXT.get(rear, "?"), firing))
-            self._tank_lbl.config(
-                fg="#FF5D5D" if fire else "#7FD4FF", bg="#0B0F16")
-        self._tank_var.set(text)
+            fire = int(tank.get("fire", 0) or 0) == 1
+            self._set_metric("开火", "开" if fire else "关", theme.BAD if fire else theme.MUTE)
+            if 0 < progress < 1:
+                self._set_metric("急停", f"{round(progress * 100)}%", theme.WARN)
+            else:
+                self._set_metric("急停", "0", theme.MUTE)
+
+        send_text, send_level = self._send_view(snap)
+        self._send_value.config(text=send_text, fg=_LEVEL_FG.get(send_level, theme.MUTE))
+        cmd_text, cmd_level = format_server_line(self.server_snapshot())
+        self._cmd_value.config(text=cmd_text, fg=_LEVEL_FG.get(cmd_level, theme.MUTE))
+
+    @staticmethod
+    def _send_view(snap) -> tuple[str, str]:
+        if snap is None:
+            return "—", "mute"
+        if snap.transport == "udp":
+            name = "UDP"
+        elif snap.transport == "http":
+            name = "HTTP"
+        else:
+            name = "—"
+        if not snap.posted:
+            return "停滞", "bad"
+        if snap.last_error:
+            return name, "warn"
+        return name, "ok"
+
+    def destroy(self) -> None:
+        self._closed = True
+        self.stop()
+        super().destroy()

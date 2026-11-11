@@ -29,18 +29,6 @@ _HAT_RIGHT = (2, 3, 4)
 _HAT_LEFT = (6, 7, 8)
 
 
-class MoveCmd(TypedDict):
-    name: str
-    speed: int
-    turn: int
-
-
-class TurretCmd(TypedDict):
-    name: str
-    yaw: int
-    pitch: int
-
-
 class TankCmd(TypedDict):
     track_l: int
     track_r: int
@@ -58,19 +46,6 @@ def _axis(v16: int) -> int:
     if -DEADZONE < v < DEADZONE:
         return 0
     return v
-
-
-def build_commands(lx: int, ly: int, rx: int, ry: int) -> list[dict]:
-    """解析四轴 -> [MOVE, TURRET] 命令列表（兼容旧链路，面板/HTTP 用）。"""
-    cmds: list[dict] = [
-        {"name": "MOVE", "speed": _axis(ly), "turn": _axis(lx)},
-        {"name": "TURRET", "yaw": _axis(rx), "pitch": _axis(ry)},
-    ]
-    return cmds
-
-
-def neutral_commands() -> list[dict]:
-    return build_commands(0x8000, 0x8000, 0x8000, 0x8000)
 
 
 def neutral_tank(estop: int = 0) -> TankCmd:

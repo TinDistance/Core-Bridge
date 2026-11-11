@@ -12,7 +12,6 @@ import httpx
 
 from desktop.telemetry.loss_window import WINDOW_S
 from desktop.telemetry.loss_window import window as loss_window_of
-from desktop.telemetry.loss_window import totals as loss_totals_of
 
 WARN_MS = 500.0
 HISTORY = 120
@@ -237,29 +236,16 @@ class LatencyMonitor:
             return
         t0 = time.monotonic()
         try:
-            resp = client.get(f"{base}/video/status")
+            resp = client.get(f"{base}/video/rtp_status")
             data = resp.json()
+            if not isinstance(data, dict):
+                data = {}
         except Exception as e:
             self.last_error = str(e)
             self._append(LatencySample(t=time.time()))
             return
-        src = "rtp:8002"
-        jpeg_live = bool(data.get("live"))
-        # 上游段（K230→server）丢包只有 /video/rtp_status 里有，所以**总是**拉一次。
-        # JPEG 链路默认关闭（server/routers/video.py 的 JPEG_ENABLED），实际请求数
-        # 与改造前一致；这里只是把「按需拉」放宽成「都拉」，换来上游口径可用。
-        rtp: dict = {}
-        try:
-            resp = client.get(f"{base}/video/rtp_status")
-            got = resp.json()
-            if isinstance(got, dict):
-                rtp = got
-        except Exception:
-            pass
-        if not jpeg_live and rtp.get("live"):
-            data = rtp
-        if not jpeg_live and not data.get("live"):
-            src = "无信号"
+        rtp = data
+        src = "rtp:8002" if data.get("live") else "无信号"
         rtt = (time.monotonic() - t0) * 1000.0
         self.last_error = ""
         live = bool(data.get("live", False))
@@ -339,21 +325,12 @@ class LatencyMonitor:
         with self._lock:
             return list(self._samples)
 
-    def current(self) -> LatencySample | None:
-        with self._lock:
-            return self._samples[-1] if self._samples else None
-
     def stats(self) -> dict:
         samples = self.samples()
         cur = samples[-1] if samples else None
         vals = [s.render_age_ms for s in samples if s.render_age_ms >= 0]
-        queue_vals = [s.queue_ms for s in samples if s.queue_ms >= 0]
-        stale_vals = [s.staleness_ms for s in samples if s.staleness_ms >= 0]
         has_render = bool(vals)
-        # 丢包两套口径：窗口值给实时判断（面板主数字/告警色），累计值给长时间
-        # 统计（日志/底栏）。窗口值不够一个窗口时 covered=False，由面板决定标注。
         win = loss_window_of(samples, span_s=WINDOW_S)
-        tot = loss_totals_of(samples)
         alive = self.probe_alive()
         age = self.sample_age_s()
         stale_limit = max(1.0, self.interval * STALE_SAMPLE_FACTOR)
@@ -368,7 +345,6 @@ class LatencyMonitor:
 
             "current_ms": cur.render_age_ms if cur else -1,
             "render_age_ms": cur.render_age_ms if cur else -1,
-            "latency_source": "render_age" if has_render else "unavailable",
             "latency_available": has_render,
 
             "local_ms": cur.local_ms if cur else -1,
@@ -376,10 +352,8 @@ class LatencyMonitor:
             "fetch_ms": cur.fetch_ms if cur else -1,
 
             "staleness_ms": cur.staleness_ms if cur else -1,
-            "staleness_max_ms": max(stale_vals) if stale_vals else -1,
 
             "queue_ms": cur.queue_ms if cur else -1,
-            "queue_max_ms": max(queue_vals) if queue_vals else -1,
             "backlog_packets": cur.backlog_packets if cur else -1,
             "backlog_bytes": cur.backlog_bytes if cur else -1,
             "drops": cur.drops if cur else -1,
@@ -391,12 +365,9 @@ class LatencyMonitor:
             "frame_id": cur.frame_id if cur else -1,
             "live": cur.live if cur else False,
             "source": cur.source if cur else None,
-            "p50_ms": round(_percentile(vals, 0.5), 1) if vals else -1,
             "p95_ms": round(_percentile(vals, 0.95), 1) if vals else -1,
-            "count": len(vals),
 
             "loss_window": win,
-            "loss_totals": tot,
         }
 
 

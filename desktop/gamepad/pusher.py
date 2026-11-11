@@ -1,16 +1,7 @@
-"""手柄后台推送：XInput ~100Hz 轮询 -> 16 字节协议 -> UDP 命令通道（HTTP 降级）。
+"""手柄后台推送：XInput ~100Hz 轮询 -> 16 字节协议 -> UDP 命令通道。
 
-D7 / doc §2.3、§4.4 方案 A
----------------------------
-旧实现用同步 `httpx.Client.post`（`POST_TIMEOUT = 0.3`）在**轮询线程**里发送，
-有两个独立的失效模式：
-
-1. 一次 POST 卡住，轮询线程就停 0.3 s —— 手柄读取率整体塌陷；
-2. HTTP over TCP 有队头阻塞，一次段重传（Windows 最小 RTO 约 200–300 ms）
-   会把**后续所有指令**一起排队，而且这恰好发生在 WiFi 抖动、视频同时变差的
-   时刻。
-
-现在拆成两个线程：
+轮询和发送分两个线程：轮询只读手柄，发送只走 UDP。K230 收到的是服务端
+从这包 raw16 编出的 15 字节 UART 帧。
 
 - **轮询线程**（``gamepad-poll``，~100 Hz）：只读 XInput、只更新「最新状态」
   （``_latest``）。**不做任何 IO**。
@@ -36,9 +27,8 @@ doc §4.4 写的「共 24 B」是算术笔误（3 + 1 + 4 + 4 + 16 = 28）。服
   服务端自己的 ``time.time()`` 收包时刻决定），所以这里不需要和服务器对时。
 - ``raw16``：``xi.parse_protocol(proto)["raw_hex"]`` 那 32 字符 hex 对应的
   16 个原始字节 —— 也就是 ``PadState.proto`` 本身（小端解析前的原始字节）。
-- 语义命令（``MOVE`` / ``TURRET``）**不在**包里：服务端写 store 时故意
-  ``cmds=None``，让它走 ``_resolve_cmds`` 从 raw16 兜底解析，与桌面端
-  ``commands.build_commands`` 同语义。不要试图往包里加 cmds 字段。
+- 语义命令不进 UDP 包。服务端从 raw16 编出 K230 要的 15 字节 UART 帧。
+  不要往包里加 cmds 字段。
 
 D6：节拍一律 ``time.sleep``，不用 ``Event.wait``。附录 A.1 在本机
 （Windows / Python 3.12）实测 ``Event.wait(2 ms)`` → p50 **15.50 ms**
@@ -56,8 +46,6 @@ import threading
 import time
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
-
-import httpx
 
 # 允许 `python desktop/gamepad/pusher.py` 直接跑自检（此时 sys.path[0] 是
 # 本文件所在目录，仓库根不在路径里，`desktop.*` 导不进来）。
@@ -137,21 +125,6 @@ def command_host(base_url: str) -> str:
         return "127.0.0.1"
 
 
-def _env_flag(name: str, default: bool = True) -> bool:
-    raw = os.environ.get(name)
-    if raw is None or not str(raw).strip():
-        return default
-    return str(raw).strip().lower() not in ("0", "off", "false", "no", "")
-
-
-def cmd_udp_enabled(default: bool = True) -> bool:
-    """UDP 主通道开关（环境变量 ``CORE_BRIDGE_CMD_UDP``，默认开）。
-
-    关掉即整体退回 HTTP ``POST /command``（降级路径，用于排查）。
-    """
-    return _env_flag("CORE_BRIDGE_CMD_UDP", default)
-
-
 def cmd_udp_port(default: int = CMDIN_DEFAULT_PORT) -> int:
     """服务端命令 UDP 端口（``CORE_BRIDGE_CMD_UDP_PORT``，默认 8010）。"""
     raw = os.environ.get("CORE_BRIDGE_CMD_UDP_PORT")
@@ -228,12 +201,9 @@ class GamepadPusher:
 
     同步方式：单个 ``threading.Lock``（``self._lock``）保护 ``_latest``、
     ``_snap`` 和发送统计。锁临界区只有几次赋值，没有 IO，所以不会成为瓶颈。
-    ``self._seq``、UDP socket、HTTP client 只被发送线程碰，无需加锁。
+    ``self._seq`` 和 UDP socket 只被发送线程碰，无需加锁。
     """
 
-    #: HTTP 降级路径的超时。D7 之前它也是主通道超时，卡住会拖垮轮询；
-    #: 现在它只在 UDP 不可用时才走到，主通道（UDP）不受影响。
-    POST_TIMEOUT = 0.3
     #: 固定下发节拍。50 Hz 常发当前帧（含空闲零帧 / 断连中位零帧），
     #: 与 K230 侧 50 Hz UART3 透传同节拍。变化即时发，不等节拍。
     HEARTBEAT_S = 0.02
@@ -267,7 +237,6 @@ class GamepadPusher:
         # 只被发送线程碰
         self._seq = 0
         self._sock: socket.socket | None = None
-        self._client: httpx.Client | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._send_thread: threading.Thread | None = None
@@ -305,12 +274,6 @@ class GamepadPusher:
             try:
                 sock.close()
             except OSError:
-                pass
-        client, self._client = self._client, None
-        if client is not None:
-            try:
-                client.close()
-            except Exception:
                 pass
 
     # ---------------------------------------------------------------- 读取
@@ -440,15 +403,6 @@ class GamepadPusher:
         finally:
             self._send_thread = None
 
-    def ping_tank(self) -> tuple[dict, float]:
-        """面板调试用：当前最新 V1.3 语义（不推进锁存计时）。"""
-        with self._lock:
-            return dict(self._latest_tank), self._latest_estop_progress
-
-    def last_tank(self) -> tuple[dict, float]:
-        with self._lock:
-            return dict(self._latest_tank), self._latest_estop_progress
-
     def clear_estop(self) -> None:
         with self._lock:
             self._tank_builder.estop.latched = False
@@ -474,37 +428,20 @@ class GamepadPusher:
             return ""
 
     def _send_frame(self, raw16: bytes) -> tuple[bool, str]:
-        """发一帧 16 字节协议：优先 UDP，失败或被关掉时降级 HTTP。
-
-        ``seq`` 在每次尝试时 +1（无论是否成功），保证单调；服务端靠它丢弃
-        乱序旧包。``ts_ms`` 只用一次，UDP 包和 HTTP body 共用同一个值，两条
-        通道看到的 ``client_ts`` 不会漂移。
-        """
+        """发一帧 16 字节协议。K230 只收服务端从这条 UDP 编出的 UART 帧。"""
         seq = (self._seq + 1) & _U32
         self._seq = seq
-        ts_ms = uptime_ms()
-        udp_err = ""
-        if cmd_udp_enabled():
-            try:
-                pkt = build_cmd_packet(raw16, seq, ts_ms)
-            except ValueError as e:
-                return False, str(e)[:120]
-            ok, udp_err = self._send_udp(pkt)
-            if ok:
-                self._note_transport("udp")
-                return True, ""
-        ok, err = self._send_http(raw16, seq, ts_ms, udp_err)
+        try:
+            pkt = build_cmd_packet(raw16, seq, uptime_ms())
+        except ValueError as e:
+            return False, str(e)[:120]
+        ok, err = self._send_udp(pkt)
         if ok:
-            self._note_transport("http")
+            self._note_transport("udp")
         return ok, err
 
     def _send_udp(self, pkt: bytes) -> tuple[bool, str]:
-        """UDP 主通道。返回 ``(ok, err)``；``ok=False`` 时调用方降级 HTTP。
-
-        实测（临时脚本，本机）：一次 ``sendto`` 的耗时是 **0.13–0.22 ms**
-        （含 ``urlparse`` + ``os.environ`` 读取），对比 HTTP 路径 5 ms 起步、
-        最坏 300 ms。
-        """
+        """UDP 命令通道。一次 sendto 大约 0.13–0.22 ms。"""
         host = command_host(self._base_url())
         sock = self._sock
         if sock is None:
@@ -517,8 +454,7 @@ class GamepadPusher:
         try:
             sock.sendto(pkt, (host, cmd_udp_port()))
         except ConnectionResetError:
-            # Windows：上一次 sendto 收到 ICMP 端口不可达后回灌到同一 socket
-            # （附录 A.2）。包本身没问题，重试一次即可，不必降级 HTTP。
+            # Windows 会把上一次 ICMP 端口不可达回灌到同一 socket，重试一次。
             try:
                 sock.sendto(pkt, (host, cmd_udp_port()))
                 return True, ""
@@ -527,47 +463,6 @@ class GamepadPusher:
         except OSError as e:
             return False, str(e)[:120]
         return True, ""
-
-    def _send_http(self, raw16: bytes, seq: int, ts_ms: int,
-                   udp_err: str = "") -> tuple[bool, str]:
-        """HTTP 降级路径（兼容服务端旧版本 / 调试 / UDP 被中间设备掐掉）。"""
-        base = self._base_url()
-        if not base:
-            return False, ""
-        try:
-            client = self._http_client()
-            if client is None:
-                return False, udp_err or "HTTP 客户端不可用"
-            parsed = xi.parse_protocol(raw16)
-            tank, _progress = self.last_tank()
-            cmds = cmd_builder.build_commands(
-                parsed["lx"], parsed["ly"], parsed["rx"], parsed["ry"])
-            cmds.append({"name": "TANK", **{k: int(v) for k, v in tank.items()
-                                            if k != "estop"},
-                         "estop": int(tank.get("estop", 0))})
-            resp = client.post(f"{base}/command", json={
-                "raw_hex": parsed["raw_hex"],
-                "cmds": cmds,
-                "slot": None,
-                "packet": 0,
-                "client_ts": round(ts_ms / 1000.0, 3),
-                "seq": seq,
-            })
-            if resp.status_code == 200:
-                return True, ""
-            return False, f"HTTP {resp.status_code}"
-        except Exception as e:
-            return False, str(e)[:120]
-
-    def _http_client(self) -> httpx.Client | None:
-        client = self._client
-        if client is None:
-            try:
-                client = httpx.Client(timeout=self.POST_TIMEOUT, trust_env=False)
-            except Exception:
-                return None
-            self._client = client
-        return client
 
 
 # ==================================================================== 自检
@@ -675,25 +570,6 @@ def _env_port(port: int):
     return _Ctx()
 
 
-def _env_flag_udp(value: str | None):
-    class _Ctx:
-        def __enter__(self):
-            self._old = os.environ.get("CORE_BRIDGE_CMD_UDP")
-            if value is None:
-                os.environ.pop("CORE_BRIDGE_CMD_UDP", None)
-            else:
-                os.environ["CORE_BRIDGE_CMD_UDP"] = value
-            return self
-
-        def __exit__(self, *exc):
-            if self._old is None:
-                os.environ.pop("CORE_BRIDGE_CMD_UDP", None)
-            else:
-                os.environ["CORE_BRIDGE_CMD_UDP"] = self._old
-            return False
-    return _Ctx()
-
-
 def test_cmd_packet_wire_format():
     """28 字节布局：magic / ver / seq(u32 BE) / ts_ms(u32 BE) / raw16。"""
     raw = bytes(range(16))
@@ -767,16 +643,8 @@ def test_should_send_heartbeat():
     assert should_send(proto, other, 100.0, 99.0, 0.02)
 
 
-def test_cmd_udp_env_switch():
-    """CORE_BRIDGE_CMD_UDP / CORE_BRIDGE_CMD_UDP_PORT 覆盖与非法值回退。"""
-    with _env_flag_udp(None):
-        assert cmd_udp_enabled() is True
-    with _env_flag_udp("1"):
-        assert cmd_udp_enabled() is True
-    with _env_flag_udp("0"):
-        assert cmd_udp_enabled() is False
-    with _env_flag_udp("off"):
-        assert cmd_udp_enabled() is False
+def test_cmd_udp_port_env():
+    """CORE_BRIDGE_CMD_UDP_PORT 覆盖与非法值回退。"""
     with _env_port(18310):
         assert cmd_udp_port() == 18310
     os.environ["CORE_BRIDGE_CMD_UDP_PORT"] = "not-a-port"
@@ -795,7 +663,6 @@ def test_udp_end_to_end_packet_layout():
                             reader=reader)
     try:
         with _env_port(SELF_TEST_PORTS[0]):
-            assert cmd_udp_enabled() is True
             pusher.start()
             time.sleep(0.30)
             snap = pusher.snapshot()
@@ -826,78 +693,6 @@ def test_udp_end_to_end_packet_layout():
     assert len(pkts) >= 10, len(pkts)
     gaps = [pkts[i + 1][0] - pkts[i][0] for i in range(len(pkts) - 1)]
     assert max(gaps) < 0.10, gaps            # 没有出现「发送线程被卡住」
-
-
-def test_slow_send_does_not_stall_poll_loop():
-    """D7 核心回归：**发送**再慢也不能拖慢轮询线程。
-
-    旧实现把 `POST /command` 放在轮询线程里：一次 0.3 s 超时（更糟的是 TCP
-    段重传 200–300 ms）会把 XInput 读取一起卡住，手柄读取率整体塌陷。这里让
-    假服务端每次 POST 都 sleep 0.3 s（比真实超时更狠），断言：
-      - 轮询次数仍接近 100 Hz（旧实现 1.5 s 里只能跑 ~4 次）；
-      - 面板快照的 packet / slot 持续推进（= 状态仍在被更新）；
-      - HTTP 请求本身也在连续到达（= 发送线程没死）。
-
-    注意这个用例暴露的是降级路径的固有代价：0.3 s 的 POST 会让保活周期退化到
-    300 ms，正好压在服务端 0.3 s 过期阈值上 —— 这正是为什么主通道必须是 UDP
-    （0.15 ms 的 sendto，见 test_udp_end_to_end_packet_layout）。
-    """
-    import http.server as _hs
-    got: list[float] = []
-    # 每次 POST 阻塞 120 ms：足够拖垮「poll + send 同线程」的旧实现
-    # （旧实现 1.5 s 里只能跑 ~12 次 poll），又稳在 POST_TIMEOUT(0.3 s)
-    # 之内，所以这里的失败原因纯粹是解耦，不掺杂超时。
-    slow = 0.12
-
-    class _Slow(_hs.BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
-
-        def do_POST(self):  # noqa: N802
-            n = int(self.headers.get("Content-Length") or 0)
-            self.rfile.read(n)
-            got.append(time.monotonic())
-            time.sleep(slow)
-            self.send_response(200)
-            self.send_header("Content-Length", "2")
-            self.end_headers()
-            self.wfile.write(b"{}")
-
-        def log_message(self, *a):
-            pass
-
-    httpd = _hs.ThreadingHTTPServer(("127.0.0.1", 0), _Slow)
-    port = httpd.server_address[1]
-    th = threading.Thread(target=httpd.serve_forever, daemon=True)
-    th.start()
-    reader = _FakeReader()
-    pusher = GamepadPusher(get_base_url=lambda: f"http://127.0.0.1:{port}",
-                            reader=reader)
-    window = 1.5
-    t0 = time.monotonic()
-    try:
-        with _env_flag_udp("0"):
-            pusher.start()
-            time.sleep(window)
-            mid = pusher.snapshot()
-        pusher.stop()
-        snap = pusher.snapshot()
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-
-    elapsed = time.monotonic() - t0
-    # 轮询线程完全没被发送拖住：至少 60% 的名义 100 Hz
-    assert reader.calls >= 0.6 * 100 * window, \
-        f"轮询被慢发送拖垮了：{reader.calls} 次 / {elapsed:.2f}s"
-    assert snap.packet >= 0.6 * 100 * window, snap.packet
-    # 面板读到的就是最新状态（不是卡住时的旧值）
-    assert mid.packet >= 0.3 * 100 * window, mid.packet
-    # 发送线程同样活着：0.12 s 慢 POST 下 1.5 s 至少完成 8 次
-    assert len(got) >= 8, len(got)
-    gaps = [got[i + 1] - got[i] for i in range(len(got) - 1)]
-    assert max(gaps) < 0.30, gaps        # 没有出现「发送线程被彻底卡死」
-    assert snap.transport == "http", snap.transport
-    assert snap.posted is True, snap.last_error
 
 
 def test_poll_stall_sends_neutral_at_50hz():
@@ -944,53 +739,6 @@ def test_poll_stall_sends_neutral_at_50hz():
     assert stalled.last_error == "手柄轮询线程无响应 · 零帧常发中", stalled.last_error
     assert resumed.posted is True, resumed.last_error
     assert resumed.packet > stalled.packet
-
-
-def test_http_fallback_when_udp_disabled():
-    """CORE_BRIDGE_CMD_UDP=0 时必须走 HTTP POST /command（降级路径仍可用）。"""
-    calls: list[dict] = []
-
-    import http.server as _hs
-
-    class _Srv(_hs.BaseHTTPRequestHandler):
-        def do_POST(self):  # noqa: N802
-            n = int(self.headers.get("Content-Length") or 0)
-            calls.append(__import__("json").loads(self.rfile.read(n) or b"{}"))
-            self.send_response(200)
-            self.send_header("Content-Length", "2")
-            self.end_headers()
-            self.wfile.write(b"{}")
-
-        def log_message(self, *a):  # 静音
-            pass
-
-    httpd = _hs.HTTPServer(("127.0.0.1", 0), _Srv)
-    port = httpd.server_address[1]
-    th = threading.Thread(target=httpd.serve_forever, daemon=True)
-    th.start()
-    try:
-        reader = _FakeReader()
-        pusher = GamepadPusher(
-            get_base_url=lambda: f"http://127.0.0.1:{port}", reader=reader)
-        try:
-            with _env_flag_udp("0"):
-                pusher.start()
-                time.sleep(0.30)
-                snap = pusher.snapshot()
-        finally:
-            pusher.stop()
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-
-    assert snap.transport == "http", snap.transport
-    assert snap.posted is True, snap.last_error
-    assert calls, "降级路径没有发出任何 HTTP POST"
-    last = calls[-1]
-    # HTTP 通道仍然要带 raw_hex / cmds（面板 GET /command 依赖它）
-    assert last["raw_hex"] == xi.parse_protocol(reader.proto)["raw_hex"]
-    names = [c["name"] for c in last["cmds"]]
-    assert names == ["MOVE", "TURRET", "TANK"], names
 
 
 def test_disconnect_keeps_sending_neutral_at_50hz():

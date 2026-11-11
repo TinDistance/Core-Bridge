@@ -68,7 +68,7 @@ def _load_xinput():
     return None, False
 
 
-_XINPUT, _DLL_FOUND = _load_xinput()
+_XINPUT, _ = _load_xinput()
 if _XINPUT is not None:
     try:
         _GET_STATE = _XINPUT[100]
@@ -82,16 +82,10 @@ else:
     _GET_STATE = None
     _GUIDE_OK = False
 
-GUIDE_SUPPORTED = bool(_GUIDE_OK and _DLL_FOUND)
-
 
 def available() -> bool:
     """本机能否调 XInput（Windows + DLL 存在）。"""
     return _GET_STATE is not None
-
-
-def guide_supported() -> bool:
-    return GUIDE_SUPPORTED
 
 
 def find_controller() -> int | None:

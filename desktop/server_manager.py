@@ -288,14 +288,6 @@ class ServerManager:
             return raw.decode("latin-1", "replace")
         return raw
 
-    def free_port(self, wait: float = 5.0) -> None:
-        """兼容旧接口：不再杀任意进程，仅等待端口释放（由调用方确认）。"""
-        deadline = time.time() + wait
-        while time.time() < deadline:
-            if not self._port_in_use():
-                return
-            time.sleep(0.2)
-
     def _port_in_use(self) -> bool:
         with socket.socket() as s:
             try:

@@ -8,6 +8,7 @@ import tkinter as tk
 from desktop import theme
 from desktop.boot import ServerBoot
 from desktop.gamepad.pusher import GamepadPusher
+from desktop.modules.color_panel import ColorGradePanel
 from desktop.modules.gamepad_panel import GamepadPanel
 from desktop.modules.header_bar import HeaderBar, format_percent, format_tier
 from desktop.modules.latency_panel import LatencyPanel
@@ -15,6 +16,7 @@ from desktop.modules.log_panel import LogPanel
 from desktop.modules.status_bar import StatusBar
 from desktop.modules.stream_panel import StreamPanel
 from desktop.server_manager import ServerManager
+from desktop.streaming.color_grade import ColorGrade
 from desktop.telemetry.latency_monitor import WARN_MS, LatencyMonitor
 from desktop.telemetry.loss_window import BAD_PCT, WARN_PCT
 
@@ -49,6 +51,8 @@ class DesktopApp(tk.Tk):
         self.gamepad_panel: GamepadPanel | None = None
         self.latency_panel: LatencyPanel | None = None
         self.log_panel: LogPanel | None = None
+        self.color_panel: ColorGradePanel | None = None
+        self._color_grade = ColorGrade()
 
         self._header = HeaderBar(self, on_release_estop=self._release_estop)
         self._header.pack(fill=tk.X)
@@ -60,11 +64,20 @@ class DesktopApp(tk.Tk):
         self._video_parent = tk.Frame(self._main, bg=theme.BG)
         self._right = _split(self._main, tk.VERTICAL)
         self._gamepad_parent = tk.Frame(self._right, bg=theme.BG)
-        self._health_parent = tk.Frame(self._right, bg=theme.BG)
+        self._lower = tk.Frame(self._right, bg=theme.BG)
+        self._health_parent = tk.Frame(self._lower, bg=theme.BG)
+        self._color_parent = tk.Frame(self._lower, bg=theme.BG)
+        self._color_parent.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+        self._health_parent.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self._main.add(self._video_parent, minsize=420, stretch="always")
-        self._main.add(self._right, minsize=260, stretch="never")
+        self._main.add(self._right, minsize=272, stretch="never")
         self._right.add(self._gamepad_parent, minsize=160, stretch="never")
-        self._right.add(self._health_parent, minsize=140, stretch="always")
+        self._right.add(self._lower, minsize=180, stretch="always")
+        self.color_panel = ColorGradePanel(
+            self._color_parent, on_change=self._on_color_grade,
+            on_layout=self._fit_color_pane)
+        self.color_panel.pack(fill=tk.X)
+        self.after_idle(self._fit_color_pane)
         self._log_parent = tk.Frame(self._outer, bg=theme.BG)
         self._outer.add(self._main, stretch="always")
         self._outer.add(self._log_parent, minsize=_LOG_FOLD_MIN, stretch="never")
@@ -126,6 +139,7 @@ class DesktopApp(tk.Tk):
         self.stream_panel = StreamPanel(
             self._video_parent, default_server=base_url, monitor=self._monitor)
         self.stream_panel.pack(fill=tk.BOTH, expand=True)
+        self.stream_panel.apply_grade(self._color_grade)
 
         self.gamepad_panel = GamepadPanel(
             self._gamepad_parent, pusher=self._gamepad, get_base_url=lambda: base_url)
@@ -157,6 +171,36 @@ class DesktopApp(tk.Tk):
                     self.after(50, lambda: self._place_log_sash(height, minsize, False))
                 return
             self._outer.sash_place(0, 0, total - height - _SASH_W)
+            self._fit_color_pane()
+        except tk.TclError:
+            return
+
+    def _on_color_grade(self, grade: ColorGrade) -> None:
+        self._color_grade = grade
+        panel = self.stream_panel
+        if panel is not None:
+            panel.apply_grade(grade)
+
+    def _fit_color_pane(self, retry: int = 8) -> None:
+        """右栏最底下留给调色盘的完整高度，上面剩给健康卡。"""
+        panel = self.color_panel
+        if self._closed or panel is None:
+            return
+        try:
+            self.update_idletasks()
+            total = self._right.winfo_height()
+            if total < 80:
+                if retry > 0:
+                    self.after(50, lambda: self._fit_color_pane(retry - 1))
+                return
+            color_h = panel.winfo_reqheight() + 6
+            lower_h = color_h + 96
+            gamepad_h = total - lower_h - _SASH_W
+            if gamepad_h < 160:
+                gamepad_h = 160
+            lower_min = max(color_h, min(lower_h, total - 160 - _SASH_W))
+            self._right.paneconfigure(self._lower, minsize=max(1, int(lower_min)))
+            self._right.sash_place(0, 0, int(gamepad_h))
         except tk.TclError:
             return
 

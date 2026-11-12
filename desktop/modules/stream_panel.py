@@ -33,6 +33,7 @@ if __package__ in (None, ""):  # pragma: no cover - 仅自检入口
 
 from desktop import theme
 from desktop.modules.base_panel import BasePanel
+from desktop.streaming.color_grade import ColorGrade, apply_grade, prepare
 from desktop.streaming.h264_viewer import H264Viewer, available as h264_available
 
 NO_STREAM_TEXT = "无画面"
@@ -115,6 +116,9 @@ class StreamPanel(BasePanel):
         # viewer 没有 set_render_size（老版本）时的兼容标记，此时退回 UI 线程
         # resize。正常路径下永远为 True。
         self._can_scale = True
+        self._grade = ColorGrade()
+        self._prepared = prepare(self._grade)
+        self._grade_on_viewer = False
         super().__init__(master, title="VIDEO · 图传", **kwargs)
 
     def build(self) -> None:
@@ -131,6 +135,19 @@ class StreamPanel(BasePanel):
             except Exception:
                 logger.exception("failed to wire telemetry provider")
         self._poll_after = self.after(POLL_INTERVAL_MS, self._poll)
+
+    def apply_grade(self, grade: ColorGrade) -> None:
+        self._grade = grade
+        self._prepared = prepare(grade)
+        self._push_grade()
+
+    def _push_grade(self) -> None:
+        viewer = self._h264
+        if viewer is not None and hasattr(viewer, "set_color_grade"):
+            viewer.set_color_grade(self._grade)
+            self._grade_on_viewer = True
+        else:
+            self._grade_on_viewer = False
 
     def source_size(self) -> tuple[int, int]:
         if self._src_known:
@@ -168,6 +185,7 @@ class StreamPanel(BasePanel):
         self._h264 = H264Viewer(self._default_server)
         self._can_scale = hasattr(self._h264, "set_render_size")
         self._render_size = (0, 0)
+        self._push_grade()
         self._h264.start()
         self._h264_last = time.monotonic()
 
@@ -348,6 +366,8 @@ class StreamPanel(BasePanel):
             if (nw, nh) != (fw, fh):
                 img = img.resize((nw, nh), Image.BILINEAR)
                 fw, fh = nw, nh
+        if not self._grade_on_viewer and self._prepared.active:
+            img = apply_grade(img, self._prepared)
         self._photo = ImageTk.PhotoImage(img)
         self._canvas.delete("all")
         self._canvas.create_image(cw // 2, ch // 2, image=self._photo)

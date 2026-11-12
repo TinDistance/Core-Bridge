@@ -14,6 +14,8 @@ from urllib.parse import urlparse
 
 from PIL import Image
 
+from desktop.streaming.color_grade import ColorGrade, apply_grade, prepare
+
 try:
     import av
 except ImportError:
@@ -444,6 +446,11 @@ class H264Viewer:
         self._nack = NackPlanner()
         # D4：UI 线程写入目标渲染尺寸，解码线程读取（0,0 = 不缩放）
         self._render_size = (0, 0)
+        # 白平衡 / 基础调色。UI 线程写，解码线程在 to_image 之后读。
+        # 中性时 prepared.active 为假，不碰像素。
+        self._grade = ColorGrade()
+        self._prepared = prepare(self._grade)
+        self._grade_error = False
         # D1：stop() 自唤醒需要拿到 socket 和它绑定的端口
         self._sock: socket.socket | None = None
         self._local_port = 0
@@ -512,6 +519,26 @@ class H264Viewer:
             hi = min(hi, RENDER_SIZE_MAX)
         with self._slock:
             self._render_size = (wi, hi)
+
+    def set_color_grade(self, grade: ColorGrade) -> None:
+        """线程安全。查找表在这里生成，解码线程只套用。"""
+        grade = ColorGrade(
+            temperature=grade.temperature,
+            tint=grade.tint,
+            brightness=grade.brightness,
+            contrast=grade.contrast,
+            saturation=grade.saturation,
+        ).clamped()
+        prepared = prepare(grade)
+        with self._slock:
+            self._grade = grade
+            self._prepared = prepared
+            self._grade_error = False
+
+    @property
+    def color_grade(self) -> ColorGrade:
+        with self._slock:
+            return self._grade
 
     @property
     def render_size(self) -> tuple[int, int]:
@@ -988,11 +1015,20 @@ class H264Viewer:
                     # 未设置时保持原样直接 to_image()。
                     with self._slock:
                         cw, ch = self._render_size
+                        prepared = self._prepared
+                        grade_failed = self._grade_error
                     if cw > 0 and ch > 0:
                         img = frame.reformat(
                             width=cw, height=ch, format="rgb24").to_image()
                     else:
                         img = frame.to_image()
+                    if prepared.active and not grade_failed:
+                        try:
+                            img = apply_grade(img, prepared)
+                        except Exception:
+                            with self._slock:
+                                self._grade_error = True
+                            logger.exception("color grade failed")
                     rendered_at = time.monotonic()
                     with self._slock:
                         if depack.last_au_start_at > 0:

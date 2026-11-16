@@ -12,6 +12,9 @@ from media.vencoder import *
 
 SERVER_IP = "192.168.137.1"
 RTP_PORT = 8002
+SSID = "TF-Laptop"
+PASSWORD = "TF@HTR.Hello"
+STATIC_IP = ("192.168.137.100", "255.255.255.0", "192.168.137.1", "192.168.137.1")
 
 TIERS = {
     "T1": (1280, 720, 3000),
@@ -27,10 +30,16 @@ FPS = 30
 GOP_LENGTH = 60
 MAX_NALU_CHUNK_SIZE = 1400
 UART_BAUDRATE = 115200
-MOTOR_SPEED_HZ = 20000  # PUL脉冲频率; 对齐STM32F103例程(main.c): 6400边沿=3200脉冲/圈(16细分)=一圈; RPM = FREQ*60/3200
-MOTOR_DIRECTION = 0  # DIR电平(例程PA7, 翻转换向、起始为低): 0=低电平=CW正转, 1=高电平=CCW(与例程翻转方向对应的出厂默认含义)
+MOTOR_SPEED_HZ = 20000
+MOTOR_DIRECTION = 0
 GC_COLLECT_EVERY = 100
 WIFI_WAIT_LOG_MS = 5000
+WIFI_CONNECT_TIMEOUT_MS = 15000
+
+EMERGENCY_H264_SPS_PPS_IDR = b""
+EMERGENCY_FRAME_PERIOD_MS = 200
+CAMERA_TIMEOUT_LIMIT = 30
+CAMERA_RETRY_INTERVAL_MS = 5000
 
 CONTROL_MAGIC = b"CBR"
 CTRL_IDR = 0x01
@@ -65,6 +74,8 @@ motor_pwm = None
 motor_dir_pin = None
 motor_en_pin = None
 motor_running = False
+cached_parameter_sets = None
+cached_emergency_payload = None
 
 
 def ticks_ms():
@@ -89,33 +100,41 @@ def sleep_us(duration):
         time.sleep(duration / 1000000.0)
 
 
-def wait_for_wifi(wlan, log_interval_ms=WIFI_WAIT_LOG_MS):
-    if wlan.isconnected():
-        ip, _, gateway, _ = wlan.ifconfig()
-        print("[wifi] connected: IP=%s GW=%s" % (ip, gateway))
-        return
+def connect_wifi(wlan):
+    if wlan.active(True) is False:
+        print("[wifi] USB device not ready")
+        return False
+    if not wlan.isconnected():
+        print("[wifi] connecting %s" % SSID)
+        wlan.connect(SSID, PASSWORD)
+        start_ms = ticks_ms()
+        while not wlan.isconnected():
+            os.exitpoint()
+            if ticks_diff(ticks_ms(), start_ms) >= WIFI_CONNECT_TIMEOUT_MS:
+                print("[wifi] connect timeout")
+                return False
+            time.sleep(0.1)
+    wlan.ifconfig(STATIC_IP)
+    ip, _, gateway, _ = wlan.ifconfig()
+    print("[wifi] connected: IP=%s GW=%s" % (ip, gateway))
+    return True
 
-    print("[wifi] waiting for connection; reconnect is not triggered here")
+
+def wait_for_wifi(wlan, log_interval_ms=WIFI_WAIT_LOG_MS):
     start_ms = ticks_ms()
     last_log_ms = start_ms
-    while not wlan.isconnected():
+    while not connect_wifi(wlan):
         os.exitpoint()
-        time.sleep(1)
         now_ms = ticks_ms()
         if ticks_diff(now_ms, last_log_ms) >= log_interval_ms:
             print("[wifi] still waiting: %ds" % (ticks_diff(now_ms, start_ms) // 1000))
             last_log_ms = now_ms
-
-    ip, _, gateway, _ = wlan.ifconfig()
-    print("[wifi] connected: IP=%s GW=%s (waited %ds)" % (
-        ip, gateway, ticks_diff(ticks_ms(), start_ms) // 1000))
+        time.sleep(1)
 
 
 def init_wifi():
     global sta
-    sta = network.WLAN(network.STA_IF)
-    if not sta.active():
-        sta.active(True)
+    sta = network.WLAN(network.STA_IF, network.WLAN_USB)
     wait_for_wifi(sta)
     return sta
 
@@ -168,6 +187,46 @@ def init_encoder():
     print("[3/4] encoder ready: ch=%d %dx%d %s %dkbps GOP=%d" % (
         encoder.chn, aligned_width, FRAME_HEIGHT, profile_name,
         ENCODER_BITRATE_KBPS, GOP_LENGTH))
+
+
+def cleanup_camera():
+    global sensor, media_link, encoder
+    if encoder is not None:
+        try:
+            if encoder.chn >= 0:
+                encoder.Stop()
+        except Exception:
+            pass
+    if media_link is not None:
+        try:
+            media_link.destroy()
+        except Exception:
+            pass
+        media_link = None
+    if sensor is not None:
+        try:
+            sensor.stop()
+        except Exception:
+            pass
+        sensor = None
+    if encoder is not None:
+        try:
+            encoder.Destroy()
+        except Exception:
+            pass
+        encoder = None
+
+
+def init_camera_and_encoder_safe():
+    cleanup_camera()
+    try:
+        init_camera()
+        init_encoder()
+        return True
+    except Exception as error:
+        print("[CAM] init failed: %s" % error)
+        cleanup_camera()
+        return False
 
 
 def split_nalus(encoded_data):
@@ -299,8 +358,7 @@ def send_packet(sock, packet, stats):
                 raise SendAborted("Socket rejected packet type")
             packet = bytes(packet)
         except OSError as error:
-            retryable_errors = (11, 115, 10035, 35)
-            if attempts >= SEND_RETRY_LIMIT or getattr(error, "errno", None) not in retryable_errors:
+            if attempts >= SEND_RETRY_LIMIT:
                 raise SendAborted(str(error))
             sleep_us(SEND_RETRY_DELAY_US)
         else:
@@ -393,6 +451,7 @@ class TxStats:
     def reset_rolling(self):
         self.sent_frames = 0
         self.dropped_frames = 0
+        self.emergency_frames = 0
         self.idr_frames = 0
         self.idr_bytes = 0
         self.bytes_tx = 0
@@ -430,11 +489,11 @@ class TxStats:
         packets_per_second = self.packets_tx / interval_seconds
         retransmit_kbps = self.retransmitted_bytes * 8 / interval_seconds / 1000.0
         return (
-            "stat: sent=%d drop=%d idr=%d (forced=%d) last=%dB max=%dB "
+            "stat: sent=%d drop=%d emerg=%d idr=%d (forced=%d) last=%dB max=%dB "
             "kbps=%.0f fps=%.1f pps=%.0f txerr=%d retx=%.1fkbps "
             "idrshare=%.0f%% gc=%.1fms/%d free=%d" % (
-                self.sent_frames, self.dropped_frames, self.idr_frames,
-                self.forced_idr_requests, self.last_frame_bytes,
+                self.sent_frames, self.dropped_frames, self.emergency_frames,
+                self.idr_frames, self.forced_idr_requests, self.last_frame_bytes,
                 self.max_frame_bytes, bitrate_kbps, fps, packets_per_second,
                 self.packet_errors, retransmit_kbps, self.idr_share_percent(),
                 self.gc_window_us / 1000.0, self.gc_window_count, free_memory
@@ -514,7 +573,7 @@ def init_motor_pwm():
         motor_pwm = PWM(42, freq=MOTOR_SPEED_HZ, duty=0)
         motor_dir_pin = Pin(52, Pin.OUT, pull=Pin.PULL_NONE, drive=7)
         motor_dir_pin.value(0)
-        print("[MOTOR] fire pulse ready: PUL=pin42(PWM0) DIR=pin43 EN=pin44(En低=使能) %dHz 50%%" % MOTOR_SPEED_HZ)
+        print("[MOTOR] fire pulse ready: PUL=pin42(PWM0) DIR=pin52 EN=pin18(En低=使能) %dHz 50%%" % MOTOR_SPEED_HZ)
     except Exception as error:
         motor_pwm = None
         motor_dir_pin = None
@@ -716,18 +775,56 @@ class CommandLink:
         )
 
 
+def send_emergency_packets(sock, stats, packet_ring, sequence_holder, ssrc, now_ms):
+    payload = cached_emergency_payload
+    if payload is None and EMERGENCY_H264_SPS_PPS_IDR:
+        payload = EMERGENCY_H264_SPS_PPS_IDR
+    if not payload:
+        marker_pkt = make_rtp_header(sequence_holder[0], make_rtp_timestamp(now_ms), True, ssrc)
+        try:
+            sent_packet = send_packet(sock, marker_pkt, stats)
+        except SendAborted:
+            stats.packet_errors += 1
+            return
+        packet_ring.put(sequence_holder[0], sent_packet)
+        sequence_holder[0] = (sequence_holder[0] + 1) & 0xFFFF
+        stats.emergency_frames += 1
+        return
+
+    packets = []
+    next_seq = sequence_holder[0]
+    timestamp = make_rtp_timestamp(now_ms)
+    for nalu in split_nalus(payload):
+        next_seq = packetize_nalu(nalu, timestamp, next_seq, ssrc, packets)
+    if not packets:
+        return
+    packets[-1] = bytearray(packets[-1])
+    packets[-1][1] |= 0x80
+    try:
+        send_frame_packets(packets, sock, stats, packet_ring, sequence_holder[0])
+    except SendAborted:
+        stats.packet_errors += 1
+        return
+    sequence_holder[0] = next_seq
+    stats.emergency_frames += 1
+
+
 def stream_loop(sock, wlan):
+    global cached_parameter_sets, cached_emergency_payload
     stream = StreamData()
-    parameter_sets = None
     idr_gate = IdrRequestGate(IDR_REQUEST_INTERVAL_MS, IDR_SETTLE_MS)
     stats = TxStats()
     ssrc = 0x54494E44
-    sequence_number = 0
+    sequence_holder = [0]
     last_stats_time = time.time()
     idr_pending = [True]
-    packet_ring = PacketRing()
+    packet_ring = PacketRing(256)
     retransmit_limiter = RetransmitLimiter(retransmit_budget_bytes(ENCODER_BITRATE_KBPS))
     command_link = None
+    consecutive_timeouts = 0
+    last_camera_attempt_ms = ticks_ms()
+    last_emergency_send_ms = 0
+    gc_tick = 0
 
     def request_idr(_command=None):
         idr_pending[0] = True
@@ -740,6 +837,9 @@ def stream_loop(sock, wlan):
 
     command_link = CommandLink(init_uart(), on_control=request_idr, on_nack=handle_nack)
     init_motor_pwm()
+    camera_ok = init_camera_and_encoder_safe()
+    if not camera_ok:
+        print("[CAM] unavailable at startup, running in fallback mode")
 
     while True:
         os.exitpoint()
@@ -747,73 +847,120 @@ def stream_loop(sock, wlan):
             wait_for_wifi(wlan)
 
         command_link.pump(sock)
-        if idr_pending[0]:
+        if idr_pending[0] and camera_ok:
             idr_pending[0] = False
             if idr_gate.request(ticks_ms()):
-                encoder.RequestIDR()
-                stats.forced_idr_requests += 1
-                print("RTP: requested IDR")
+                try:
+                    encoder.RequestIDR()
+                    stats.forced_idr_requests += 1
+                    print("RTP: requested IDR")
+                except Exception as error:
+                    print("[CAM] RequestIDR failed: %s" % error)
+                    camera_ok = False
+                    cleanup_camera()
+                    last_camera_attempt_ms = ticks_ms()
+                    idr_pending[0] = True
 
-        if encoder.GetStream(stream, timeout=4) != 0:
-            command_link.pump(sock)
-            continue
-
-        frame_time_ms = ticks_ms()
-        try:
-            packets = []
-            frame_size_bytes = 0
-            is_idr = False
-            next_sequence_number = sequence_number
-            timestamp = make_rtp_timestamp(frame_time_ms)
-
-            for index in range(stream.pack_cnt):
-                frame_data = uctypes.bytearray_at(stream.data[index], stream.data_size[index])
-                stream_type = stream.stream_type[index]
-                if stream_type == encoder.STREAM_TYPE_HEADER:
-                    parameter_sets = bytes(frame_data)
-                    continue
-                if stream_type == encoder.STREAM_TYPE_I:
-                    is_idr = True
-
-                frame_data = bytes(frame_data)
-                frame_size_bytes += len(frame_data)
-                if stream_type == encoder.STREAM_TYPE_I and parameter_sets:
-                    for nalu in split_nalus(parameter_sets):
-                        next_sequence_number = packetize_nalu(
-                            nalu, timestamp, next_sequence_number, ssrc, packets
-                        )
-                for nalu in split_nalus(frame_data):
-                    next_sequence_number = packetize_nalu(
-                        nalu, timestamp, next_sequence_number, ssrc, packets
-                    )
-
-            if not packets:
-                continue
-
-            packets[-1] = bytearray(packets[-1])
-            packets[-1][1] |= 0x80
-            frame_airtime_ms = estimate_airtime_ms(
-                frame_size_bytes, len(packets), WIFI_LINK_KBPS
-            )
-
-            if is_idr:
-                idr_gate.note_idr_sent(ticks_ms())
-
+        if camera_ok:
+            got = False
             try:
-                send_frame_packets(packets, sock, stats, packet_ring, sequence_number)
-                stats.note_frame(frame_size_bytes, len(packets), is_idr, frame_airtime_ms)
-            except SendAborted as error:
-                stats.packet_errors += 1
-                print("send error: %s" % error)
+                got = encoder.GetStream(stream, timeout=15) == 0
+            except Exception as error:
+                print("[CAM] GetStream failed: %s" % error)
+                got = False
 
-            sequence_number = next_sequence_number
-        except Exception as error:
-            print("send drop: %s" % error)
-            stats.dropped_frames += 1
-        finally:
-            encoder.ReleaseStream(stream)
+            if got:
+                consecutive_timeouts = 0
+                try:
+                    packets = []
+                    frame_size_bytes = 0
+                    is_idr = False
+                    idr_payload_for_cache = None
+                    next_sequence_number = sequence_holder[0]
+                    timestamp = make_rtp_timestamp(ticks_ms())
 
-        if stats.gc_frames and stats.gc_frames % GC_COLLECT_EVERY == 0:
+                    for index in range(stream.pack_cnt):
+                        frame_data = uctypes.bytearray_at(stream.data[index], stream.data_size[index])
+                        stream_type = stream.stream_type[index]
+                        if stream_type == encoder.STREAM_TYPE_HEADER:
+                            cached_parameter_sets = bytes(frame_data)
+                            continue
+                        if stream_type == encoder.STREAM_TYPE_I:
+                            is_idr = True
+                            if idr_payload_for_cache is None:
+                                idr_payload_for_cache = bytes(frame_data)
+                            else:
+                                idr_payload_for_cache += bytes(frame_data)
+
+                        frame_data = bytes(frame_data)
+                        frame_size_bytes += len(frame_data)
+                        if stream_type == encoder.STREAM_TYPE_I and cached_parameter_sets:
+                            for nalu in split_nalus(cached_parameter_sets):
+                                next_sequence_number = packetize_nalu(
+                                    nalu, timestamp, next_sequence_number, ssrc, packets
+                                )
+                        for nalu in split_nalus(frame_data):
+                            next_sequence_number = packetize_nalu(
+                                nalu, timestamp, next_sequence_number, ssrc, packets
+                            )
+
+                    if packets:
+                        packets[-1] = bytearray(packets[-1])
+                        packets[-1][1] |= 0x80
+                        frame_airtime_ms = estimate_airtime_ms(
+                            frame_size_bytes, len(packets), WIFI_LINK_KBPS
+                        )
+                        if is_idr and cached_parameter_sets and idr_payload_for_cache:
+                            cached_emergency_payload = cached_parameter_sets + idr_payload_for_cache
+                        try:
+                            send_frame_packets(packets, sock, stats, packet_ring, sequence_holder[0])
+                            stats.note_frame(frame_size_bytes, len(packets), is_idr, frame_airtime_ms)
+                            if is_idr:
+                                idr_gate.note_idr_sent(ticks_ms())
+                            sequence_holder[0] = next_sequence_number
+                        except SendAborted as error:
+                            stats.packet_errors += 1
+                            print("send error: %s" % error)
+                except Exception as error:
+                    print("send drop: %s" % error)
+                    stats.dropped_frames += 1
+                finally:
+                    try:
+                        encoder.ReleaseStream(stream)
+                    except Exception:
+                        pass
+            else:
+                consecutive_timeouts += 1
+                if consecutive_timeouts >= CAMERA_TIMEOUT_LIMIT:
+                    print("[CAM] stream lost, entering fallback")
+                    camera_ok = False
+                    cleanup_camera()
+                    last_camera_attempt_ms = ticks_ms()
+                    consecutive_timeouts = 0
+                else:
+                    sleep_us(1000)
+        else:
+            now_ms = ticks_ms()
+            if ticks_diff(now_ms, last_emergency_send_ms) >= EMERGENCY_FRAME_PERIOD_MS:
+                try:
+                    send_emergency_packets(sock, stats, packet_ring, sequence_holder, ssrc, now_ms)
+                except Exception as error:
+                    stats.packet_errors += 1
+                    print("[CAM] emergency send error: %s" % error)
+                last_emergency_send_ms = now_ms
+            if ticks_diff(now_ms, last_camera_attempt_ms) >= CAMERA_RETRY_INTERVAL_MS:
+                last_camera_attempt_ms = now_ms
+                if init_camera_and_encoder_safe():
+                    print("[CAM] recovered")
+                    camera_ok = True
+                    consecutive_timeouts = 0
+                    idr_pending[0] = True
+            if not camera_ok:
+                sleep_us(UART_TX_PERIOD_MS * 1000)
+
+        gc_tick += 1
+        if gc_tick >= GC_COLLECT_EVERY:
+            gc_tick = 0
             gc_start_us = ticks_us()
             gc.collect()
             stats.note_gc(ticks_diff(ticks_us(), gc_start_us))
@@ -856,26 +1003,8 @@ def stream_loop(sock, wlan):
 
 
 def cleanup():
-    global sensor, media_link, encoder
     stop_motor_pwm()
-    if sensor is not None:
-        try:
-            sensor.stop()
-        except Exception:
-            pass
-    if media_link is not None:
-        try:
-            media_link.destroy()
-        except Exception:
-            pass
-        media_link = None
-    if encoder is not None and encoder.chn >= 0:
-        try:
-            encoder.Stop()
-            encoder.Destroy()
-        except Exception:
-            pass
-        encoder = None
+    cleanup_camera()
 
 
 def create_socket():
@@ -904,8 +1033,6 @@ def main():
         WIFI_LINK_KBPS, SERVER_IP, RTP_PORT
     ))
 
-    init_camera()
-    init_encoder()
     sock = create_socket()
     print("[4/4] RTP H.264 -> %s:%d (tier=%s, encoder=%dkbps, link=%dkbps, GOP=%d, chunk=%d)" % (
         SERVER_IP, RTP_PORT, SELECTED_TIER, ENCODER_BITRATE_KBPS,
@@ -926,11 +1053,6 @@ finally:
     try:
         if uart is not None:
             uart.deinit()
-    except Exception:
-        pass
-    try:
-        if sta is not None:
-            sta.active(False)
     except Exception:
         pass
     gc.collect()

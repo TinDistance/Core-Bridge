@@ -76,6 +76,7 @@ motor_en_pin = None
 motor_running = False
 cached_parameter_sets = None
 cached_emergency_payload = None
+wifi_link_up = False
 
 
 def ticks_ms():
@@ -93,11 +94,289 @@ def ticks_diff(start, end):
     return difference + TICKS_MS_PERIOD if difference < 0 else difference
 
 
+def ticks_add(base, delta):
+    if hasattr(time, "ticks_add"):
+        return time.ticks_add(base, delta)
+    return base + delta
+
+
 def sleep_us(duration):
     if hasattr(time, "sleep_us"):
         time.sleep_us(duration)
     else:
         time.sleep(duration / 1000000.0)
+
+
+# 蜂鸣器：K230=GPIO43，K230D/Lite=GPIO61，都走 PWM1。
+# 正常推流不响。
+#   init      两声短鸣，响完即停（上电）
+#   wifi      一声中音（连接成功，含首次和重连）
+#   camera    4kHz 长音，中间留间隔，掉线期间循环
+#   emergency 低音三连，循环（断网 / 急停锁存 / 未捕获异常）
+#   recovery  三声上行，只响一轮（急停或摄像头恢复，且没有别的报警）
+EVENT_INIT = "init"
+EVENT_WIFI = "wifi"
+EVENT_CAMERA = "camera"
+EVENT_EMERGENCY = "emergency"
+EVENT_RECOVERY = "recovery"
+BUZZER_DUTY_U16 = 32768
+BUZZER_PWM_CHANNEL = 1
+# (freq_hz, duty_u16, duration_ms)；duty 0 是间隔。
+BUZZ_PATTERNS = {
+    EVENT_INIT: (
+        ((4000, BUZZER_DUTY_U16, 80), (0, 0, 70), (4000, BUZZER_DUTY_U16, 80)),
+        False,
+    ),
+    EVENT_WIFI: (
+        ((4000, BUZZER_DUTY_U16, 200),),
+        False,
+    ),
+    EVENT_CAMERA: (
+        ((4000, BUZZER_DUTY_U16, 1000), (0, 0, 800)),
+        True,
+    ),
+    EVENT_EMERGENCY: (
+        (
+            (2500, BUZZER_DUTY_U16, 90),
+            (0, 0, 70),
+            (2500, BUZZER_DUTY_U16, 90),
+            (0, 0, 70),
+            (2500, BUZZER_DUTY_U16, 90),
+            (0, 0, 480),
+        ),
+        True,
+    ),
+    EVENT_RECOVERY: (
+        (
+            (3200, BUZZER_DUTY_U16, 70),
+            (0, 0, 50),
+            (4000, BUZZER_DUTY_U16, 70),
+            (0, 0, 50),
+            (4800, BUZZER_DUTY_U16, 150),
+        ),
+        False,
+    ),
+}
+
+
+def buzzer_pin_for(machine_name):
+    if machine_name == "k230_canmv_lckfb":
+        return 43
+    return 61
+
+
+def _sleep_slice(duration_ms, player):
+    start = ticks_ms()
+    while ticks_diff(ticks_ms(), start) < duration_ms:
+        player.tick(ticks_ms())
+        remaining = duration_ms - ticks_diff(ticks_ms(), start)
+        if remaining <= 0:
+            return
+        slice_ms = remaining if remaining < 20 else 20
+        before = ticks_ms()
+        if hasattr(time, "sleep_ms"):
+            time.sleep_ms(int(slice_ms))
+        else:
+            time.sleep(slice_ms / 1000.0)
+        if ticks_diff(ticks_ms(), before) <= 0:
+            player.tick(ticks_ms())
+            return
+
+
+class Buzzer:
+    def __init__(self):
+        self._pwm = None
+        self._ready = False
+        self._failed = False
+        self._use_u16 = None
+        self._pattern = ()
+        self._index = 0
+        self._step_ms = 0
+        self._repeat = False
+        self._event = None
+        self._conditions = {}
+        self._alarm_latched = False
+
+    def _ensure(self):
+        if self._ready or self._failed:
+            return self._ready
+        try:
+            from machine import FPIOA, PWM
+            machine_name = ""
+            try:
+                machine_name = os.uname()[-1]
+            except Exception:
+                machine_name = ""
+            pin = buzzer_pin_for(machine_name)
+            pin_map = FPIOA()
+            pin_map.set_function(pin, FPIOA.PWM1)
+            pwm = PWM(BUZZER_PWM_CHANNEL)
+            pwm.freq(4000)
+            if hasattr(pwm, "duty_u16"):
+                pwm.duty_u16(0)
+            elif hasattr(pwm, "duty"):
+                pwm.duty(0)
+            self._pwm = pwm
+            self._ready = True
+            print("[BUZZ] ready pin=%d PWM1" % pin)
+        except Exception as error:
+            self._failed = True
+            print("[BUZZ] init failed: %s" % error)
+        return self._ready
+
+    def play(self, event, now_ms=None):
+        spec = BUZZ_PATTERNS.get(event)
+        if spec is None:
+            return False
+        steps, repeat = spec
+        if event == self._event and (self._repeat or self._pattern):
+            return False
+        if not self._ensure():
+            return False
+        self._event = event
+        self._pattern = steps
+        self._repeat = repeat
+        self._index = 0
+        self._step_ms = ticks_ms() if now_ms is None else now_ms
+        self._apply_step()
+        print("[BUZZ] %s" % event)
+        return True
+
+    def _alarm_event(self):
+        if self._conditions.get("camera", False):
+            return EVENT_CAMERA
+        if any(self._conditions.values()):
+            return EVENT_EMERGENCY
+        return None
+
+    def _end_oneshot(self, now_ms):
+        self._pattern = ()
+        self._repeat = False
+        self._event = None
+        self._index = 0
+        self._set_duty(0)
+        alarm = self._alarm_event()
+        if alarm:
+            self.play(alarm, now_ms)
+
+    def finish(self):
+        spins = 0
+        while self._pattern and not self._repeat and spins < 40:
+            spins += 1
+            before = ticks_ms()
+            _sleep_slice(20, self)
+            if ticks_diff(ticks_ms(), before) <= 0:
+                return
+
+    def set_condition(self, name, active):
+        active = bool(active)
+        if self._conditions.get(name, False) == active:
+            return
+        self._conditions[name] = active
+        print("[BUZZ] %s %s" % (name, "on" if active else "off"))
+        alarm = self._alarm_event()
+        if alarm:
+            self._alarm_latched = True
+            self.play(alarm)
+            return
+        if self._alarm_latched:
+            self._alarm_latched = False
+            self.play(EVENT_RECOVERY)
+
+    def note_wifi_connected(self):
+        if self._conditions.get("wifi", False):
+            self._conditions["wifi"] = False
+            print("[BUZZ] wifi off")
+        if self._alarm_event() is None:
+            self._alarm_latched = False
+        self.play(EVENT_WIFI)
+        self.finish()
+
+    def tick(self, now_ms):
+        if not self._pattern:
+            return
+        if ticks_diff(now_ms, self._step_ms) > 3000:
+            if not self._repeat:
+                self._end_oneshot(now_ms)
+                return
+            self._step_ms = now_ms
+            self._apply_step()
+            return
+        guard = 0
+        while self._pattern and guard < 16:
+            guard += 1
+            duration = self._pattern[self._index][2]
+            if duration < 1:
+                duration = 1
+            elapsed = ticks_diff(now_ms, self._step_ms)
+            if elapsed < duration:
+                return
+            elapsed -= duration
+            self._index += 1
+            if self._index >= len(self._pattern):
+                if not self._repeat:
+                    self._end_oneshot(now_ms)
+                    return
+                self._index = 0
+            self._step_ms = ticks_add(now_ms, -elapsed)
+            self._apply_step()
+
+    def _apply_step(self):
+        if not self._pattern:
+            self._set_duty(0)
+            return
+        freq, duty, _duration = self._pattern[self._index]
+        if duty and freq and self._pwm is not None:
+            try:
+                self._pwm.freq(freq)
+            except Exception as error:
+                print("[BUZZ] freq error: %s" % error)
+        self._set_duty(duty)
+
+    def _set_duty(self, duty):
+        pwm = self._pwm
+        if pwm is None:
+            return
+        try:
+            if self._use_u16 is not False and hasattr(pwm, "duty_u16"):
+                pwm.duty_u16(duty)
+                self._use_u16 = True
+                return
+            if hasattr(pwm, "duty"):
+                pwm.duty(50 if duty else 0)
+                self._use_u16 = False
+        except Exception as error:
+            print("[BUZZ] duty error: %s" % error)
+
+    def deinit(self):
+        self._pattern = ()
+        self._repeat = False
+        self._event = None
+        self._index = 0
+        self._alarm_latched = False
+        pwm = self._pwm
+        self._pwm = None
+        self._ready = False
+        if pwm is None:
+            return
+        try:
+            if hasattr(pwm, "duty_u16"):
+                pwm.duty_u16(0)
+            elif hasattr(pwm, "duty"):
+                pwm.duty(0)
+        except Exception:
+            pass
+        try:
+            pwm.deinit()
+        except Exception:
+            pass
+
+
+buzzer = Buzzer()
+
+
+def sleep_ms(duration_ms):
+    _sleep_slice(duration_ms, buzzer)
 
 
 def connect_wifi(wlan):
@@ -113,7 +392,7 @@ def connect_wifi(wlan):
             if ticks_diff(ticks_ms(), start_ms) >= WIFI_CONNECT_TIMEOUT_MS:
                 print("[wifi] connect timeout")
                 return False
-            time.sleep(0.1)
+            sleep_ms(100)
     wlan.ifconfig(STATIC_IP)
     ip, _, gateway, _ = wlan.ifconfig()
     print("[wifi] connected: IP=%s GW=%s" % (ip, gateway))
@@ -121,6 +400,10 @@ def connect_wifi(wlan):
 
 
 def wait_for_wifi(wlan, log_interval_ms=WIFI_WAIT_LOG_MS):
+    global wifi_link_up
+    dropped = wifi_link_up and not wlan.isconnected()
+    if dropped:
+        buzzer.set_condition("wifi", True)
     start_ms = ticks_ms()
     last_log_ms = start_ms
     while not connect_wifi(wlan):
@@ -129,7 +412,9 @@ def wait_for_wifi(wlan, log_interval_ms=WIFI_WAIT_LOG_MS):
         if ticks_diff(now_ms, last_log_ms) >= log_interval_ms:
             print("[wifi] still waiting: %ds" % (ticks_diff(now_ms, start_ms) // 1000))
             last_log_ms = now_ms
-        time.sleep(1)
+        sleep_ms(1000)
+    wifi_link_up = True
+    buzzer.note_wifi_connected()
 
 
 def init_wifi():
@@ -751,6 +1036,8 @@ class CommandLink:
             self.cached_at_ms = now_ms
             self.received_frames += 1
             self.last_receive_ms = now_ms
+            # V1.3 第 10 字节是 EMERGENCY_STOP。锁存期间循环报警，解除后响恢复音。
+            buzzer.set_condition("estop", self.cached_command[10] == 1)
             if not self.active:
                 print("[CMD] server streaming")
                 self.active = True
@@ -840,9 +1127,11 @@ def stream_loop(sock, wlan):
     camera_ok = init_camera_and_encoder_safe()
     if not camera_ok:
         print("[CAM] unavailable at startup, running in fallback mode")
+        buzzer.set_condition("camera", True)
 
     while True:
         os.exitpoint()
+        buzzer.tick(ticks_ms())
         if not wlan.isconnected():
             wait_for_wifi(wlan)
 
@@ -860,6 +1149,7 @@ def stream_loop(sock, wlan):
                     cleanup_camera()
                     last_camera_attempt_ms = ticks_ms()
                     idr_pending[0] = True
+                    buzzer.set_condition("camera", True)
 
         if camera_ok:
             got = False
@@ -937,6 +1227,7 @@ def stream_loop(sock, wlan):
                     cleanup_camera()
                     last_camera_attempt_ms = ticks_ms()
                     consecutive_timeouts = 0
+                    buzzer.set_condition("camera", True)
                 else:
                     sleep_us(1000)
         else:
@@ -955,6 +1246,7 @@ def stream_loop(sock, wlan):
                     camera_ok = True
                     consecutive_timeouts = 0
                     idr_pending[0] = True
+                    buzzer.set_condition("camera", False)
             if not camera_ok:
                 sleep_us(UART_TX_PERIOD_MS * 1000)
 
@@ -1003,6 +1295,7 @@ def stream_loop(sock, wlan):
 
 
 def cleanup():
+    buzzer.deinit()
     stop_motor_pwm()
     cleanup_camera()
 
@@ -1027,6 +1320,8 @@ def create_socket():
 
 
 def main():
+    buzzer.play(EVENT_INIT)
+    buzzer.finish()
     wlan = init_wifi()
     print("[cfg] tier=%s %dx%d %dkbps | link=%dkbps | target=%s:%d" % (
         SELECTED_TIER, FRAME_WIDTH, FRAME_HEIGHT, ENCODER_BITRATE_KBPS,
@@ -1048,6 +1343,12 @@ except KeyboardInterrupt as error:
 except BaseException as error:
     import sys
     sys.print_exception(error)
+    try:
+        buzzer.set_condition("fault", True)
+        if buzzer._pattern:
+            sleep_ms(700)
+    except Exception:
+        pass
 finally:
     cleanup()
     try:
